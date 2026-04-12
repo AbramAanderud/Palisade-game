@@ -1,0 +1,12 @@
+# Godot
+.godot/
+*.import
+
+# C# / .NET
+.mono/
+data_*/
+mono_crash.*.json
+*.user
+.vs/
+bin/
+obj/
