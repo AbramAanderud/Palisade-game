@@ -83,14 +83,17 @@
 - **Extends:** Control
 - **Signals received:** GameManager.TimerTick, GameManager.GameOver
 
-### TileData (existing autoload)
-- **File:** res://scripts/TileData.cs
+### PieceDB (static utility)
+- **File:** res://scripts/PieceDB.cs
+- **Purpose:** PieceType enum, Dir flags bitmask, openings per (type, rotation), colors, costs, labels
 
-### MapSerializer (existing static)
-- **File:** res://scripts/MapSerializer.cs
+### MazeData (plain C# model)
+- **File:** res://scripts/MazeData.cs
+- **Purpose:** MazePiece record (Type, X, Y, Floor, Rotation) + MazeData (Name, GoldSpent, List<MazePiece>)
 
-### MapValidator (existing static)
-- **File:** res://scripts/MapValidator.cs
+### MazeSerializer (static utility)
+- **File:** res://scripts/MazeSerializer.cs
+- **Purpose:** Multi-slot JSON save/load — user://maze_slot_0.json through maze_slot_4.json
 
 ## Signal Map
 

@@ -2,61 +2,75 @@
 
 ## Game Description
 
-Top-down 2D dungeon map editor where each player designs a 10×10 tile maze (with multi-floor support via stairs). When matched, both players' mazes are connected via a central circular room containing a randomly-rolled weapon. The game is then played first-person: players are placed in each other's mazes and race to find the exit. The first player out claims the weapon and enters the opponent's maze to hunt them. If the hunted player survives 30 seconds they earn 100 gold; the hunter earns 200 gold on a kill. Gold is spent on maze upgrades. Players are matched by gold spent.
+Players design modular dungeons using snap-together pieces (straight hall, L-hall, T-junction, stairs). Before matchmaking, a player builds up to 5 saved mazes and selects the best one. Matchmaking pairs players by gold spent. Both mazes are joined at a small central weapon room. The game plays first-person: race to find your exit, claim the weapon, hunt the opponent. First out earns 50 gold; killing the opponent earns +50 (total 100). Winning by kill earns 200 gold. Gold funds new maze pieces.
+
+## Piece System
+
+Each piece occupies exactly one 10×10m grid cell. Openings are fixed at the center of each face (N/S/E/W). All pieces fit together automatically — no geometry math needed.
+
+| Piece | Openings (rot=0) | Cost |
+|-------|-----------------|------|
+| Start | S only | free |
+| Exit | N only | free |
+| Straight | N + S | free |
+| LHall | N + E | free |
+| THall | N + E + S | 25g |
+| Stairs | S (floor F) + N (floor F+1) | 50g |
+
+Openings rotate clockwise with the piece.
 
 ## Risk Tasks
 
-### 1. Map → 3D Dungeon Mesh Generation
-- **Why isolated:** Runtime procedural mesh from 2D tile array. Easy to get wrong winding, UV tiling, or seams at tile boundaries. Must produce walkable geometry with correct normals for lighting.
-- **Approach:** Per-tile approach: for each Floor/Entrance/Exit tile, emit floor quad + ceiling quad. For each Wall tile, emit 4 side-wall quads only where the neighbor is open (no wall face where two walls meet). Use SurfaceTool, call GenerateNormals(). UV = world XZ / tile_size for seamless tiling.
-- **Verify:** Run headless, capture screenshot in generated dungeon — floor visible, walls block view, no holes, no inside-out faces (no magenta), normals correct (lighting on wall faces).
+### 1. Modular Piece → 3D Dungeon Mesh
+- **Why isolated:** Each piece maps to a pre-defined 3D mesh segment. Must get winding, UVs, and seams correct at piece boundaries. Openings must align at face centers.
+- **Approach:** Per piece type, procedurally build walls/floor/ceiling using SurfaceTool quads. A 10m×10m×3m cell has 4 wall quads (each 10×3m), 1 floor quad, 1 ceiling quad, minus the opening faces. Opening = a 3m-wide × 2.5m-tall gap centered on the face. Stairs = ramp quad from floor F ground level to floor F+1 ground level at ~15° angle. Call GenerateNormals(). UV = world XZ/3 for seamless tiling.
+- **Verify:** Screenshot from inside generated dungeon — floor/ceiling/walls visible, opening gaps align correctly between adjacent pieces, no holes, no inside-out faces.
 
 ### 2. First-Person Player Controller
-- **Why isolated:** FPS mouse look + CharacterBody3D collision in narrow corridors is finicky. Mouse sensitivity, vertical clamp, gravity, and corridor sliding all interact.
-- **Approach:** CharacterBody3D with Camera3D child. Mouse captured in `_Ready()`. Horizontal rotation on Node root, vertical on Camera3D only (clamped ±85°). Gravity always applied. `MoveAndSlide()` in GROUNDED mode. Collision shape: CapsuleShape3D radius 0.35m height 1.6m.
-- **Verify:** Player walks all 4 directions, mouse look 360° horizontal, vertical clamped, no clipping through walls in 1-tile-wide corridor.
+- **Why isolated:** Mouse look + capsule in narrow (3m wide) corridors. Clamp, gravity, and step-through are finicky.
+- **Approach:** CharacterBody3D GROUNDED mode. CapsuleShape3D radius=0.35m height=1.6m. Mouse captured in _Ready(). Horizontal yaw on root node, vertical pitch on Camera3D child (clamped ±85°). Gravity constant. MoveAndSlide() each physics tick.
+- **Verify:** Walk all 4 directions, 360° horizontal look, vertical clamp, no clipping through walls in 3m-wide corridors.
 
 ## Main Build
 
-Build the complete game loop using the existing 2D map editor (already scaffolded) and the two verified risk systems.
+Use verified risk systems + existing piece editor to assemble full game loop.
 
-**What to build:**
-- Central circular connecting room (procedural mesh, radius 4m, domed ceiling)
-- Weapon pickup in center room (glowing sword, InteractableArea3D)
-- Enemy placeholder (capsule mesh, NavigationAgent3D, simple path-to-player)
-- Combat system: swing weapon on LMB, 1-hit kill, kill/death detection
-- Survival timer (30s countdown, shown on HUD)
-- Game state machine: Editor → Loading → Playing → Result
-- HUD: HP bar, timer, gold counter, crosshair
-- Result screen: winner/gold earned
-- Map editor "Play" button that triggers dungeon generation + scene switch
-- Gold persistence (simple file save)
-- Texture assets: stone wall, floor, ceiling (generated)
-- Torch OmniLight3D placements every 4 tiles along corridors
+- Map editor redesign: piece-based drag/snap system with 5 save slots + select-for-matchmaking
+- Main menu: Play (→ map selection), Map Builder, Settings
+- Map selection screen: shows saved mazes, gold spent, Select for matchmaking button
+- Dungeon assembly: load both players' mazes, attach exits to small central weapon room
+- Weapon pickup: one iron sword in central room (Area3D detect), weapon disappears on pickup
+- Enemy AI: simple NavigationAgent3D path-to-player
+- Combat: swing weapon on LMB, 1-hit kill on enemy
+- Survival timer: 30s countdown starts when first player exits
+- Game state machine: Menu → MapSelect → Loading → Playing → Result
+- HUD: HP dot indicator, timer (hidden until one player exits), gold counter
+- Result screen: outcome text + gold earned + continue button
+- Gold persistence: saved to user://profile.json
 
 **Assets needed:**
-- Stone brick wall texture (tileable, 512×512)
-- Stone floor texture (tileable, 512×512)
-- Sword pickup GLB (from reference image)
+- Stone wall texture (tileable 512×512)
+- Stone floor texture (tileable 512×512)
+- Iron sword sprite/model (for pickup + held weapon)
 
 **Verify:**
-- Movement direction matches player input
-- Mouse look works, no gimbal lock
-- Walls block movement in narrow corridors
-- Weapon pickup triggers on enter, sword disappears from room
-- Timer counts down 0:30 → 0:00
-- Kill/survival detected and gold awarded correctly
-- HUD elements readable, no overlap
-- No missing textures (no magenta/checkerboard)
-- No holes in dungeon mesh
-- reference.png consistency: stone aesthetic, torch lighting, HUD layout
-- **Presentation video:** ~30s cinematic MP4
-  - Camera pans through editor, switches to 3D dungeon, walks toward central room, picks up sword, swings at enemy
-  - Output: screenshots/presentation/gameplay.mp4
+- All 5 piece types snap correctly in editor
+- Mazes save and load across sessions
+- 3D dungeon generates from saved piece data, correctly joined to central room
+- Movement, look, collision all correct
+- Weapon pickup works, disappears from room
+- Timer starts only after first player exits
+- Gold awarded correctly for each outcome
+- HUD readable, no overlap
+- No missing textures
+- reference.png consistency: stone dungeon, torch lighting, HUD layout
+- **Presentation video:** ~30s MP4 — editor placing pieces → switch to 3D → walk → pick up sword → fight
 
 ## Task Status
 
-- [ ] Risk 1: Map → 3D Mesh Generation
-- [ ] Risk 2: First-Person Player Controller
+- [x] Piece system data layer (PieceDB, MazeData, MazeSerializer)
+- [x] Map editor rewrite (piece placement, save slots)
+- [ ] Risk 1: Piece → 3D Mesh
+- [ ] Risk 2: First-Person Controller
 - [ ] Main Build
 - [ ] Presentation Video
