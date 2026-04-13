@@ -12,7 +12,8 @@
       "Bash(pip install:*)",
       "Bash(py -3 .claude/skills/godogen/tools/asset_gen.py image --model gemini --prompt 'Screenshot of a 3D first-person video game. Camera: eye-level first-person perspective inside a dungeon, looking down a narrow stone-brick corridor toward a circular chamber. Player hands visible at bottom-center holding a worn iron sword. At corridor end: circular stone chamber 8m wide, a glowing golden sword hovering at chest height center-chamber in golden light. Dark-armored enemy silhouette at chamber doorway left. Stone brick walls with iron torch sconces emitting warm amber flame every 4m. Worn stone floor, low stone ceiling. Circular chamber has vaulted dome. HUD: red horizontal health bar top-left labeled HP, white countdown timer 0:28 top-center, yellow coin icon and number 150 top-right. Dark gothic dungeon, warm amber torchlight on grey stone. Sharp clean game engine rendering.' --size 1K --aspect-ratio 16:9 -o reference.png)",
       "Bash(py -3 -m pip install -q requests pillow google-generativeai)",
-      "Bash(py -3 -m pip install -q xai-sdk google-genai)"
+      "Bash(py -3 -m pip install -q xai-sdk google-genai)",
+      "Bash(timeout 60 dotnet build Palisade.csproj)"
     ]
   }
 }

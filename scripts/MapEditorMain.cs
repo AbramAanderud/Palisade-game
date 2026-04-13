@@ -296,6 +296,25 @@ public partial class MapEditorMain : Node2D
     {
         DrawRect(new Rect2(GridOffX, GridOffY, GridW * CellPx, GridH * CellPx),
             new Color(0.08f, 0.07f, 0.07f));
+
+        // ── Row zone highlights (only on floor 0) ─────────────────────────────
+        if (_floor == 0)
+        {
+            // Row 0 = Start zone (green tint)
+            DrawRect(new Rect2(GridOffX, GridOffY, GridW * CellPx, CellPx),
+                new Color(0.10f, 0.40f, 0.10f, 0.18f));
+            DrawString(_font, new Vector2(GridOffX + 2, GridOffY + CellPx - 6),
+                "START ZONE", HorizontalAlignment.Left, GridW * CellPx, 10,
+                new Color(0.35f, 0.90f, 0.35f, 0.70f));
+
+            // Last row = Exit zone (amber tint)
+            DrawRect(new Rect2(GridOffX, GridOffY + (GridH - 1) * CellPx, GridW * CellPx, CellPx),
+                new Color(0.50f, 0.30f, 0.05f, 0.22f));
+            DrawString(_font, new Vector2(GridOffX + 2, GridOffY + GridH * CellPx - 6),
+                "EXIT ZONE", HorizontalAlignment.Left, GridW * CellPx, 10,
+                new Color(0.95f, 0.70f, 0.15f, 0.70f));
+        }
+
         for (int x = 1; x < GridW; x++)
             DrawLine(new Vector2(GridOffX + x * CellPx, GridOffY),
                      new Vector2(GridOffX + x * CellPx, GridOffY + GridH * CellPx),
@@ -331,14 +350,22 @@ public partial class MapEditorMain : Node2D
             float px    = GridOffX + stair.X * CellPx;
             float py    = GridOffY + stair.Y * CellPx;
             Color base_ = PieceDB.Colors[PieceType.Stairs];
-            Color ghost = new Color(base_.R * 0.7f, base_.G * 0.7f, base_.B * 0.7f, 0.35f);
+            Color ghost = new Color(base_.R * 0.7f, base_.G * 0.7f, base_.B * 0.7f, 0.30f);
 
-            // Ghost fill
-            DrawRect(new Rect2(px + 2, py + 2, CellPx - 4, CellPx - 4), ghost);
+            // Ghost: show corridor shape for the stair openings (both N and S at rot=0)
+            Dir ghostOpen = PieceDB.GetOpenings(PieceType.Stairs, stair.Rotation);
+            float gcx = px + CellPx * 0.5f, gcy = py + CellPx * 0.5f;
+            float ghw = CellPx * 0.30f;
+            DrawRect(new Rect2(px + 1, py + 1, CellPx - 2, CellPx - 2),
+                new Color(base_.R * 0.3f, base_.G * 0.3f, base_.B * 0.3f, 0.28f));
+            if ((ghostOpen & Dir.N) != 0) DrawRect(new Rect2(gcx-ghw, py,      ghw*2, CellPx*0.5f+ghw), ghost);
+            if ((ghostOpen & Dir.S) != 0) DrawRect(new Rect2(gcx-ghw, gcy-ghw, ghw*2, CellPx*0.5f+ghw), ghost);
+            if ((ghostOpen & Dir.E) != 0) DrawRect(new Rect2(gcx-ghw, gcy-ghw, CellPx*0.5f+ghw, ghw*2), ghost);
+            if ((ghostOpen & Dir.W) != 0) DrawRect(new Rect2(px,      gcy-ghw, CellPx*0.5f+ghw, ghw*2), ghost);
 
             // Dashed border to distinguish from real pieces
             DrawRect(new Rect2(px, py, CellPx, CellPx),
-                new Color(base_.R, base_.G, base_.B, 0.55f), filled: false, width: 2f);
+                new Color(base_.R, base_.G, base_.B, 0.45f), filled: false, width: 1.5f);
 
             // The exit opening on this floor (upDir of the stair)
             Dir upDir = PieceDB.GetStairUpDir(stair.Rotation);
@@ -408,86 +435,93 @@ public partial class MapEditorMain : Node2D
         Color col = PieceDB.Colors[piece.Type];
         Dir   open = PieceDB.GetOpenings(piece.Type, piece.Rotation);
 
-        DrawRect(new Rect2(px + 2, py + 2, CellPx - 4, CellPx - 4), col.Darkened(0.30f));
+        float cx = px + CellPx * 0.5f;
+        float cy = py + CellPx * 0.5f;
+        // hw: corridor half-width — slightly wider than a visual "slot" but shows shape clearly
+        float hw = CellPx * 0.30f;
 
-        float wallThick = 7f;
-        float gapPx     = CellPx * 0.36f;
-        float gapOff    = (CellPx - gapPx) / 2f;
+        // ── Wall fill (background stone) ──────────────────────────────────────
+        DrawRect(new Rect2(px + 1, py + 1, CellPx - 2, CellPx - 2), col.Darkened(0.68f));
 
-        DrawFace(px, py, Dir.N, open, lookup, piece, wallThick, gapOff, gapPx, col);
-        DrawFace(px, py, Dir.E, open, lookup, piece, wallThick, gapOff, gapPx, col);
-        DrawFace(px, py, Dir.S, open, lookup, piece, wallThick, gapOff, gapPx, col);
-        DrawFace(px, py, Dir.W, open, lookup, piece, wallThick, gapOff, gapPx, col);
+        // ── Corridor area — union of open-direction strips ────────────────────
+        Color floorCol = col.Darkened(0.20f);
+        // Each strip extends from the cell edge to just past the centre, so strips
+        // overlap at the centre and their union forms the corridor silhouette.
+        if ((open & Dir.N) != 0)
+            DrawRect(new Rect2(cx - hw, py,      hw * 2, CellPx * 0.5f + hw), floorCol);
+        if ((open & Dir.S) != 0)
+            DrawRect(new Rect2(cx - hw, cy - hw, hw * 2, CellPx * 0.5f + hw), floorCol);
+        if ((open & Dir.E) != 0)
+            DrawRect(new Rect2(cx - hw, cy - hw, CellPx * 0.5f + hw, hw * 2), floorCol);
+        if ((open & Dir.W) != 0)
+            DrawRect(new Rect2(px,      cy - hw, CellPx * 0.5f + hw, hw * 2), floorCol);
 
-        DrawString(_font, new Vector2(px + CellPx * 0.5f, py + CellPx * 0.5f + 5),
-            PieceDB.ShortLabels[piece.Type], HorizontalAlignment.Center, CellPx - 4, 14, Colors.White);
+        // ── Opening edge accents (connection-state indicator) ─────────────────
+        const float ew = 3f;
+        foreach (Dir dir in AllDirs)
+        {
+            if ((open & dir) == 0) continue;
+            int  di      = System.Array.IndexOf(AllDirs, dir);
+            var (dx, dy) = DirDelta[di];
+            Dir  opp     = Opposite[di];
 
+            int  nFloor     = (piece.Type == PieceType.Stairs &&
+                               dir == PieceDB.GetStairUpDir(piece.Rotation))
+                              ? piece.Floor + 1 : piece.Floor;
+            bool nbExists   = lookup.ContainsKey((piece.X + dx, piece.Y + dy, nFloor));
+            bool nbConnects = nbExists &&
+                (PieceDB.GetOpenings(lookup[(piece.X + dx, piece.Y + dy, nFloor)].Type,
+                                     lookup[(piece.X + dx, piece.Y + dy, nFloor)].Rotation)
+                 & opp) != 0;
+
+            Color accent = (nbExists && !nbConnects) ? CInvalid : col.Lightened(0.35f);
+            switch (dir)
+            {
+                case Dir.N: DrawRect(new Rect2(cx - hw, py,              hw * 2, ew), accent); break;
+                case Dir.S: DrawRect(new Rect2(cx - hw, py + CellPx - ew, hw * 2, ew), accent); break;
+                case Dir.E: DrawRect(new Rect2(px + CellPx - ew, cy - hw, ew, hw * 2), accent); break;
+                case Dir.W: DrawRect(new Rect2(px,               cy - hw, ew, hw * 2), accent); break;
+            }
+        }
+
+        // ── Stairs ramp arrow ─────────────────────────────────────────────────
         if (piece.Type == PieceType.Stairs)
-            DrawString(_font, new Vector2(px + CellPx * 0.5f, py + CellPx - 8),
-                "F" + (piece.Floor + 1), HorizontalAlignment.Center, CellPx, 9, CGoldText);
+        {
+            Dir   upDir = PieceDB.GetStairUpDir(piece.Rotation);
+            Color arrow = CGoldText.Lightened(0.1f);
+            // Draw a diagonal slash indicating the ramp incline direction
+            (float ax, float ay, float bx, float by) = upDir switch
+            {
+                Dir.N => (cx, cy + hw * 0.8f,  cx, cy - hw * 0.8f),  // low → high going north
+                Dir.S => (cx, cy - hw * 0.8f,  cx, cy + hw * 0.8f),
+                Dir.E => (cx - hw * 0.8f, cy,  cx + hw * 0.8f, cy),
+                Dir.W => (cx + hw * 0.8f, cy,  cx - hw * 0.8f, cy),
+                _     => (cx - hw, cy, cx + hw, cy),
+            };
+            DrawLine(new Vector2(ax, ay), new Vector2(bx, by), arrow, 2f);
+            // Arrowhead at high end
+            float aLen = 5f;
+            Vector2 tip = new(bx, by);
+            Vector2 dir2 = (tip - new Vector2(ax, ay)).Normalized();
+            Vector2 perp = new(-dir2.Y, dir2.X);
+            DrawLine(tip, tip - dir2 * aLen + perp * aLen * 0.5f, arrow, 2f);
+            DrawLine(tip, tip - dir2 * aLen - perp * aLen * 0.5f, arrow, 2f);
 
-        // Selection highlight
+            DrawString(_font, new Vector2(cx, py + CellPx - 7),
+                "F" + (piece.Floor + 1), HorizontalAlignment.Center, CellPx, 9, CGoldText);
+        }
+
+        // ── Label (small, faint, inside corridor area) ────────────────────────
+        DrawString(_font, new Vector2(cx, cy + 4),
+            PieceDB.ShortLabels[piece.Type],
+            HorizontalAlignment.Center, CellPx - 4, 11,
+            new Color(1f, 1f, 1f, 0.45f));
+
+        // ── Selection highlight ───────────────────────────────────────────────
         if (piece == _picked)
         {
             DrawRect(new Rect2(px, py, CellPx, CellPx), CSelFill);
             DrawRect(new Rect2(px, py, CellPx, CellPx), CSelBorder, filled: false, width: 3f);
-        }
-    }
-
-    void DrawFace(float px, float py, Dir dir, Dir openings,
-        Dictionary<(int, int, int), MazePiece> lookup,
-        MazePiece piece, float w, float gapOff, float gapPx, Color pieceColor)
-    {
-        bool isOpen = (openings & dir) != 0;
-        int  di     = System.Array.IndexOf(AllDirs, dir);
-        var (dx, dy) = DirDelta[di];
-        Dir  opp    = Opposite[di];
-
-        int nFloor = (piece.Type == PieceType.Stairs && dir == Dir.N)
-            ? piece.Floor + 1 : piece.Floor;
-        bool nbExists   = lookup.ContainsKey((piece.X + dx, piece.Y + dy, nFloor));
-        bool nbConnects = nbExists &&
-            (PieceDB.GetOpenings(lookup[(piece.X + dx, piece.Y + dy, nFloor)].Type,
-                                 lookup[(piece.X + dx, piece.Y + dy, nFloor)].Rotation) & opp) != 0;
-
-        bool connError = isOpen && nbExists && !nbConnects;
-        Color openCol  = connError ? CInvalid : pieceColor.Lightened(0.25f);
-
-        if (isOpen)
-        {
-            switch (dir)
-            {
-                case Dir.N:
-                    DrawRect(new Rect2(px,                   py, gapOff,             w        ), CWall);
-                    DrawRect(new Rect2(px + gapOff,          py, gapPx,              w * 0.5f ), openCol);
-                    DrawRect(new Rect2(px + gapOff + gapPx,  py, CellPx-gapOff-gapPx, w      ), CWall);
-                    break;
-                case Dir.S:
-                    DrawRect(new Rect2(px,                   py+CellPx-w, gapOff,             w        ), CWall);
-                    DrawRect(new Rect2(px + gapOff,          py+CellPx-w*0.5f, gapPx,         w * 0.5f ), openCol);
-                    DrawRect(new Rect2(px + gapOff + gapPx,  py+CellPx-w, CellPx-gapOff-gapPx, w      ), CWall);
-                    break;
-                case Dir.E:
-                    DrawRect(new Rect2(px+CellPx-w, py,                  w,        gapOff             ), CWall);
-                    DrawRect(new Rect2(px+CellPx-w*0.5f, py+gapOff,      w * 0.5f, gapPx             ), openCol);
-                    DrawRect(new Rect2(px+CellPx-w, py+gapOff+gapPx,     w,        CellPx-gapOff-gapPx), CWall);
-                    break;
-                case Dir.W:
-                    DrawRect(new Rect2(px, py,                w,        gapOff             ), CWall);
-                    DrawRect(new Rect2(px, py+gapOff,         w * 0.5f, gapPx             ), openCol);
-                    DrawRect(new Rect2(px, py+gapOff+gapPx,   w,        CellPx-gapOff-gapPx), CWall);
-                    break;
-            }
-        }
-        else
-        {
-            switch (dir)
-            {
-                case Dir.N: DrawRect(new Rect2(px, py,              CellPx, w     ), CWall); break;
-                case Dir.S: DrawRect(new Rect2(px, py+CellPx-w,     CellPx, w     ), CWall); break;
-                case Dir.E: DrawRect(new Rect2(px+CellPx-w, py,     w,      CellPx), CWall); break;
-                case Dir.W: DrawRect(new Rect2(px, py,              w,      CellPx), CWall); break;
-            }
         }
     }
 
@@ -590,6 +624,18 @@ public partial class MapEditorMain : Node2D
         { _statusLbl.Text = "Only one Start allowed"; return; }
         if (_selType == PieceType.Exit && _maze.Pieces.Any(p => p.Type == PieceType.Exit))
         { _statusLbl.Text = "Only one Exit allowed"; return; }
+
+        // ── Row zone constraints ──────────────────────────────────────────────
+        if (_selType == PieceType.Start && (y != 0 || _floor != 0))
+        { _statusLbl.Text = "Start must be in the top row (row 0, floor 0)"; return; }
+        if (_selType == PieceType.Exit && (y != GridH - 1 || _floor != 0))
+        { _statusLbl.Text = "Exit must be in the bottom row (floor 0)"; return; }
+
+        // Block placement on stair ghost cells (stairs from the floor below occupy this cell)
+        if (_floor > 0 && _maze.Pieces.Any(p =>
+                p.Type == PieceType.Stairs && p.Floor == _floor - 1 &&
+                p.X == x && p.Y == y))
+        { _statusLbl.Text = "Stairs from below occupy this cell"; return; }
 
         int rot = InferRotation(_selType, x, y, _floor, exclude: null);
 
@@ -742,8 +788,30 @@ public partial class MapEditorMain : Node2D
         bool hasExit  = _maze.Pieces.Any(p => p.Type == PieceType.Exit);
         if (!hasStart || !hasExit)
         { _statusLbl.Text = "Need a Start and Exit piece!"; return; }
+
+        // Validate all stair exits are connected
+        foreach (var stair in _maze.Pieces.Where(p => p.Type == PieceType.Stairs))
+        {
+            Dir upDir = PieceDB.GetStairUpDir(stair.Rotation);
+            int di    = System.Array.IndexOf(AllDirs, upDir);
+            var (dx, dy) = DirDelta[di];
+            bool connected = _maze.Pieces.Any(p =>
+                p.Floor == stair.Floor + 1 &&
+                p.X == stair.X + dx && p.Y == stair.Y + dy &&
+                (PieceDB.GetOpenings(p.Type, p.Rotation) & Opposite[di]) != 0);
+            if (!connected)
+            {
+                _statusLbl.Text = $"Stairs at ({stair.X},{stair.Y}) F{stair.Floor} has no exit above!";
+                _floor = stair.Floor + 1;
+                _floorLbl.Text = $"Floor {_floor}";
+                QueueRedraw();
+                return;
+            }
+        }
+
         OnSaveSlot(_slot);
-        GD.Print("[MapEditor] DungeonGame scene not yet implemented.");
+        GameState.ActiveSlot = _slot;
+        GetTree().ChangeSceneToFile("res://scenes/DungeonGame.tscn");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -783,10 +851,24 @@ public partial class MapEditorMain : Node2D
     {
         bool hasStart = _maze.Pieces.Any(p => p.Type == PieceType.Start);
         bool hasExit  = _maze.Pieces.Any(p => p.Type == PieceType.Exit);
-        if (!hasStart && !hasExit)      _statusLbl.Text = "Place a Start and Exit";
-        else if (!hasStart)             _statusLbl.Text = "Missing Start piece";
-        else if (!hasExit)              _statusLbl.Text = "Missing Exit piece";
-        else                            _statusLbl.Text = "";
+        if (!hasStart && !hasExit)      { _statusLbl.Text = "Place a Start and Exit"; return; }
+        if (!hasStart)                  { _statusLbl.Text = "Missing Start piece"; return; }
+        if (!hasExit)                   { _statusLbl.Text = "Missing Exit piece"; return; }
+
+        // Check stair connections
+        foreach (var stair in _maze.Pieces.Where(p => p.Type == PieceType.Stairs))
+        {
+            Dir upDir = PieceDB.GetStairUpDir(stair.Rotation);
+            int di    = System.Array.IndexOf(AllDirs, upDir);
+            var (dx, dy) = DirDelta[di];
+            bool ok = _maze.Pieces.Any(p =>
+                p.Floor == stair.Floor + 1 &&
+                p.X == stair.X + dx && p.Y == stair.Y + dy &&
+                (PieceDB.GetOpenings(p.Type, p.Rotation) & Opposite[di]) != 0);
+            if (!ok) { _statusLbl.Text = $"Stairs at ({stair.X},{stair.Y}) needs exit"; return; }
+        }
+
+        _statusLbl.Text = "";
     }
 
     void UpdateAllSlotLabels()

@@ -23,8 +23,10 @@ Openings rotate clockwise with the piece.
 
 ### 1. Modular Piece → 3D Dungeon Mesh
 - **Why isolated:** Each piece maps to a pre-defined 3D mesh segment. Must get winding, UVs, and seams correct at piece boundaries. Openings must align at face centers.
-- **Approach:** Per piece type, procedurally build walls/floor/ceiling using SurfaceTool quads. A 10m×10m×3m cell has 4 wall quads (each 10×3m), 1 floor quad, 1 ceiling quad, minus the opening faces. Opening = a 3m-wide × 2.5m-tall gap centered on the face. Stairs = ramp quad from floor F ground level to floor F+1 ground level at ~15° angle. Call GenerateNormals(). UV = world XZ/3 for seamless tiling.
-- **Verify:** Screenshot from inside generated dungeon — floor/ceiling/walls visible, opening gaps align correctly between adjacent pieces, no holes, no inside-out faces.
+- **Aesthetic:** Liminal / backrooms feel — very tall ceilings, nearly full-height openings, pale off-white walls, harsh flat lighting. Oppressive scale.
+- **Dimensions:** Cell = 10m × 10m footprint. Ceiling height = 6m (tall and liminal). Opening gap = 3m wide × 5.5m tall, centered on face. Floor F+1 starts at Y = 6m (floor-to-floor height = 6m). Stairs ramp from Y=0 at S face to Y=6m at N face across 10m depth (~31° incline).
+- **Approach:** Per piece type, procedurally build walls/floor/ceiling using SurfaceTool quads. Call GenerateNormals(). UV = world position / tileSize for seamless tiling. StaticBody3D with ConcavePolygonShape3D for collision (mesh shape, not CSG). No textures for risk prototype — solid color materials only.
+- **Verify:** Screenshot from inside generated dungeon — tall corridor visible, opening gaps align between pieces, floor and ceiling present, no holes, no inside-out faces.
 
 ### 2. First-Person Player Controller
 - **Why isolated:** Mouse look + capsule in narrow (3m wide) corridors. Clamp, gravity, and step-through are finicky.
@@ -38,7 +40,7 @@ Use verified risk systems + existing piece editor to assemble full game loop.
 - Map editor redesign: piece-based drag/snap system with 5 save slots + select-for-matchmaking
 - Main menu: Play (→ map selection), Map Builder, Settings
 - Map selection screen: shows saved mazes, gold spent, Select for matchmaking button
-- Dungeon assembly: load both players' mazes, attach exits to small central weapon room
+- Dungeon assembly: load both players' mazes, join Exit-to-Exit via a connector corridor (see Dual-Maze Connection below)
 - Weapon pickup: one iron sword in central room (Area3D detect), weapon disappears on pickup
 - Enemy AI: simple NavigationAgent3D path-to-player
 - Combat: swing weapon on LMB, 1-hit kill on enemy
@@ -66,11 +68,56 @@ Use verified risk systems + existing piece editor to assemble full game loop.
 - reference.png consistency: stone dungeon, torch lighting, HUD layout
 - **Presentation video:** ~30s MP4 — editor placing pieces → switch to 3D → walk → pick up sword → fight
 
+## Dual-Maze Connection Architecture
+
+### Layout
+```
+[Player A Maze]          [Connector]         [Player B Maze]
+  Start (row 0)                                Start (row 0)
+  ↓  (corridors)                               ↓  (corridors)
+  Exit (row 9) → [ 6m wide bridge corridor ] ← Exit (row 9)
+```
+
+### Implementation Plan
+1. **Maze A** is built normally at world offset (0, 0, 0).
+2. **Maze B** is flipped 180° (rotated around Y) and placed so its Exit
+   aligns with Maze A's Exit. The bridge between them is a straight 6m-wide
+   corridor segment, length = 1 cell (10 m). Both exit openings face this
+   bridge.
+3. **World offset for Maze B**: 
+   - Maze B is placed at `z = GridH * CellSize + BridgeLen` (south of Maze A),
+     then its pieces are rendered with `z' = offset - piece.Y * CellSize`
+     (mirror Z) so its row 0 is farthest from the bridge and row 9 (Exit) faces
+     Maze A's Exit.
+4. **Bridge corridor**: a single straight N-S corridor piece placed between the
+   two exits at `z = GridH * CellSize` (Maze A's exit face) to `z + CellSize`
+   (Maze B's exit face). The weapon pickup spawns in the center of the bridge.
+5. **Single DungeonGame scene** hosts both maze builds and the bridge, sharing
+   one physics world. Both players spawn at their respective Start pieces.
+
+### Key Design Constraints (enforced by editor)
+- **Start** piece: row 0 only, floor 0 only → always at the far end of the maze.
+- **Exit** piece: row GridH-1 only, floor 0 only → always at the connecting end.
+- Both constraints enforced in `PlaceNew()` in MapEditorMain.cs.
+
+### Data Flow
+```
+GameState.SlotA (int)   → MazeSerializer.Load(SlotA) → DungeonBuilder.Build(dataA, offsetA, flipA=false)
+GameState.SlotB (int)   → MazeSerializer.Load(SlotB) → DungeonBuilder.Build(dataB, offsetB, flipB=true)
+Bridge corridor         → DungeonBuilder.BuildBridge(exitA_pos, exitB_pos)
+```
+
+### Next Implementation Steps (Risk 3)
+- Add `Build(MazeData, Vector3 offset, bool flipZ)` overload to DungeonBuilder
+- Add `BuildBridge(Vector3 posA, Vector3 posB)` helper
+- Add `GameState.SlotA`, `GameState.SlotB` fields
+- Add maze-selection screen so each player picks their slot before entering
+
 ## Task Status
 
 - [x] Piece system data layer (PieceDB, MazeData, MazeSerializer)
 - [x] Map editor rewrite (piece placement, save slots)
-- [ ] Risk 1: Piece → 3D Mesh
-- [ ] Risk 2: First-Person Controller
+- [x] Risk 1: Piece → 3D Mesh
+- [x] Risk 2: First-Person Controller (ULTRAKILL movement — slide, slide-jump, wall-run, wall-jump)
 - [ ] Main Build
 - [ ] Presentation Video
