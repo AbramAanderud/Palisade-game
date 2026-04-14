@@ -32,7 +32,7 @@ public partial class ArenaBuilder : Node3D
     // ── Shaders (duplicated from DungeonBuilder for self-contained build) ─────
     const string StoneShaderSrc = @"
 shader_type spatial;
-render_mode diffuse_burley, specular_schlick_ggx;
+render_mode diffuse_burley, specular_schlick_ggx, cull_disabled;
 uniform vec3 base_color : source_color = vec3(0.42, 0.37, 0.30);
 uniform vec3 mortar_color : source_color = vec3(0.22, 0.20, 0.18);
 uniform float brick_scale = 0.28;
@@ -59,7 +59,7 @@ void fragment(){
 }";
     const string FloorShaderSrc = @"
 shader_type spatial;
-render_mode diffuse_burley, specular_schlick_ggx;
+render_mode diffuse_burley, specular_schlick_ggx, cull_disabled;
 uniform vec3 stone_color : source_color = vec3(0.32, 0.29, 0.25);
 uniform vec3 grout_color : source_color = vec3(0.18, 0.17, 0.15);
 uniform float tile_scale = 0.20;
@@ -137,13 +137,14 @@ void fragment(){
         if (openSouth) AddArchDoorway(wallST, domeST, northFacing: false);
 
         // ── Floor (polygon fan) ────────────────────────────────────────────────
+        // Winding: center → b → a gives counterclockwise from above → normal faces UP (+Y).
         for (int i = 0; i < Sides; i++)
         {
             Vector3 a = outer[i];
             Vector3 b = outer[(i + 1) % Sides];
             floorST.SetUV(UV(Vector3.Zero)); floorST.AddVertex(Vector3.Zero);
-            floorST.SetUV(UV(a));            floorST.AddVertex(a);
             floorST.SetUV(UV(b));            floorST.AddVertex(b);
+            floorST.SetUV(UV(a));            floorST.AddVertex(a);
         }
 
         // ── Dome ceiling ───────────────────────────────────────────────────────
@@ -192,11 +193,23 @@ void fragment(){
                 Position        = new(tx, WallH * 0.45f, tz),
                 LightColor      = new(1.0f, 0.68f, 0.22f),
                 LightEnergy     = 3.2f,
-                OmniRange       = 22f,
+                OmniRange       = 40f,
                 OmniAttenuation = 0.55f,
                 ShadowEnabled   = false,
             });
         }
+
+        // ── Dome apex light (centre top of hemisphere) ─────────────────────────
+        AddChild(new OmniLight3D
+        {
+            Name            = "DomeApexLight",
+            Position        = new(0f, WallH + Radius * 0.95f, 0f),
+            LightColor      = new(0.85f, 0.78f, 1.0f),   // cool bluish-white
+            LightEnergy     = 4.0f,
+            OmniRange       = Radius * 2.2f,
+            OmniAttenuation = 0.4f,
+            ShadowEnabled   = false,
+        });
     }
 
     // ── Arch doorway geometry ─────────────────────────────────────────────────
@@ -213,10 +226,11 @@ void fragment(){
         // ── Side jambs: wall flanking the arch ────────────────────────────────
         // West jamb: from wall edge to -hw at the face Z
         float wallEdge = Mathf.Sqrt(Mathf.Max(0f, Radius * Radius - zFace * zFace));
+        // Jamb faces inward: north jamb → +Z (nSign=-1 → normalX=+1); south jamb → -Z (nSign=+1 → normalX=-1)
         // West side of corridor: x from -wallEdge to -hw
-        AddVertPanel(wallST, -wallEdge, -hw, zFace, 0f, WallH, normalX: nSign > 0 ? 1f : -1f);
+        AddVertPanel(wallST, -wallEdge, -hw, zFace, 0f, WallH, normalX: nSign > 0 ? -1f : 1f);
         // East side: x from +hw to +wallEdge
-        AddVertPanel(wallST, hw, wallEdge, zFace, 0f, WallH, normalX: nSign > 0 ? 1f : -1f);
+        AddVertPanel(wallST, hw, wallEdge, zFace, 0f, WallH, normalX: nSign > 0 ? -1f : 1f);
 
         // ── Arch soffit: barrel vault above corridor opening ──────────────────
         for (int i = 0; i < ArchSegs; i++)

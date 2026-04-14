@@ -408,11 +408,11 @@ public partial class PlayerController : CharacterBody3D
 
         if (slopeSign < 0f)
         {
-            // Going uphill: cap horizontal speed to WalkSpeed
+            // Going uphill: cap horizontal speed to SprintSpeed (slightly quicker on stairs)
             float spd = velXZ.Length();
-            if (spd > WalkSpeed)
+            if (spd > SprintSpeed)
             {
-                velXZ = velXZ.Normalized() * WalkSpeed;
+                velXZ = velXZ.Normalized() * SprintSpeed;
                 vel.X = velXZ.X;
                 vel.Z = velXZ.Z;
             }

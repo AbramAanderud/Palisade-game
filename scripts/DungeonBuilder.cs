@@ -331,9 +331,46 @@ void fragment() {
         if (hasS && !IsConnected(Dir.S, piece, lookup) && !exitS) CapWallNS(wallST, cx-hw, cx+hw, z1, y0, yTop, -1);
         if (hasE && !IsConnected(Dir.E, piece, lookup) && !exitE) CapWallEW(wallST, cz-hw, cz+hw, x1, y0, yTop, -1);
         if (hasW && !IsConnected(Dir.W, piece, lookup) && !exitW) CapWallEW(wallST, cz-hw, cz+hw, x0, y0, yTop, +1);
+
+        // ── Exit connector arms ───────────────────────────────────────────────────
+        // When the exit opens toward the arena in a direction that isn't a natural opening
+        // of this piece type, add the arm floor + walls + vault so there's no 2 m gap.
+        if (exitS && !hasS)
+        {
+            Quad(floorST, new(cx-hw,y0,cz+hw), new(cx+hw,y0,cz+hw),
+                          new(cx+hw,y0,z1),    new(cx-hw,y0,z1));
+            BarrelX(ceilST, cx-hw, cz+hw, cx+hw, z1, y1);
+            NSWall(wallST, cx-hw, cz+hw, z1, y0, yTop, +1);
+            NSWall(wallST, cx+hw, cz+hw, z1, y0, yTop, -1);
+        }
+        if (exitN && !hasN)
+        {
+            Quad(floorST, new(cx-hw,y0,z0),    new(cx+hw,y0,z0),
+                          new(cx+hw,y0,cz-hw),  new(cx-hw,y0,cz-hw));
+            BarrelX(ceilST, cx-hw, z0, cx+hw, cz-hw, y1);
+            NSWall(wallST, cx-hw, z0, cz-hw, y0, yTop, +1);
+            NSWall(wallST, cx+hw, z0, cz-hw, y0, yTop, -1);
+        }
+        if (exitE && !hasE)
+        {
+            Quad(floorST, new(cx+hw,y0,cz-hw), new(x1,y0,cz-hw),
+                          new(x1,y0,cz+hw),     new(cx+hw,y0,cz+hw));
+            BarrelZ(ceilST, cx+hw, cz-hw, x1, cz+hw, y1);
+            EWWall(wallST, cz-hw, cx+hw, x1, y0, yTop, +1);
+            EWWall(wallST, cz+hw, cx+hw, x1, y0, yTop, -1);
+        }
+        if (exitW && !hasW)
+        {
+            Quad(floorST, new(x0,y0,cz-hw),   new(cx-hw,y0,cz-hw),
+                          new(cx-hw,y0,cz+hw),  new(x0,y0,cz+hw));
+            BarrelZ(ceilST, x0, cz-hw, cx-hw, cz+hw, y1);
+            EWWall(wallST, cz-hw, x0, cx-hw, y0, yTop, +1);
+            EWWall(wallST, cz+hw, x0, cx-hw, y0, yTop, -1);
+        }
     }
 
     // Returns true when the adjacent cell exists and its openings face back toward us.
+    // Also returns true when a stair on floor-1 exits upward into this face (cross-floor join).
     static bool IsConnected(Dir dir, MazePiece piece, Dictionary<(int, int, int), MazePiece> lookup)
     {
         Dir opposite = dir switch { Dir.N => Dir.S, Dir.S => Dir.N, Dir.E => Dir.W, _ => Dir.E };
@@ -344,8 +381,15 @@ void fragment() {
             Dir.E => (piece.X + 1, piece.Y),
             _     => (piece.X - 1, piece.Y),
         };
-        if (!lookup.TryGetValue((nx, ny, piece.Floor), out var neighbor)) return false;
-        return (PieceDB.GetOpenings(neighbor.Type, neighbor.Rotation) & opposite) != 0;
+        // Same-floor neighbor
+        if (lookup.TryGetValue((nx, ny, piece.Floor), out var neighbor))
+            if ((PieceDB.GetOpenings(neighbor.Type, neighbor.Rotation) & opposite) != 0)
+                return true;
+        // Cross-floor: a stair on floor-1 whose high exit faces toward us (no cap on stair top)
+        if (piece.Floor > 0 && lookup.TryGetValue((nx, ny, piece.Floor - 1), out var below))
+            if (below.Type == PieceType.Stairs && PieceDB.GetStairUpDir(below.Rotation) == opposite)
+                return true;
+        return false;
     }
 
     // ── Corridor wall helpers ─────────────────────────────────────────────────

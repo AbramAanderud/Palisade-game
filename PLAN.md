@@ -2,26 +2,27 @@
 
 ## Game Description
 
-Players design modular dungeons using snap-together pieces (straight hall, L-hall, T-junction, stairs). Before matchmaking, a player builds up to 5 saved mazes and selects the best one. Matchmaking pairs players by gold spent. Both mazes are joined at a small central weapon room. The game plays first-person: race to find your exit, claim the weapon, hunt the opponent. First out earns 50 gold; killing the opponent earns +50 (total 100). Winning by kill earns 200 gold. Gold funds new maze pieces.
+Players design modular dungeons using snap-together pieces (straight hall, L-hall, T-junction, stairs). Before matchmaking, a player builds up to 5 saved mazes and selects the best one. Matchmaking pairs players by gold spent. Both mazes are joined at a small central weapon room or "arena". The game plays first-person: race to find your exit, claim the weapon, hunt the opponent. First out earns 50 gold; killing the opponent earns +50 (total 100). Winning by kill earns 200 gold. Gold funds new maze pieces.
 
 ## Piece System
 
 Each piece occupies exactly one 10×10m grid cell. Openings are fixed at the center of each face (N/S/E/W). All pieces fit together automatically — no geometry math needed.
 
-| Piece | Openings (rot=0) | Cost |
-|-------|-----------------|------|
-| Start | S only | free |
-| Exit | N only | free |
-| Straight | N + S | free |
-| LHall | N + E | free |
-| THall | N + E + S | 25g |
-| Stairs | S (floor F) + N (floor F+1) | 50g |
+| Piece    | Openings (rot=0)            | Cost |
+| -------- | --------------------------- | ---- |
+| Start    | S only                      | free |
+| Exit     | N only                      | free |
+| Straight | N + S                       | free |
+| LHall    | N + E                       | free |
+| THall    | N + E + S                   | 25g  |
+| Stairs   | S (floor F) + N (floor F+1) | 50g  |
 
 Openings rotate clockwise with the piece.
 
 ## Risk Tasks
 
 ### 1. Modular Piece → 3D Dungeon Mesh
+
 - **Why isolated:** Each piece maps to a pre-defined 3D mesh segment. Must get winding, UVs, and seams correct at piece boundaries. Openings must align at face centers.
 - **Aesthetic:** Liminal / backrooms feel — very tall ceilings, nearly full-height openings, pale off-white walls, harsh flat lighting. Oppressive scale.
 - **Dimensions:** Cell = 10m × 10m footprint. Ceiling height = 6m (tall and liminal). Opening gap = 3m wide × 5.5m tall, centered on face. Floor F+1 starts at Y = 6m (floor-to-floor height = 6m). Stairs ramp from Y=0 at S face to Y=6m at N face across 10m depth (~31° incline).
@@ -29,8 +30,9 @@ Openings rotate clockwise with the piece.
 - **Verify:** Screenshot from inside generated dungeon — tall corridor visible, opening gaps align between pieces, floor and ceiling present, no holes, no inside-out faces.
 
 ### 2. First-Person Player Controller
+
 - **Why isolated:** Mouse look + capsule in narrow (3m wide) corridors. Clamp, gravity, and step-through are finicky.
-- **Approach:** CharacterBody3D GROUNDED mode. CapsuleShape3D radius=0.35m height=1.6m. Mouse captured in _Ready(). Horizontal yaw on root node, vertical pitch on Camera3D child (clamped ±85°). Gravity constant. MoveAndSlide() each physics tick.
+- **Approach:** CharacterBody3D GROUNDED mode. CapsuleShape3D radius=0.35m height=1.6m. Mouse captured in \_Ready(). Horizontal yaw on root node, vertical pitch on Camera3D child (clamped ±85°). Gravity constant. MoveAndSlide() each physics tick.
 - **Verify:** Walk all 4 directions, 360° horizontal look, vertical clamp, no clipping through walls in 3m-wide corridors.
 
 ## Main Build
@@ -51,11 +53,13 @@ Use verified risk systems + existing piece editor to assemble full game loop.
 - Gold persistence: saved to user://profile.json
 
 **Assets needed:**
+
 - Stone wall texture (tileable 512×512)
 - Stone floor texture (tileable 512×512)
 - Iron sword sprite/model (for pickup + held weapon)
 
 **Verify:**
+
 - All 5 piece types snap correctly in editor
 - Mazes save and load across sessions
 - 3D dungeon generates from saved piece data, correctly joined to central room
@@ -71,6 +75,7 @@ Use verified risk systems + existing piece editor to assemble full game loop.
 ## Dual-Maze Connection Architecture
 
 ### Layout
+
 ```
 [Player A Maze]          [Connector]         [Player B Maze]
   Start (row 0)                                Start (row 0)
@@ -79,12 +84,13 @@ Use verified risk systems + existing piece editor to assemble full game loop.
 ```
 
 ### Implementation Plan
+
 1. **Maze A** is built normally at world offset (0, 0, 0).
 2. **Maze B** is flipped 180° (rotated around Y) and placed so its Exit
    aligns with Maze A's Exit. The bridge between them is a straight 6m-wide
    corridor segment, length = 1 cell (10 m). Both exit openings face this
    bridge.
-3. **World offset for Maze B**: 
+3. **World offset for Maze B**:
    - Maze B is placed at `z = GridH * CellSize + BridgeLen` (south of Maze A),
      then its pieces are rendered with `z' = offset - piece.Y * CellSize`
      (mirror Z) so its row 0 is farthest from the bridge and row 9 (Exit) faces
@@ -96,11 +102,13 @@ Use verified risk systems + existing piece editor to assemble full game loop.
    one physics world. Both players spawn at their respective Start pieces.
 
 ### Key Design Constraints (enforced by editor)
+
 - **Start** piece: row 0 only, floor 0 only → always at the far end of the maze.
 - **Exit** piece: row GridH-1 only, floor 0 only → always at the connecting end.
 - Both constraints enforced in `PlaceNew()` in MapEditorMain.cs.
 
 ### Data Flow
+
 ```
 GameState.SlotA (int)   → MazeSerializer.Load(SlotA) → DungeonBuilder.Build(dataA, offsetA, flipA=false)
 GameState.SlotB (int)   → MazeSerializer.Load(SlotB) → DungeonBuilder.Build(dataB, offsetB, flipB=true)
@@ -108,6 +116,7 @@ Bridge corridor         → DungeonBuilder.BuildBridge(exitA_pos, exitB_pos)
 ```
 
 ### Next Implementation Steps (Risk 3)
+
 - Add `Build(MazeData, Vector3 offset, bool flipZ)` overload to DungeonBuilder
 - Add `BuildBridge(Vector3 posA, Vector3 posB)` helper
 - Add `GameState.SlotA`, `GameState.SlotB` fields
