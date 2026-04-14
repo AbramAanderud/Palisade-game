@@ -53,8 +53,9 @@ public partial class MapEditorMain : Node2D
     Label       _floorLbl  = null!;
     Label       _goldLbl   = null!;
     Label       _statusLbl = null!;
-    OptionButton _arenaSlotA = null!;
-    OptionButton _arenaSlotB = null!;
+    OptionButton _arenaSlotA   = null!;
+    OptionButton _arenaSlotB   = null!;
+    OptionButton _arenaSpawn   = null!;
 
     // ══════════════════════════════════════════════════════════════════════════
     //  LIFECYCLE
@@ -181,6 +182,19 @@ public partial class MapEditorMain : Node2D
         for (int i = 0; i < 5; i++) _arenaSlotB.AddItem($"Slot {i}", i);
         _arenaSlotB.Selected = 1;
         rowB.AddChild(_arenaSlotB);
+
+        var spawnRow = new HBoxContainer();
+        spawnRow.AddThemeConstantOverride("separation", 4);
+        vbox.AddChild(spawnRow);
+        var spawnLbl = new Label { Text = "Spawn:", CustomMinimumSize = new Vector2(48, 0) };
+        spawnLbl.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
+        spawnRow.AddChild(spawnLbl);
+        _arenaSpawn = new OptionButton { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
+        _arenaSpawn.AddItem("Maze A",  0);
+        _arenaSpawn.AddItem("Maze B",  1);
+        _arenaSpawn.AddItem("Arena",   2);
+        _arenaSpawn.Selected = 0;
+        spawnRow.AddChild(_arenaSpawn);
 
         var arenaBtn = new Button { Text = "PLAY ARENA", CustomMinimumSize = new Vector2(0, 40) };
         arenaBtn.AddThemeFontSizeOverride("font_size", 13);
@@ -665,8 +679,8 @@ public partial class MapEditorMain : Node2D
         // ── Row zone constraints ──────────────────────────────────────────────
         if (_selType == PieceType.Start && (y != 0 || _floor != 0))
         { _statusLbl.Text = "Start must be in the top row (row 0, floor 0)"; return; }
-        if (_selType == PieceType.Exit && (y != GridH - 1 || _floor != 0))
-        { _statusLbl.Text = "Exit must be in the bottom row (floor 0)"; return; }
+        if (_selType == PieceType.Exit && y != GridH - 1)
+        { _statusLbl.Text = "Exit must be in the last row (row 9)"; return; }
 
         // Block placement on stair ghost cells (stairs from the floor below occupy this cell)
         if (_floor > 0 && _maze.Pieces.Any(p =>
@@ -799,6 +813,9 @@ public partial class MapEditorMain : Node2D
 
     void OnLoadSlot(int slot)
     {
+        // Auto-save any unsaved changes to the current slot before switching
+        MazeSerializer.Save(_slot, _maze);
+
         _picked = null;
         var data = MazeSerializer.Load(slot);
         _maze  = data ?? new MazeData();
@@ -865,6 +882,12 @@ public partial class MapEditorMain : Node2D
         GameState.IsArenaMode = true;
         GameState.ArenaSlotA  = a;
         GameState.ArenaSlotB  = b;
+        DungeonArena.ChosenSpawn = _arenaSpawn.Selected switch
+        {
+            1 => DungeonArena.SpawnPoint.MazeB,
+            2 => DungeonArena.SpawnPoint.Arena,
+            _ => DungeonArena.SpawnPoint.MazeA,
+        };
         GetTree().ChangeSceneToFile("res://scenes/DungeonArena.tscn");
     }
 

@@ -156,13 +156,23 @@ void fragment() {
 
             var body = new StaticBody3D { Name = $"Cell_{p.X}_{p.Y}_{floor}" };
             AddChild(body);
-            AddMesh(body, Commit(wallST),  $"Wall_{p.X}_{p.Y}",  default);
-            AddMesh(body, Commit(floorST), $"Floor_{p.X}_{p.Y}", default);
-            AddMesh(body, Commit(ceilST),  $"Ceil_{p.X}_{p.Y}",  default);
 
-            // Smooth ramp collision for stairs — added to the same per-cell body
             if (p.Type == PieceType.Stairs)
+            {
+                // Walls still need collision (player bumps the side walls).
+                // Tread/riser floor and ceiling are visual-only so they don't
+                // conflict with the smooth ramp CollisionShape3D added below.
+                AddMesh(body, Commit(wallST), $"Wall_{p.X}_{p.Y}", default);
+                AddMeshVisual(body, Commit(floorST), $"Floor_{p.X}_{p.Y}", isFloor: true);
+                AddMeshVisual(body, Commit(ceilST),  $"Ceil_{p.X}_{p.Y}",  isFloor: false);
                 AddStairRamp(body, p, yBase);
+            }
+            else
+            {
+                AddMesh(body, Commit(wallST),  $"Wall_{p.X}_{p.Y}",  default);
+                AddMesh(body, Commit(floorST), $"Floor_{p.X}_{p.Y}", default);
+                AddMesh(body, Commit(ceilST),  $"Ceil_{p.X}_{p.Y}",  default);
+            }
         }
     }
 
@@ -200,6 +210,16 @@ void fragment() {
         var rampMesh = Commit(rampST);
         if (rampMesh != null)
             body.AddChild(new CollisionShape3D { Name = "StairRamp", Shape = rampMesh.CreateTrimeshShape() });
+    }
+
+    // Add a mesh as visual-only (no collision). Used for stair tread/riser geometry
+    // so the stepped trimesh doesn't conflict with the smooth ramp collision shape.
+    void AddMeshVisual(Node3D parent, ArrayMesh? mesh, string name, bool isFloor)
+    {
+        if (mesh == null) return;
+        var mi = new MeshInstance3D { Name = name, Mesh = mesh };
+        mi.SetSurfaceOverrideMaterial(0, isFloor ? GetFloorMat() : GetStoneMat());
+        parent.AddChild(mi);
     }
 
     // Instance fields — NOT static. Static Godot resources get silently freed when
@@ -401,11 +421,10 @@ void fragment() {
                     // Riser (vertical face, faces south +Z toward approaching player)
                     EWWall(wallST, zFront, cx-hw, cx+hw, yPrev, yTread, +1);
                 }
-                // Full-height side walls (simple rectangles — no winding ambiguity)
+                // Full-height side walls
                 NSWall(wallST, cx-hw, z0, z1, yLo, yHi, +1);  // west wall, faces +X
                 NSWall(wallST, cx+hw, z0, z1, yLo, yHi, -1);  // east wall, faces -X
-                // Cap wall at top exit (north face, faces south into dungeon)
-                EWWall(wallST, z0, cx-hw, cx+hw, yLo, yHi, +1);
+                // No cap wall at z0 (north/top exit) — the upper floor piece handles that face
                 // Rising vault: spring grows from springLo (south/bottom) to springHi (north/top)
                 SlantedBarrelX(ceilST, cx-hw, z0, cx+hw, z1, springHi, springLo);
                 break;
@@ -428,7 +447,7 @@ void fragment() {
                 }
                 NSWall(wallST, cx-hw, z0, z1, yLo, yHi, +1);
                 NSWall(wallST, cx+hw, z0, z1, yLo, yHi, -1);
-                EWWall(wallST, z1, cx-hw, cx+hw, yLo, yHi, -1);
+                // No cap wall at z1 (south/top exit) — the upper floor piece handles that face
                 // Rising vault: spring grows from springLo (north/bottom) to springHi (south/top)
                 SlantedBarrelX(ceilST, cx-hw, z0, cx+hw, z1, springLo, springHi);
                 break;
@@ -451,7 +470,7 @@ void fragment() {
                 }
                 EWWall(wallST, cz-hw, x0, x1, yLo, yHi, +1);  // north wall
                 EWWall(wallST, cz+hw, x0, x1, yLo, yHi, -1);  // south wall
-                NSWall(wallST, x1, cz-hw, cz+hw, yLo, yHi, -1);  // east cap
+                // No cap wall at x1 (east/top exit) — the upper floor piece handles that face
                 // Rising vault: spring grows from springLo (west/bottom) to springHi (east/top)
                 SlantedBarrelZ(ceilST, x0, cz-hw, x1, cz+hw, springLo, springHi);
                 break;
@@ -474,7 +493,7 @@ void fragment() {
                 }
                 EWWall(wallST, cz-hw, x0, x1, yLo, yHi, +1);
                 EWWall(wallST, cz+hw, x0, x1, yLo, yHi, -1);
-                NSWall(wallST, x0, cz-hw, cz+hw, yLo, yHi, +1);  // west cap
+                // No cap wall at x0 (west/top exit) — the upper floor piece handles that face
                 // Rising vault: spring grows from springHi (west/top) to springLo (east/bottom)
                 SlantedBarrelZ(ceilST, x0, cz-hw, x1, cz+hw, springHi, springLo);
                 break;
