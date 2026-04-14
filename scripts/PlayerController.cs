@@ -84,6 +84,9 @@ public partial class PlayerController : CharacterBody3D
     const float SprintGrace    = 0.45f;  // seconds after releasing sprint where slide still works
     float _sprintGraceTimer    = 0f;
 
+    // ── Stair speed regulation ─────────────────────────────────────────────────
+    const float StairDownBoost = 10f;    // m/s² gravity assist going down stairs
+
     // ── Camera smoothing ──────────────────────────────────────────────────────
     float _camH    = EyeHeight;
     float _camRoll = 0f;
@@ -196,6 +199,8 @@ public partial class PlayerController : CharacterBody3D
             NormalTick(ref vel, dt, onFloor);
 
         _wasOnFloor = onFloor;
+
+        AdjustStairVelocity(ref vel, dt);
 
         Velocity = vel;
         MoveAndSlide();
@@ -382,6 +387,44 @@ public partial class PlayerController : CharacterBody3D
         _wallRunning  = false;
         _wallCooldown = WallRunCooldown;
         _wallRollSign = 0f;
+    }
+
+    // ── Stair speed regulation ────────────────────────────────────────────────
+    // Caps uphill movement to WalkSpeed; adds gravity boost on the way down.
+    // Only fires on steep floors (stairs ~51°, so floorNormal.Y ≈ 0.63).
+    void AdjustStairVelocity(ref Vector3 vel, float dt)
+    {
+        if (!IsOnFloor()) return;
+        var fn = GetFloorNormal();
+        if (fn.Y > 0.85f) return;   // flat floor, skip
+
+        // XZ component of floor normal points downhill
+        var downhillXZ = new Vector3(fn.X, 0f, fn.Z);
+        if (downhillXZ.LengthSquared() < 0.01f) return;
+        downhillXZ = downhillXZ.Normalized();
+
+        var velXZ = new Vector3(vel.X, 0f, vel.Z);
+        float slopeSign = velXZ.Dot(downhillXZ); // +ve = going downhill, -ve = going uphill
+
+        if (slopeSign < 0f)
+        {
+            // Going uphill: cap horizontal speed to WalkSpeed
+            float spd = velXZ.Length();
+            if (spd > WalkSpeed)
+            {
+                velXZ = velXZ.Normalized() * WalkSpeed;
+                vel.X = velXZ.X;
+                vel.Z = velXZ.Z;
+            }
+        }
+        else if (_sliding)
+        {
+            // Sliding downhill: gravity assist accelerates the slide
+            velXZ += downhillXZ * StairDownBoost * dt;
+            vel.X  = velXZ.X;
+            vel.Z  = velXZ.Z;
+            _slideSp = velXZ.Length();   // sync slide speed so friction tracks correctly
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

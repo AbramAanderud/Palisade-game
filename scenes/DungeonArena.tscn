@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://crf8wjqcxpam7"]
+
+[ext_resource type="Script" path="res://scenes/DungeonArena.cs" id="1_s"]
+
+[node name="DungeonArena" type="Node3D"]
+script = ExtResource("1_s")

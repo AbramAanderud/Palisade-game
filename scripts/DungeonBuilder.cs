@@ -103,11 +103,24 @@ void fragment() {
 
     [Signal] public delegate void DungeonReadyEventHandler();
 
+    // ── World-space offset (arena mode: second maze is shifted along Z) ────────
+    Vector3 _worldOffset  = Vector3.Zero;
+    /// Which side of the Exit piece is left open (no cap wall) to face the arena.
+    Dir     _exitOpenDir  = Dir.None;
+
     // ══════════════════════════════════════════════════════════════════════════
     //  PUBLIC API
     // ══════════════════════════════════════════════════════════════════════════
-    public void Build(MazeData data)
+    public void Build(MazeData data) => Build(data, Vector3.Zero, Dir.None);
+
+    /// Build with an explicit world offset and the direction of the Exit opening.
+    /// exitOpenDir: which face of the Exit tile should remain open toward the arena.
+    public void Build(MazeData data, Vector3 worldOffset, Dir exitOpenDir)
     {
+        _worldOffset = worldOffset;
+        _exitOpenDir = exitOpenDir;
+        Position     = worldOffset;   // shift the entire node; all children inherit transform
+
         foreach (var child in GetChildren()) child.QueueFree();
 
         var lookup = new Dictionary<(int, int, int), MazePiece>();
@@ -280,18 +293,24 @@ void fragment() {
         if (hasW) { EWWall(wallST, cz-hw, x0,   cx-hw,  y0, y1, +1);
                     EWWall(wallST, cz+hw, x0,   cx-hw,  y0, y1, -1); }
 
-        // Center-square side walls on CLOSED directions (cap dead ends)
+        // Center-square side walls on CLOSED directions (cap dead ends).
+        // For Exit pieces in arena mode, skip the wall on the open side toward the arena.
         float yTop = y1 + ArchRise; // cap walls extend to arch peak to seal void
-        if (!hasN) CapWallNS(wallST, cx-hw, cx+hw, cz-hw, y0, yTop, +1); // faces +Z (inward)
-        if (!hasS) CapWallNS(wallST, cx-hw, cx+hw, cz+hw, y0, yTop, -1); // faces -Z (inward)
-        if (!hasE) CapWallEW(wallST, cz-hw, cz+hw, cx+hw, y0, yTop, -1); // faces -X (inward)
-        if (!hasW) CapWallEW(wallST, cz-hw, cz+hw, cx-hw, y0, yTop, +1); // faces +X (inward)
+        bool exitN = piece.Type == PieceType.Exit && (_exitOpenDir & Dir.N) != 0;
+        bool exitS = piece.Type == PieceType.Exit && (_exitOpenDir & Dir.S) != 0;
+        bool exitE = piece.Type == PieceType.Exit && (_exitOpenDir & Dir.E) != 0;
+        bool exitW = piece.Type == PieceType.Exit && (_exitOpenDir & Dir.W) != 0;
+        if (!hasN && !exitN) CapWallNS(wallST, cx-hw, cx+hw, cz-hw, y0, yTop, +1);
+        if (!hasS && !exitS) CapWallNS(wallST, cx-hw, cx+hw, cz+hw, y0, yTop, -1);
+        if (!hasE && !exitE) CapWallEW(wallST, cz-hw, cz+hw, cx+hw, y0, yTop, -1);
+        if (!hasW && !exitW) CapWallEW(wallST, cz-hw, cz+hw, cx-hw, y0, yTop, +1);
 
-        // Dead-end walls: open arms with no valid neighbor get a sealed face at the cell boundary
-        if (hasN && !IsConnected(Dir.N, piece, lookup)) CapWallNS(wallST, cx-hw, cx+hw, z0,  y0, yTop, +1);
-        if (hasS && !IsConnected(Dir.S, piece, lookup)) CapWallNS(wallST, cx-hw, cx+hw, z1,  y0, yTop, -1);
-        if (hasE && !IsConnected(Dir.E, piece, lookup)) CapWallEW(wallST, cz-hw, cz+hw, x1,  y0, yTop, -1);
-        if (hasW && !IsConnected(Dir.W, piece, lookup)) CapWallEW(wallST, cz-hw, cz+hw, x0,  y0, yTop, +1);
+        // Dead-end walls: open arms with no valid neighbor get a sealed face at the cell boundary.
+        // In arena mode the Exit's open direction connects to the arena, so skip that cap.
+        if (hasN && !IsConnected(Dir.N, piece, lookup) && !exitN) CapWallNS(wallST, cx-hw, cx+hw, z0, y0, yTop, +1);
+        if (hasS && !IsConnected(Dir.S, piece, lookup) && !exitS) CapWallNS(wallST, cx-hw, cx+hw, z1, y0, yTop, -1);
+        if (hasE && !IsConnected(Dir.E, piece, lookup) && !exitE) CapWallEW(wallST, cz-hw, cz+hw, x1, y0, yTop, -1);
+        if (hasW && !IsConnected(Dir.W, piece, lookup) && !exitW) CapWallEW(wallST, cz-hw, cz+hw, x0, y0, yTop, +1);
     }
 
     // Returns true when the adjacent cell exists and its openings face back toward us.
@@ -366,9 +385,9 @@ void fragment() {
             case Dir.N: // low at south (z1), high at north (z0)
             {
                 float run = CellSize / N;
-                // Bottom approach floor (first half of cell, before first step)
-                Quad(floorST, new(cx-hw,yLo,z1), new(cx+hw,yLo,z1),
-                              new(cx+hw,yLo,cz), new(cx-hw,yLo,cz));
+                // Full-cell bottom floor seals the void beneath the staircase
+                Quad(floorST, new(cx-hw,yLo,z0), new(cx+hw,yLo,z0),
+                              new(cx+hw,yLo,z1), new(cx-hw,yLo,z1));
                 for (int i = 0; i < N; i++)
                 {
                     float zBack  = z1 - i * run;
@@ -395,7 +414,7 @@ void fragment() {
             {
                 float run = CellSize / N;
                 Quad(floorST, new(cx-hw,yLo,z0), new(cx+hw,yLo,z0),
-                              new(cx+hw,yLo,cz), new(cx-hw,yLo,cz));
+                              new(cx+hw,yLo,z1), new(cx-hw,yLo,z1));
                 for (int i = 0; i < N; i++)
                 {
                     float zBack  = z0 + i * run;
@@ -418,7 +437,7 @@ void fragment() {
             {
                 float run = CellSize / N;
                 Quad(floorST, new(x0,yLo,cz-hw), new(x0,yLo,cz+hw),
-                              new(cx,yLo,cz+hw), new(cx,yLo,cz-hw));
+                              new(x1,yLo,cz+hw), new(x1,yLo,cz-hw));
                 for (int i = 0; i < N; i++)
                 {
                     float xBack  = x0 + i * run;
@@ -440,7 +459,7 @@ void fragment() {
             case Dir.W: // low at east (x1), high at west (x0)
             {
                 float run = CellSize / N;
-                Quad(floorST, new(cx,yLo,cz-hw), new(cx,yLo,cz+hw),
+                Quad(floorST, new(x0,yLo,cz-hw), new(x0,yLo,cz+hw),
                               new(x1,yLo,cz+hw), new(x1,yLo,cz-hw));
                 for (int i = 0; i < N; i++)
                 {

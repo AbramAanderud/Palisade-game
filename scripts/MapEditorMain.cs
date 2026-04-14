@@ -46,13 +46,15 @@ public partial class MapEditorMain : Node2D
     MazePiece? _picked  = null;     // currently selected placed piece
 
     // ── UI refs ───────────────────────────────────────────────────────────────
-    Font     _font      = null!;
-    Button[] _slotBtns  = new Button[5];
-    Button[] _typeBtns  = new Button[PieceTypes.Length];
-    Label    _rotLbl    = null!;
-    Label    _floorLbl  = null!;
-    Label    _goldLbl   = null!;
-    Label    _statusLbl = null!;
+    Font        _font      = null!;
+    Button[]    _slotBtns  = new Button[5];
+    Button[]    _typeBtns  = new Button[PieceTypes.Length];
+    Label       _rotLbl    = null!;
+    Label       _floorLbl  = null!;
+    Label       _goldLbl   = null!;
+    Label       _statusLbl = null!;
+    OptionButton _arenaSlotA = null!;
+    OptionButton _arenaSlotB = null!;
 
     // ══════════════════════════════════════════════════════════════════════════
     //  LIFECYCLE
@@ -150,6 +152,41 @@ public partial class MapEditorMain : Node2D
         StyleColorBtn(enterBtn, new Color(0.15f, 0.55f, 0.15f));
         enterBtn.Pressed += OnEnterDungeon;
         vbox.AddChild(enterBtn);
+
+        vbox.AddChild(new HSeparator());
+
+        var arenaHdr = new Label { Text = "ARENA MODE", HorizontalAlignment = HorizontalAlignment.Center };
+        arenaHdr.AddThemeFontSizeOverride("font_size", 12);
+        arenaHdr.AddThemeColorOverride("font_color", new Color(0.85f, 0.65f, 0.20f));
+        vbox.AddChild(arenaHdr);
+
+        var rowA = new HBoxContainer();
+        rowA.AddThemeConstantOverride("separation", 4);
+        vbox.AddChild(rowA);
+        var lblA = new Label { Text = "Maze A:", CustomMinimumSize = new Vector2(48, 0) };
+        lblA.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
+        rowA.AddChild(lblA);
+        _arenaSlotA = new OptionButton { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
+        for (int i = 0; i < 5; i++) _arenaSlotA.AddItem($"Slot {i}", i);
+        _arenaSlotA.Selected = 0;
+        rowA.AddChild(_arenaSlotA);
+
+        var rowB = new HBoxContainer();
+        rowB.AddThemeConstantOverride("separation", 4);
+        vbox.AddChild(rowB);
+        var lblB = new Label { Text = "Maze B:", CustomMinimumSize = new Vector2(48, 0) };
+        lblB.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
+        rowB.AddChild(lblB);
+        _arenaSlotB = new OptionButton { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
+        for (int i = 0; i < 5; i++) _arenaSlotB.AddItem($"Slot {i}", i);
+        _arenaSlotB.Selected = 1;
+        rowB.AddChild(_arenaSlotB);
+
+        var arenaBtn = new Button { Text = "PLAY ARENA", CustomMinimumSize = new Vector2(0, 40) };
+        arenaBtn.AddThemeFontSizeOverride("font_size", 13);
+        StyleColorBtn(arenaBtn, new Color(0.45f, 0.25f, 0.05f));
+        arenaBtn.Pressed += OnPlayArena;
+        vbox.AddChild(arenaBtn);
     }
 
     void BuildRightPanel(CanvasLayer canvas)
@@ -812,6 +849,23 @@ public partial class MapEditorMain : Node2D
         OnSaveSlot(_slot);
         GameState.ActiveSlot = _slot;
         GetTree().ChangeSceneToFile("res://scenes/DungeonGame.tscn");
+    }
+
+    void OnPlayArena()
+    {
+        int a = _arenaSlotA.Selected;
+        int b = _arenaSlotB.Selected;
+        if (a == b)
+        { _statusLbl.Text = "Arena needs two different slots"; return; }
+        if (!MazeSerializer.Exists(a))
+        { _statusLbl.Text = $"Slot {a} is empty"; return; }
+        if (!MazeSerializer.Exists(b))
+        { _statusLbl.Text = $"Slot {b} is empty"; return; }
+
+        GameState.IsArenaMode = true;
+        GameState.ArenaSlotA  = a;
+        GameState.ArenaSlotB  = b;
+        GetTree().ChangeSceneToFile("res://scenes/DungeonArena.tscn");
     }
 
     // ══════════════════════════════════════════════════════════════════════════
