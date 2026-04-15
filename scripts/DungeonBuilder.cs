@@ -152,12 +152,18 @@ void fragment() {
             var floorST = MakeST();
             var ceilST  = MakeST();
 
-            AddPiece(p, lookup, yBase, wallST, floorST, ceilST);
+            // StairsDown geometry is anchored at the floor below (ramp descends from
+            // this floor's level down to floor-1 level).  Shift yBase down by one floor.
+            float geomBase = (p.Type == PieceType.StairsDown)
+                ? yBase - FloorHeight
+                : yBase;
+
+            AddPiece(p, lookup, geomBase, wallST, floorST, ceilST);
 
             var body = new StaticBody3D { Name = $"Cell_{p.X}_{p.Y}_{floor}" };
             AddChild(body);
 
-            if (p.Type == PieceType.Stairs)
+            if (PieceDB.IsStair(p.Type))
             {
                 // Walls still need collision (player bumps the side walls).
                 // Tread/riser floor and ceiling are visual-only so they don't
@@ -165,7 +171,7 @@ void fragment() {
                 AddMesh(body, Commit(wallST), $"Wall_{p.X}_{p.Y}", default);
                 AddMeshVisual(body, Commit(floorST), $"Floor_{p.X}_{p.Y}", isFloor: true);
                 AddMeshVisual(body, Commit(ceilST),  $"Ceil_{p.X}_{p.Y}",  isFloor: false);
-                AddStairRamp(body, p, yBase);
+                AddStairRamp(body, p, geomBase);
             }
             else
             {
@@ -185,7 +191,11 @@ void fragment() {
         float cx = x0 + CellSize * 0.5f, cz = z0 + CellSize * 0.5f;
         float hw = OpeningW * 0.5f;
         float yLo = yBase, yHi = yBase + FloorHeight;
-        Dir upDir = PieceDB.GetStairUpDir(p.Rotation);
+        // For StairsDown the geomBase is already shifted; the high end is always N.
+        // For legacy Stairs/StairsUp use the cross dir (which equals GetStairUpDir for those types).
+        Dir upDir = p.Type == PieceType.StairsDown
+            ? Dir.N
+            : PieceDB.GetStairCrossDir(p.Type, p.Rotation);
 
         var rampST = MakeST();
         switch (upDir)
@@ -273,8 +283,10 @@ void fragment() {
         bool hasN = (op & Dir.N) != 0, hasS = (op & Dir.S) != 0;
         bool hasE = (op & Dir.E) != 0, hasW = (op & Dir.W) != 0;
 
-        if (piece.Type == PieceType.Stairs)
+        if (PieceDB.IsStair(piece.Type))
         {
+            // StairsDown's geomBase is already shifted to floor-1 level by BuildFloor,
+            // so its geometry is identical to a Dir.N StairsUp at that shifted base.
             AddStairGeometry(piece, wallST, floorST, ceilST, x0, z0, yBase);
             return;
         }
@@ -370,7 +382,10 @@ void fragment() {
     }
 
     // Returns true when the adjacent cell exists and its openings face back toward us.
-    // Also returns true when a stair on floor-1 exits upward into this face (cross-floor join).
+    // Also handles cross-floor stair joins:
+    //   StairsUp/Stairs on floor-1  — high (N) exit toward us
+    //   StairsDown on floor+1       — low  (S) exit toward us
+    //   StairsDown own S face       — connects to floor-1 neighbor
     static bool IsConnected(Dir dir, MazePiece piece, Dictionary<(int, int, int), MazePiece> lookup)
     {
         Dir opposite = dir switch { Dir.N => Dir.S, Dir.S => Dir.N, Dir.E => Dir.W, _ => Dir.E };
@@ -381,14 +396,35 @@ void fragment() {
             Dir.E => (piece.X + 1, piece.Y),
             _     => (piece.X - 1, piece.Y),
         };
-        // Same-floor neighbor
+
+        // ── Same-floor neighbor ───────────────────────────────────────────────
         if (lookup.TryGetValue((nx, ny, piece.Floor), out var neighbor))
             if ((PieceDB.GetOpenings(neighbor.Type, neighbor.Rotation) & opposite) != 0)
                 return true;
-        // Cross-floor: a stair on floor-1 whose high exit faces toward us (no cap on stair top)
-        if (piece.Floor > 0 && lookup.TryGetValue((nx, ny, piece.Floor - 1), out var below))
-            if (below.Type == PieceType.Stairs && PieceDB.GetStairUpDir(below.Rotation) == opposite)
+
+        // ── StairsDown: S face connects down to floor-1 ───────────────────────
+        // The piece's own S face goes to floor-1 at (nx, ny).
+        if (piece.Type == PieceType.StairsDown && dir == Dir.S)
+        {
+            if (lookup.TryGetValue((nx, ny, piece.Floor - 1), out var belowNeighbor))
+                if ((PieceDB.GetOpenings(belowNeighbor.Type, belowNeighbor.Rotation) & opposite) != 0)
+                    return true;
+            return true; // S face of StairsDown is always open (leads down) — no cap wall
+        }
+
+        // ── StairsUp/Stairs on floor-1 whose high exit faces toward us ────────
+        if (lookup.TryGetValue((nx, ny, piece.Floor - 1), out var below))
+            if (PieceDB.IsStair(below.Type) && below.Type != PieceType.StairsDown &&
+                PieceDB.GetStairCrossDir(below.Type, below.Rotation) == opposite)
                 return true;
+
+        // ── StairsDown on floor+1 whose S (low) exit faces toward us ─────────
+        // A piece at (x, y, F) checking dir D: if there's a StairsDown at (nx, ny, F+1)
+        // whose S face connects to (nx, ny+1, F) == us when dir==N, nx==piece.X, ny==piece.Y-1.
+        if (lookup.TryGetValue((nx, ny, piece.Floor + 1), out var above))
+            if (above.Type == PieceType.StairsDown && Dir.S == opposite)
+                return true;
+
         return false;
     }
 
@@ -440,7 +476,11 @@ void fragment() {
         float yLo      = yBase, yHi = yBase + FloorHeight;
         float springLo = yBase + CellHeight;          // vault spring at low end of stair
         float springHi = yBase + FloorHeight + CellHeight; // vault spring at high end
-        Dir   upDir    = PieceDB.GetStairUpDir(piece.Rotation);
+        // For StairsDown (geomBase is floor-1 level), the geometry's high end is always N.
+        // For legacy Stairs and StairsUp, use the rotation-based cross dir.
+        Dir   upDir    = piece.Type == PieceType.StairsDown
+            ? Dir.N
+            : PieceDB.GetStairCrossDir(piece.Type, piece.Rotation);
         int   N        = StairSteps;
         float rise     = FloorHeight / N;
 
@@ -734,7 +774,7 @@ void fragment() {
         int idx = 0;
         foreach (var piece in pieces)
         {
-            if (piece.Type == PieceType.Stairs) continue;
+            if (PieceDB.IsStair(piece.Type)) continue;
 
             float cx    = piece.X * CellSize + CellSize * 0.5f;
             float cz    = piece.Y * CellSize + CellSize * 0.5f;

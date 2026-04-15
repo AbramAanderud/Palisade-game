@@ -104,8 +104,18 @@ Use verified risk systems + existing piece editor to assemble full game loop.
 ### Key Design Constraints (enforced by editor)
 
 - **Start** piece: row 0 only, floor 0 only → always at the far end of the maze.
-- **Exit** piece: row GridH-1 only, floor 0 only → always at the connecting end.
-- Both constraints enforced in `PlaceNew()` in MapEditorMain.cs.
+- **Exit** piece: row GridH-1 only, **any floor** → must be in the last row (farthest from Start)
+  but can be on any floor. Editor highlights the EXIT ZONE row on every floor.
+- **StairsUp**: fixed orientation (no rotation), N face → floor+1.  Replaces legacy Stairs.
+- **StairsDown**: fixed orientation (no rotation), S face → floor-1.  Must be placed on floor 1+.
+- All constraints enforced in `PlaceNew()` in MapEditorMain.cs.
+
+### Arena Y-Anchoring
+
+Each maze is shifted in Y so its Exit piece's floor sits at world Y=0 (arena floor level).
+- `offsetY = -exitFloor × FloorHeight`
+- Maze A and Maze B anchored independently → one maze may float high, the other low.
+- Both exits always meet the arena doorways at Y=0 regardless of which floor they're on.
 
 ### Data Flow
 

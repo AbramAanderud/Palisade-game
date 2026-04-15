@@ -62,24 +62,34 @@ public partial class DungeonArena : Node3D
         worldEnv.Environment   = env;
         AddChild(worldEnv);
 
-        // ── Find Exit pieces to determine arena X alignment ───────────────────
+        // ── Find Exit pieces — their floor drives Y offset so both meet arena Y=0 ─
         var exitA = dataA.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+        var exitB = dataB.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+
+        // X centre of the arena aligns with Maze A's exit column.
         float exitAX = exitA != null
             ? exitA.X * CellSize + CellSize * 0.5f
             : MazeDepth * 0.5f;
 
-        // ── Build Maze A: origin (0,0,0), Exit opens South toward arena ───────
+        // Each maze is shifted down in Y so its exit piece's floor sits at Y=0 (arena floor level).
+        // Example: Maze A exit on floor 2 → offsetAY = -2×FloorHeight, bringing exit to Y=0.
+        // Maze B works independently, so one maze can tower high while the other sits low.
+        float offsetAY = exitA != null ? -exitA.Floor  * DungeonBuilder.FloorHeight : 0f;
+        float offsetBY = exitB != null ? -exitB.Floor  * DungeonBuilder.FloorHeight : 0f;
+
+        // ── Build Maze A: Y-anchored so its exit floor sits at world Y=0 ──────
         var builderA = new DungeonBuilder { Name = "MazeA" };
         AddChild(builderA);
-        builderA.Build(dataA, Vector3.Zero, Dir.S);
+        builderA.Build(dataA, new Vector3(0f, offsetAY, 0f), Dir.S);
 
-        // ── Flip and build Maze B: origin (0,0,MazeBOffset), Exit opens North ─
+        // ── Flip and build Maze B: Y-anchored independently ───────────────────
         var dataFlipped = FlipMazeZ(dataB);
         var builderB    = new DungeonBuilder { Name = "MazeB" };
         AddChild(builderB);
-        builderB.Build(dataFlipped, new Vector3(0f, 0f, MazeBOffset), Dir.N);
+        builderB.Build(dataFlipped, new Vector3(0f, offsetBY, MazeBOffset), Dir.N);
 
         // ── Build arena centred at (exitAX, 0, ArenaCentreZ) ─────────────────
+        // Arena floor is always Y=0; both exits have been anchored to meet it.
         var arena = new ArenaBuilder { Name = "Arena" };
         AddChild(arena);
         arena.Build(new Vector3(exitAX, 0f, ArenaCentreZ), openNorth: true, openSouth: true);
@@ -96,7 +106,8 @@ public partial class DungeonArena : Node3D
                           ?? dataFlipped.Pieces[0];
                 float cx = startB.X * CellSize + CellSize * 0.5f;
                 float cz = startB.Y * CellSize + CellSize * 0.5f + MazeBOffset;
-                float cy = startB.Floor * DungeonBuilder.FloorHeight + 1f;
+                // Apply the same Y offset used when building Maze B
+                float cy = startB.Floor * DungeonBuilder.FloorHeight + 1f + offsetBY;
                 spawnPos = new Vector3(cx, cy, cz);
                 spawnYaw = DirToYaw(PieceDB.GetOpenings(PieceType.Start, startB.Rotation));
                 break;
@@ -111,7 +122,8 @@ public partial class DungeonArena : Node3D
                           ?? dataA.Pieces[0];
                 float cx = startA.X * CellSize + CellSize * 0.5f;
                 float cz = startA.Y * CellSize + CellSize * 0.5f;
-                float cy = startA.Floor * DungeonBuilder.FloorHeight + 1f;
+                // Apply the same Y offset used when building Maze A
+                float cy = startA.Floor * DungeonBuilder.FloorHeight + 1f + offsetAY;
                 spawnPos = new Vector3(cx, cy, cz);
                 spawnYaw = DirToYaw(PieceDB.GetOpenings(PieceType.Start, startA.Rotation));
                 break;
@@ -132,7 +144,8 @@ public partial class DungeonArena : Node3D
         hint.AddThemeColorOverride("font_color", new Color(0.7f, 0.7f, 0.7f));
         canvas.AddChild(hint);
 
-        GD.Print($"[DungeonArena] A=slot{slotA} B=slot{slotB} " +
+        GD.Print($"[DungeonArena] A=slot{slotA}(exitFloor={exitA?.Floor ?? 0},offsetY={offsetAY:F1}) " +
+                 $"B=slot{slotB}(exitFloor={exitB?.Floor ?? 0},offsetY={offsetBY:F1}) " +
                  $"arenaZ={ArenaCentreZ:F1} mazeBZ={MazeBOffset:F1} spawn={ChosenSpawn}");
     }
 
