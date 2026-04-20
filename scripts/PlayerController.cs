@@ -91,6 +91,23 @@ public partial class PlayerController : CharacterBody3D
     float _camH    = EyeHeight;
     float _camRoll = 0f;
 
+    // ── Third-person camera ────────────────────────────────────────────────────
+    const float TpDistance      = 4.0f;
+    const float TpDistanceBlock = 3.5f;
+    const float TpElevation     = 1.8f;
+    const float TpElevationSlide= 1.0f;
+    bool        _tpMode         = false;
+    Camera3D    _tpCam          = null!;
+    Node3D      _playerBody     = null!;
+    float       _tpDistCurrent  = 5.0f;
+    float       _tpElevCurrent  = 2.5f;
+
+    // ── Animator ──────────────────────────────────────────────────────────────
+    PlayerAnimator _animator = null!;
+
+    // ── Combat ────────────────────────────────────────────────────────────────
+    SwordCombat _combat = null!;
+
     // ── Public ────────────────────────────────────────────────────────────────
     public bool HasWeapon { get; private set; } = false;
 
@@ -132,6 +149,20 @@ public partial class PlayerController : CharacterBody3D
         _heldWeapon.SetSurfaceOverrideMaterial(0, wMat);
         _cam.AddChild(_heldWeapon);
 
+        _playerBody = BuildPlayerBody();
+        AddChild(_playerBody);
+
+        _animator = new PlayerAnimator();
+        AddChild(_animator);
+        var modelRoot = _playerBody.GetNodeOrNull<Node3D>("RascalModel");
+        if (modelRoot != null) _animator.Init(modelRoot);
+
+        _tpCam = new Camera3D { Name = "TpCam", Fov = 75f, Near = 0.1f, Far = 500f };
+        AddChild(_tpCam);
+
+        _combat = new SwordCombat();
+        AddChild(_combat);
+
         ApplyLook();
         _cam.MakeCurrent();
         Input.MouseMode = Input.MouseModeEnum.Captured;
@@ -149,6 +180,8 @@ public partial class PlayerController : CharacterBody3D
             Input.MouseMode = Input.MouseMode == Input.MouseModeEnum.Captured
                 ? Input.MouseModeEnum.Visible
                 : Input.MouseModeEnum.Captured;
+        if (ev.IsActionPressed("toggle_camera") && !(ev is InputEventKey ek && ek.Echo))
+            ToggleCameraMode();
     }
 
     public override void _PhysicsProcess(double delta)
@@ -208,6 +241,14 @@ public partial class PlayerController : CharacterBody3D
         if (!IsOnFloor() && !_wallRunning && _wallCooldown <= 0)
             TryStartWallRun();
 
+        // ── Sword combat ──────────────────────────────────────────────────────
+        if (HasWeapon)
+        {
+            _combat.Tick(dt, !IsOnFloor(), _wallRunning, _yaw, out float yawDelta);
+            _yaw += yawDelta;
+            ApplyLook();
+        }
+
         // ── Smooth camera height ───────────────────────────────────────────────
         float targetH = _sliding ? SlideEyeH : _crouching ? CrouchEyeH : EyeHeight;
         _camH = Mathf.MoveToward(_camH, targetH, 6f * dt);
@@ -217,6 +258,33 @@ public partial class PlayerController : CharacterBody3D
         float targetRoll = _wallRunning ? _wallRollSign * 12f * Mathf.Pi / 180f : 0f;
         _camRoll = Mathf.Lerp(_camRoll, targetRoll, 10f * dt);
         _cam.Rotation = new(_pitch, 0f, _camRoll);
+
+        // ── Animate player body ────────────────────────────────────────────────
+        var hSpd = new Vector2(Velocity.X, Velocity.Z).Length();
+        _animator.Tick(dt, IsOnFloor(), _sliding, _wallRunning, HasWeapon, hSpd, Velocity.Y);
+
+        // ── FP FOV swell on sprint ─────────────────────────────────────────────
+        bool isSpr = Input.IsActionPressed("sprint") && new Vector2(Velocity.X, Velocity.Z).Length() > WalkSpeed;
+        float targetFov = isSpr ? 98f : 90f;
+        _cam.Fov = Mathf.Lerp(_cam.Fov, targetFov, 5f * dt);
+
+        // ── Player body yaw tracks look direction ──────────────────────────────
+        _playerBody.Rotation = new(0f, _yaw, 0f);
+
+        // ── TP camera follows behind player ────────────────────────────────────
+        if (_tpMode)
+        {
+            bool blocking = HasWeapon && _combat.IsBlocking;
+            float targetDist = blocking ? TpDistanceBlock : TpDistance;
+            float targetElev = _sliding  ? TpElevationSlide : TpElevation;
+            _tpDistCurrent = Mathf.MoveToward(_tpDistCurrent, targetDist, 8f * dt);
+            _tpElevCurrent = Mathf.MoveToward(_tpElevCurrent, targetElev, 4f * dt);
+
+            var pivot = GlobalPosition + Vector3.Up * (EyeHeight * 0.7f);
+            var back  = new Vector3(Mathf.Sin(_yaw), 0f, Mathf.Cos(_yaw));
+            _tpCam.GlobalPosition = pivot + back * _tpDistCurrent + Vector3.Up * _tpElevCurrent;
+            _tpCam.LookAt(pivot, Vector3.Up);
+        }
     }
 
     // ── Normal movement ───────────────────────────────────────────────────────
@@ -235,7 +303,10 @@ public partial class PlayerController : CharacterBody3D
 
         bool canSlide = isSprinting || _sprintGraceTimer > 0f;
 
-        float speed = isSprinting ? SprintSpeed : slideHeld ? CrouchSpeed : WalkSpeed;
+        float speed = isSprinting ? SprintSpeed
+            : slideHeld ? CrouchSpeed
+            : (HasWeapon && _combat.IsBlocking) ? CrouchSpeed
+            : WalkSpeed;
 
         // Crouch state: Ctrl while standing still or slow walk (not enough speed to slide)
         var hVelNow = new Vector3(vel.X, 0, vel.Z);
@@ -279,7 +350,7 @@ public partial class PlayerController : CharacterBody3D
         // Start slide: Ctrl pressed while moving (any speed).
         // If sprinting or in grace window: full SlideBoost burst.
         // If just walking: slide at current speed (no extra boost, just the dive).
-        if (Input.IsActionJustPressed("slide") && onFloor)
+        if (Input.IsActionJustPressed("slide") && onFloor && !(HasWeapon && _combat.IsBlocking))
         {
             var hVel = new Vector3(vel.X, 0, vel.Z);
             if (hVel.Length() > 1f)
@@ -437,7 +508,90 @@ public partial class PlayerController : CharacterBody3D
     public void PickupWeapon()
     {
         HasWeapon = true;
-        if (_heldWeapon != null) _heldWeapon.Visible = true;
+        if (_tpMode)
+        {
+            var tpW = _playerBody.GetNodeOrNull<MeshInstance3D>("TpWeapon");
+            if (tpW != null) tpW.Visible = true;
+        }
+        else
+        {
+            if (_heldWeapon != null) _heldWeapon.Visible = true;
+        }
+    }
+
+    public void ToggleCameraMode()
+    {
+        _tpMode = !_tpMode;
+        _playerBody.Visible = _tpMode;
+        if (_tpMode)
+        {
+            _tpCam.MakeCurrent();
+            if (_heldWeapon != null) _heldWeapon.Visible = false;
+            var tpW = _playerBody.GetNodeOrNull<MeshInstance3D>("TpWeapon");
+            if (tpW != null) tpW.Visible = HasWeapon;
+        }
+        else
+        {
+            _cam.MakeCurrent();
+            if (_heldWeapon != null) _heldWeapon.Visible = HasWeapon;
+            var tpW = _playerBody.GetNodeOrNull<MeshInstance3D>("TpWeapon");
+            if (tpW != null) tpW.Visible = false;
+        }
+    }
+
+    // ── Model config — tweak these to align Rascal.glb ──────────────────────
+    const string ModelPath   = "res://playerModels/rascal-cat/Rascal.glb";
+    const float  ModelScale  = 3.0f;    // uniform scale; increase if model is too small
+    // Y offset so model feet sit at capsule base (0 = pivot at world origin).
+    const float  ModelYOff   = -0.05f;
+
+    Node3D BuildPlayerBody()
+    {
+        var root = new Node3D { Name = "PlayerBody", Visible = false };
+
+        var scene = GD.Load<PackedScene>(ModelPath);
+        if (scene != null)
+        {
+            var model = scene.Instantiate<Node3D>();
+            model.Name             = "RascalModel";
+            model.Scale            = Vector3.One * ModelScale;
+            model.Position         = new Vector3(0f, ModelYOff, 0f);
+            model.RotationDegrees  = new Vector3(0f, 180f, 0f);
+            root.AddChild(model);
+        }
+        else
+        {
+            // Fallback: primitive capsule body used when GLB is missing
+            var mat = new StandardMaterial3D { AlbedoColor = new(0.25f, 0.30f, 0.45f), Roughness = 0.8f };
+            var torso = new MeshInstance3D
+            {
+                Mesh     = new CapsuleMesh { Radius = 0.28f, Height = 0.80f },
+                Position = new(0f, 0.75f, 0f),
+            };
+            torso.SetSurfaceOverrideMaterial(0, mat);
+            root.AddChild(torso);
+            var head = new MeshInstance3D
+            {
+                Mesh     = new SphereMesh { Radius = 0.20f, RadialSegments = 8, Rings = 6 },
+                Position = new(0f, 1.45f, 0f),
+            };
+            head.SetSurfaceOverrideMaterial(0, mat);
+            root.AddChild(head);
+        }
+
+        var tpWeapon = new MeshInstance3D
+        {
+            Name     = "TpWeapon",
+            Mesh     = new BoxMesh { Size = new(0.05f, 0.70f, 0.05f) },
+            Position = new(0.32f, 0.80f, -0.15f),
+            Rotation = new(0.3f, 0f, 0f),
+            Visible  = false,
+        };
+        var wMat = new StandardMaterial3D { AlbedoColor = new(0.6f, 0.6f, 0.65f), Metallic = 0.9f, Roughness = 0.25f };
+        tpWeapon.SetSurfaceOverrideMaterial(0, wMat);
+        root.AddChild(tpWeapon);
+
+        return root;
     }
 
     public void ReleaseMouse() => Input.MouseMode = Input.MouseModeEnum.Visible;
