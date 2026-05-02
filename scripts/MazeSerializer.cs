@@ -4,7 +4,7 @@ using System.Text.Json;
 /// res://scripts/MazeSerializer.cs — Multi-slot save/load for MazeData (user://maze_slot_N.json).
 public static class MazeSerializer
 {
-    const int SlotCount = 5;
+    public const int SlotCount = 30;
 
     static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 

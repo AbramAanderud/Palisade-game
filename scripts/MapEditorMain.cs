@@ -1,15 +1,16 @@
 using Godot;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
-/// res://scripts/MapEditorMain.cs — Piece-based maze editor with 5 save slots.
+/// res://scripts/MapEditorMain.cs — Piece-based maze editor with 30 save slots.
 public partial class MapEditorMain : Node2D
 {
     // ── Grid layout (pixels) ──────────────────────────────────────────────────
-    const int CellPx   = 64;
+    const int CellPx   = 56;
     const int GridW    = 10;
     const int GridH    = 10;
-    const int GridOffX = 280;
+    const int GridOffX = 360;   // left sidebar occupies 0..352, map starts at 360
     const int GridOffY = 40;
     const int RightX   = GridOffX + GridW * CellPx;  // = 920
 
@@ -34,7 +35,7 @@ public partial class MapEditorMain : Node2D
     {
         PieceType.Start, PieceType.Exit,
         PieceType.Straight, PieceType.LHall,
-        PieceType.THall, PieceType.StairsUp, PieceType.StairsDown,
+        PieceType.THall, PieceType.Cross, PieceType.StairsUp, PieceType.StairsDown,
     };
 
     // Direction helpers (parallel arrays)
@@ -52,13 +53,16 @@ public partial class MapEditorMain : Node2D
 
     // ── UI refs ───────────────────────────────────────────────────────────────
     Font        _font      = null!;
-    Button[]    _slotBtns  = new Button[5];
+    Button[]    _slotBtns  = null!;
+    LineEdit    _nameEdit  = null!;
     Button[]    _typeBtns  = null!;   // sized to PieceTypes.Length at runtime
     Label       _rotLbl    = null!;
     Button      _rotBtn    = null!;
     Label       _floorLbl  = null!;
     Label       _goldLbl   = null!;
     Label       _statusLbl = null!;
+    HSlider     _budgetSlider = null!;
+    LineEdit    _budgetEdit   = null!;
     OptionButton _arenaSlotA   = null!;
     OptionButton _arenaSlotB   = null!;
     OptionButton _arenaSpawn   = null!;
@@ -70,13 +74,20 @@ public partial class MapEditorMain : Node2D
     {
         _font     = new SystemFont();
         _typeBtns = new Button[PieceTypes.Length];
+        _slotBtns = new Button[MazeSerializer.SlotCount];
         var saved = MazeSerializer.Load(_slot);
         if (saved != null) _maze = saved;
         BuildUI();
+        _nameEdit.Text = _maze.Name;
         UpdateRotateButtonState();
         RefreshGold();
         UpdateStatusLine();
         UpdateAllSlotLabels();
+        // Restore arena UI selections from GameState / DungeonArena so that
+        // returning from a game run doesn't reset the dropdowns to defaults.
+        _arenaSlotA.Selected = GameState.ArenaSlotA;
+        _arenaSlotB.Selected = GameState.ArenaSlotB;
+        _arenaSpawn.Selected = (int)DungeonArena.ChosenSpawn;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -85,6 +96,10 @@ public partial class MapEditorMain : Node2D
     void BuildUI()
     {
         var canvas = new CanvasLayer();
+        // FollowViewportEnabled makes the CanvasLayer scale with the game viewport
+        // so the panels stay in sync with the Node2D drawing coordinate space at all
+        // window sizes (critical when stretch mode is "canvas_items" + "expand").
+        canvas.FollowViewportEnabled = true;
         AddChild(canvas);
         BuildLeftPanel(canvas);
         BuildRightPanel(canvas);
@@ -93,10 +108,13 @@ public partial class MapEditorMain : Node2D
     void BuildLeftPanel(CanvasLayer canvas)
     {
         var panel = MakePanel(new Color(0.07f, 0.07f, 0.10f, 0.97f));
+        // Anchor the left edge firmly to the left side of the viewport (offset 0)
+        // so nothing is pushed off-screen on any window size.
         panel.SetAnchor(Side.Left, 0f);  panel.SetAnchor(Side.Right, 0f);
         panel.SetAnchor(Side.Top, 0f);   panel.SetAnchor(Side.Bottom, 1f);
         panel.SetOffset(Side.Left, 0);   panel.SetOffset(Side.Right, GridOffX - 8);
         panel.SetOffset(Side.Top, 0);    panel.SetOffset(Side.Bottom, 0);
+        panel.ClipContents = true;
         canvas.AddChild(panel);
 
         var vbox = new VBoxContainer();
@@ -114,27 +132,128 @@ public partial class MapEditorMain : Node2D
         hdr.AddThemeColorOverride("font_color", new Color(0.65f, 0.65f, 0.65f));
         vbox.AddChild(hdr);
 
-        for (int i = 0; i < 5; i++)
+        // Map name field — edits the currently loaded maze's Name field live
+        var nameRow = new HBoxContainer();
+        nameRow.AddThemeConstantOverride("separation", 4);
+        vbox.AddChild(nameRow);
+        var nameLbl = new Label { Text = "Name:", CustomMinimumSize = new Vector2(42, 0) };
+        nameLbl.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
+        nameRow.AddChild(nameLbl);
+        _nameEdit = new LineEdit
+        {
+            PlaceholderText     = "Untitled",
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+            CustomMinimumSize   = new Vector2(0, 28),
+        };
+        _nameEdit.TextChanged += text => { _maze.Name = text; };
+        nameRow.AddChild(_nameEdit);
+
+        // Scrollable slot list — 30 slots at 36 px each needs scroll
+        var scroll = new ScrollContainer
+        {
+            SizeFlagsVertical   = Control.SizeFlags.ExpandFill,
+            CustomMinimumSize   = new Vector2(0, 200),
+        };
+        scroll.AddThemeConstantOverride("v_separation", 0);
+        vbox.AddChild(scroll);
+
+        var slotVBox = new VBoxContainer();
+        slotVBox.AddThemeConstantOverride("separation", 2);
+        slotVBox.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+        scroll.AddChild(slotVBox);
+
+        for (int i = 0; i < MazeSerializer.SlotCount; i++)
         {
             int idx = i;
             var row = new HBoxContainer();
             row.AddThemeConstantOverride("separation", 3);
-            vbox.AddChild(row);
+            slotVBox.AddChild(row);
 
             var loadBtn = new Button
             {
                 SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
-                CustomMinimumSize   = new Vector2(0, 36),
+                CustomMinimumSize   = new Vector2(0, 32),
             };
             StyleSlotBtn(loadBtn, idx == _slot);
             loadBtn.Pressed += () => OnLoadSlot(idx);
             row.AddChild(loadBtn);
             _slotBtns[i] = loadBtn;
 
-            var saveBtn = new Button { Text = "Save", CustomMinimumSize = new Vector2(46, 36) };
+            var saveBtn = new Button { Text = "Save", CustomMinimumSize = new Vector2(46, 32) };
             saveBtn.Pressed += () => OnSaveSlot(idx);
             row.AddChild(saveBtn);
         }
+
+        // ── Budget section ────────────────────────────────────────────────────
+        vbox.AddChild(new HSeparator());
+
+        var budgetHdr = new Label { Text = "BUDGET", HorizontalAlignment = HorizontalAlignment.Center };
+        budgetHdr.AddThemeColorOverride("font_color", CGoldText);
+        vbox.AddChild(budgetHdr);
+
+        int maxBudget = MapGen.GetMaxBudget();
+        _budgetSlider = new HSlider
+        {
+            MinValue          = 0,
+            MaxValue          = maxBudget,
+            Step              = 10,
+            Value             = maxBudget / 2,
+            CustomMinimumSize = new Vector2(200, 24),
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+        };
+        _budgetSlider.ValueChanged += v =>
+        {
+            _budgetEdit.Text = ((int)v).ToString();
+        };
+        vbox.AddChild(_budgetSlider);
+
+        var goldRow = new HBoxContainer();
+        goldRow.AddThemeConstantOverride("separation", 4);
+        vbox.AddChild(goldRow);
+
+        var goldLblStatic = new Label { Text = "Gold:", CustomMinimumSize = new Vector2(38, 0) };
+        goldLblStatic.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
+        goldRow.AddChild(goldLblStatic);
+
+        _budgetEdit = new LineEdit
+        {
+            Text              = ((int)_budgetSlider.Value).ToString(),
+            CustomMinimumSize = new Vector2(80, 26),
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+        };
+        _budgetEdit.TextChanged += text =>
+        {
+            if (int.TryParse(text, out int val))
+            {
+                val = Math.Clamp(val, 0, maxBudget);
+                _budgetSlider.Value = val;
+            }
+        };
+        goldRow.AddChild(_budgetEdit);
+
+        vbox.AddChild(new HSeparator());
+
+        var genBtn = new Button
+        {
+            Text              = "Generate Map (current slot)",
+            CustomMinimumSize = new Vector2(0, 32),
+        };
+        genBtn.AddThemeFontSizeOverride("font_size", 11);
+        StyleColorBtn(genBtn, new Color(0.10f, 0.20f, 0.35f));
+        genBtn.Pressed += () =>
+        {
+            var result = MapGen.GenerateSlot(_slot, (int)_budgetSlider.Value);
+            _maze = result.Data ?? _maze;
+            _nameEdit.Text = _maze.Name;
+            _statusLbl.Text = result.Message;
+            _statusLbl.AddThemeColorOverride("font_color",
+                result.Success ? new Color(0.30f, 0.90f, 0.30f) : CInvalid);
+            RefreshGold();
+            UpdateStatusLine();
+            UpdateAllSlotLabels();
+            QueueRedraw();
+        };
+        vbox.AddChild(genBtn);
 
         vbox.AddChild(new HSeparator());
 
@@ -176,7 +295,7 @@ public partial class MapEditorMain : Node2D
         lblA.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
         rowA.AddChild(lblA);
         _arenaSlotA = new OptionButton { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
-        for (int i = 0; i < 5; i++) _arenaSlotA.AddItem($"Slot {i}", i);
+        for (int i = 0; i < MazeSerializer.SlotCount; i++) _arenaSlotA.AddItem(ArenaSlotLabel(i), i);
         _arenaSlotA.Selected = 0;
         rowA.AddChild(_arenaSlotA);
 
@@ -187,7 +306,7 @@ public partial class MapEditorMain : Node2D
         lblB.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
         rowB.AddChild(lblB);
         _arenaSlotB = new OptionButton { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
-        for (int i = 0; i < 5; i++) _arenaSlotB.AddItem($"Slot {i}", i);
+        for (int i = 0; i < MazeSerializer.SlotCount; i++) _arenaSlotB.AddItem(ArenaSlotLabel(i), i);
         _arenaSlotB.Selected = 1;
         rowB.AddChild(_arenaSlotB);
 
@@ -293,6 +412,12 @@ public partial class MapEditorMain : Node2D
         var panel = new PanelContainer();
         var style = new StyleBoxFlat { BgColor = bg };
         style.SetCornerRadiusAll(4);
+        // Content margins keep text away from the panel edges; left margin = 6 prevents
+        // the left-most panel's content from being flush with (or clipped by) the screen edge.
+        style.ContentMarginLeft   = 6;
+        style.ContentMarginRight  = 6;
+        style.ContentMarginTop    = 6;
+        style.ContentMarginBottom = 6;
         panel.AddThemeStyleboxOverride("panel", style);
         return panel;
     }
@@ -393,6 +518,27 @@ public partial class MapEditorMain : Node2D
         DrawStairGhosts(lookup);
         foreach (var piece in _maze.Pieces)
             if (piece.Floor == _floor) DrawPiece(piece, lookup);
+        // Yellow reserved-cell overlay: drawn after pieces but before move cursor
+        DrawStairReservedOverlay();
+    }
+
+    // Draw semi-transparent yellow squares over all stair-reserved cells on the current floor.
+    static readonly Color CReserved = new(1f, 1f, 0f, 0.45f);
+    void DrawStairReservedOverlay()
+    {
+        var reserved = GetStairReservedCells(_maze.Pieces);
+        foreach (var (rx, ry, rf) in reserved)
+        {
+            if (rf != _floor) continue;
+            float px = GridOffX + rx * CellPx;
+            float py = GridOffY + ry * CellPx;
+            DrawRect(new Rect2(px + 1, py + 1, CellPx - 2, CellPx - 2), CReserved);
+            DrawRect(new Rect2(px, py, CellPx, CellPx),
+                new Color(1f, 0.85f, 0f, 0.90f), filled: false, width: 2f);
+            DrawString(_font, new Vector2(px + CellPx * 0.5f, py + CellPx * 0.5f + 5),
+                "R", HorizontalAlignment.Center, CellPx - 4, 14,
+                new Color(0.8f, 0.6f, 0f, 0.95f));
+        }
     }
 
     // Stair ghosts show where stairs from an adjacent floor project onto the current floor,
@@ -473,32 +619,36 @@ public partial class MapEditorMain : Node2D
 
     void DrawStairDownGhost(MazePiece stair, int aboveFloor)
     {
-        // StairsDown is at aboveFloor. Its S face connects down to _floor at (stair.X, stair.Y+1).
-        // Show ghost at the stair's own cell; highlight the S face connection.
+        // StairsDown is at aboveFloor. Its cross-floor face connects down to _floor.
+        // Show ghost at the stair's own cell; highlight the cross-floor face connection.
         float px    = GridOffX + stair.X * CellPx;
         float py    = GridOffY + stair.Y * CellPx;
         Color base_ = PieceDB.Colors[PieceType.StairsDown];
         Color ghost = new Color(base_.R * 0.7f, base_.G * 0.7f, base_.B * 0.7f, 0.30f);
 
-        Dir ghostOpen = PieceDB.GetOpenings(PieceType.StairsDown, 0);
+        Dir ghostOpen = PieceDB.GetOpenings(stair.Type, stair.Rotation);
         float gcx = px + CellPx * 0.5f, gcy = py + CellPx * 0.5f;
         float ghw = CellPx * 0.30f;
         DrawRect(new Rect2(px + 1, py + 1, CellPx - 2, CellPx - 2),
             new Color(base_.R * 0.3f, base_.G * 0.3f, base_.B * 0.3f, 0.28f));
         if ((ghostOpen & Dir.N) != 0) DrawRect(new Rect2(gcx-ghw, py,      ghw*2, CellPx*0.5f+ghw), ghost);
         if ((ghostOpen & Dir.S) != 0) DrawRect(new Rect2(gcx-ghw, gcy-ghw, ghw*2, CellPx*0.5f+ghw), ghost);
+        if ((ghostOpen & Dir.E) != 0) DrawRect(new Rect2(gcx-ghw, gcy-ghw, CellPx*0.5f+ghw, ghw*2), ghost);
+        if ((ghostOpen & Dir.W) != 0) DrawRect(new Rect2(px,      gcy-ghw, CellPx*0.5f+ghw, ghw*2), ghost);
         DrawRect(new Rect2(px, py, CellPx, CellPx),
             new Color(base_.R, base_.G, base_.B, 0.45f), filled: false, width: 1.5f);
 
-        // S face is the cross-floor exit; check if (stair.X, stair.Y+1, _floor) connects back
-        int diS = System.Array.IndexOf(AllDirs, Dir.S);
-        var (dxS, dyS) = DirDelta[diS];
+        // Cross-floor face is the connection to this floor; check if the cell it exits toward connects back
+        Dir crossDir = PieceDB.GetStairCrossDir(stair.Type, stair.Rotation);
+        int diCross = System.Array.IndexOf(AllDirs, crossDir);
+        var (dxC, dyC) = DirDelta[diCross];
+        Dir oppCross = Opposite[diCross];
         bool connected = _maze.Pieces.Any(p =>
             p.Floor == _floor &&
-            p.X == stair.X + dxS && p.Y == stair.Y + dyS &&
-            (PieceDB.GetOpenings(p.Type, p.Rotation) & Dir.N) != 0);
+            p.X == stair.X + dxC && p.Y == stair.Y + dyC &&
+            (PieceDB.GetOpenings(p.Type, p.Rotation) & oppCross) != 0);
 
-        DrawOpeningMarker(px, py, Dir.S,
+        DrawOpeningMarker(px, py, crossDir,
             connected ? new Color(0.2f, 0.9f, 0.2f, 0.8f) : new Color(0.9f, 0.15f, 0.15f, 0.9f));
 
         DrawString(_font, new Vector2(px + CellPx * 0.5f, py + CellPx * 0.5f + 5),
@@ -600,11 +750,8 @@ public partial class MapEditorMain : Node2D
         // ── Stairs ramp arrow ─────────────────────────────────────────────────
         if (PieceDB.IsStair(piece.Type))
         {
-            // For StairsUp/Stairs: arrow points toward the "up" (high) exit.
-            // For StairsDown: arrow points toward the "down" (low S) exit.
-            Dir arrowDir = piece.Type == PieceType.StairsDown
-                ? Dir.S
-                : PieceDB.GetStairUpDir(piece.Rotation);
+            // Arrow points toward the cross-floor exit (up for StairsUp, down for StairsDown).
+            Dir arrowDir = PieceDB.GetStairCrossDir(piece.Type, piece.Rotation);
             Color arrow = CGoldText.Lightened(0.1f);
             Dir   upDir = arrowDir;   // keep same variable name for the arrow-head code below
             (float ax, float ay, float bx, float by) = upDir switch
@@ -664,6 +811,12 @@ public partial class MapEditorMain : Node2D
                 case Key.R:      OnRotate(); return;
                 case Key.Escape: Deselect(); return;
                 case Key.Delete: DeleteSelected(); return;
+                case Key.F11:
+                    var mode = DisplayServer.WindowGetMode();
+                    DisplayServer.WindowSetMode(mode == DisplayServer.WindowMode.Fullscreen
+                        ? DisplayServer.WindowMode.Windowed
+                        : DisplayServer.WindowMode.Fullscreen);
+                    return;
             }
         }
 
@@ -696,12 +849,9 @@ public partial class MapEditorMain : Node2D
             if (hit == null)
             {
                 // Move selected piece to this empty cell; auto-rotate to connect.
-                // Stair types are fixed-orientation — keep rotation 0.
                 _picked.X        = cx;
                 _picked.Y        = cy;
-                _picked.Rotation = (_picked.Type == PieceType.StairsUp || _picked.Type == PieceType.StairsDown)
-                    ? 0
-                    : InferRotation(_picked.Type, cx, cy, _floor, exclude: _picked);
+                _picked.Rotation = InferRotation(_picked.Type, cx, cy, _floor, exclude: _picked);
                 _picked = null;
                 RefreshGold();
                 UpdateStatusLine();
@@ -754,14 +904,19 @@ public partial class MapEditorMain : Node2D
         if (_selType == PieceType.StairsDown && _floor <= FloorMin)
         { _statusLbl.Text = $"Stairs Down needs a floor below — use floor {FloorMin + 1}+"; return; }
 
-        // Block placement on stair ghost cells (upward stairs from the floor below)
-        if (_maze.Pieces.Any(p =>
-                PieceDB.IsStair(p.Type) && p.Type != PieceType.StairsDown &&
-                p.Floor == _floor - 1 && p.X == x && p.Y == y))
-        { _statusLbl.Text = "Stairs from below occupy this cell"; return; }
+        // Block placement on any cell reserved by a stair's shadow floor.
+        if (IsStairReserved(x, y, _floor, _maze.Pieces))
+        { _statusLbl.Text = "Stair space reserved — cannot place here"; return; }
 
-        // StairsUp/StairsDown are always rotation-0 (no rotation needed)
-        int rot = PieceDB.IsStair(_selType) ? 0 : InferRotation(_selType, x, y, _floor, exclude: null);
+        // When placing a stair piece, also verify the shadow floor is free.
+        if (PieceDB.IsStair(_selType))
+        {
+            int shadowFloor = _floor + PieceDB.StairFloorDelta(_selType);
+            if (_maze.Pieces.Any(p => p.X == x && p.Y == y && p.Floor == shadowFloor))
+            { _statusLbl.Text = "Cannot place stair — shadow floor is occupied"; return; }
+        }
+
+        int rot = PieceDB.IsStair(_selType) ? _rotation : InferRotation(_selType, x, y, _floor, exclude: null);
 
         _maze.Pieces.RemoveAll(p => p.X == x && p.Y == y && p.Floor == _floor);
         _maze.Pieces.Add(new MazePiece { Type = _selType, X = x, Y = y, Floor = _floor, Rotation = rot });
@@ -805,17 +960,62 @@ public partial class MapEditorMain : Node2D
     /// </summary>
     int InferRotation(PieceType type, int x, int y, int floor, MazePiece? exclude)
     {
-        // Collect which directions REQUIRE an opening (neighbor has opening toward us)
+        // Collect which directions REQUIRE an opening (neighbor has opening toward us).
+        // For stair neighbors, the cross-floor face connects from a different floor, so we
+        // must look on the stair's own floor and check if its cross-floor exit points here.
         Dir required = Dir.None;
         for (int i = 0; i < 4; i++)
         {
             var (dx, dy) = DirDelta[i];
-            int nf = (type == PieceType.Stairs && AllDirs[i] == Dir.N) ? floor + 1 : floor;
-            if (!_maze.Pieces.Any(p => p != exclude && p.X == x+dx && p.Y == y+dy && p.Floor == nf))
-                continue;
-            var nb = _maze.Pieces.First(p => p != exclude && p.X == x+dx && p.Y == y+dy && p.Floor == nf);
-            if ((PieceDB.GetOpenings(nb.Type, nb.Rotation) & Opposite[i]) != 0)
-                required |= AllDirs[i];
+            Dir incomingDir = AllDirs[i];   // direction from (x,y) toward neighbor
+            Dir faceBack    = Opposite[i];  // the face the neighbor would need to point back at us
+
+            // ── Same-floor neighbors ──────────────────────────────────────────
+            var nbSame = _maze.Pieces.FirstOrDefault(p =>
+                p != exclude && p.X == x+dx && p.Y == y+dy && p.Floor == floor);
+            if (nbSame != null)
+            {
+                Dir nbOpen = PieceDB.GetOpenings(nbSame.Type, nbSame.Rotation);
+                // For a stair neighbor, only count its flat (same-floor) face — not the cross-floor face.
+                if (PieceDB.IsStair(nbSame.Type))
+                {
+                    Dir flatFace = PieceDB.GetStairFlatDir(nbSame.Type, nbSame.Rotation);
+                    if (faceBack == flatFace) required |= incomingDir;
+                }
+                else
+                {
+                    if ((nbOpen & faceBack) != 0) required |= incomingDir;
+                }
+            }
+
+            // ── Cross-floor stair neighbors ───────────────────────────────────
+            // A stair piece on an adjacent floor whose cross-floor exit is toward (x,y)
+            // requires (x,y) to have an opening toward that stair.
+            // StairsUp on floor-1: crossDir=N, so its exit is at (stair.X, stair.Y-1, floor).
+            //   That means we're at (stair.X, stair.Y-1) and the stair is south of us (dy=+1 → dir=S).
+            //   We need faceBack = S, incomingDir = S.
+            // StairsDown on floor+1: crossDir=S, so its exit is at (stair.X, stair.Y+1, floor).
+            //   That means we're at (stair.X, stair.Y+1) and the stair is north of us (dy=-1 → dir=N).
+            //   We need faceBack = N, incomingDir = N.
+            // General rule: look for a stair on the cross-floor whose cross-exit delta matches (-dx,-dy).
+            foreach (var stair in _maze.Pieces)
+            {
+                if (stair == exclude) continue;
+                if (!PieceDB.IsStair(stair.Type)) continue;
+                int delta = PieceDB.StairFloorDelta(stair.Type);
+                if (stair.Floor + delta != floor) continue;          // its cross exit must be on our floor
+                Dir  crossDir = PieceDB.GetStairCrossDir(stair.Type, stair.Rotation);
+                int  ci       = System.Array.IndexOf(AllDirs, crossDir);
+                var (cdx, cdy) = DirDelta[ci];
+                // The stair's cross-floor exit cell is (stair.X+cdx, stair.Y+cdy, floor)
+                if (stair.X + cdx != x || stair.Y + cdy != y) continue;
+                // The stair is at (stair.X, stair.Y) which is (x-cdx, y-cdy) relative to us.
+                // We need to check if (-cdx, -cdy) matches (dx, dy) for direction i.
+                if (dx != -cdx || dy != -cdy) continue;
+                // This stair's cross-floor exit lands exactly here in direction i;
+                // we require an opening in that direction.
+                required |= incomingDir;
+            }
         }
 
         if (required == Dir.None) return _rotation;  // no neighbors, keep manual rotation
@@ -854,22 +1054,12 @@ public partial class MapEditorMain : Node2D
 
     void UpdateRotateButtonState()
     {
-        // Disable rotate when the active type (palette or selected piece) is a fixed-rotation stair
-        PieceType active = _picked != null ? _picked.Type : _selType;
-        bool noRot = active == PieceType.StairsUp || active == PieceType.StairsDown;
-        _rotBtn.Disabled = noRot;
-        _rotBtn.Modulate  = noRot ? new Color(1f, 1f, 1f, 0.35f) : new Color(1f, 1f, 1f, 1f);
+        _rotBtn.Disabled = false;
+        _rotBtn.Modulate  = new Color(1f, 1f, 1f, 1f);
     }
 
     void OnRotate()
     {
-        // Stair types can't be rotated
-        if (_picked != null && PieceDB.IsStair(_picked.Type) &&
-            (_picked.Type == PieceType.StairsUp || _picked.Type == PieceType.StairsDown))
-            return;
-        if (_picked == null && (_selType == PieceType.StairsUp || _selType == PieceType.StairsDown))
-            return;
-
         if (_picked != null)
         {
             _picked.Rotation = (_picked.Rotation + 1) % 4;
@@ -913,7 +1103,8 @@ public partial class MapEditorMain : Node2D
         _maze  = data ?? new MazeData();
         _slot  = slot;
         _floor = 0;
-        _floorLbl.Text = FloorLabel(0);
+        _floorLbl.Text  = FloorLabel(0);
+        _nameEdit.Text  = _maze.Name;
         UpdateAllSlotLabels();
         RefreshGold();
         UpdateStatusLine();
@@ -935,35 +1126,26 @@ public partial class MapEditorMain : Node2D
         if (!hasStart || !hasExit)
         { _statusLbl.Text = "Need a Start and Exit piece!"; return; }
 
-        // Validate all stair cross-floor connections
+        // Validate all stair cross-floor connections (fast local check for floor-range violations)
         foreach (var stair in _maze.Pieces.Where(p => PieceDB.IsStair(p.Type)))
         {
-            Dir  crossDir  = PieceDB.GetStairCrossDir(stair.Type, stair.Rotation);
-            int  di        = System.Array.IndexOf(AllDirs, crossDir);
-            var (dx, dy)   = DirDelta[di];
-            int  delta     = PieceDB.StairFloorDelta(stair.Type);
-            int  crossFloor = stair.Floor + delta;
-
+            int  crossFloor = stair.Floor + PieceDB.StairFloorDelta(stair.Type);
             if (crossFloor < FloorMin || crossFloor > FloorMax)
             {
                 _statusLbl.Text = $"Stairs at ({stair.X},{stair.Y}) F{stair.Floor} goes out of range!";
                 QueueRedraw();
                 return;
             }
+        }
 
-            bool connected = _maze.Pieces.Any(p =>
-                p.Floor == crossFloor &&
-                p.X == stair.X + dx && p.Y == stair.Y + dy &&
-                (PieceDB.GetOpenings(p.Type, p.Rotation) & Opposite[di]) != 0);
-            if (!connected)
-            {
-                string label = stair.Type == PieceType.StairsDown ? "below" : "above";
-                _statusLbl.Text = $"Stairs at ({stair.X},{stair.Y}) F{stair.Floor} has no exit {label}!";
-                _floor = crossFloor;
-                _floorLbl.Text = FloorLabel(_floor);
-                QueueRedraw();
-                return;
-            }
+        // Full BFS reachability check — accepts any layout that keeps Start→Exit navigable.
+        // This replaces the strict local neighbor check so that a stair whose adjacent cell is a
+        // dead-end cap wall is still accepted as long as the whole map remains traversable.
+        if (!IsMapFullyReachable(out string reachErr))
+        {
+            _statusLbl.Text = $"Map not fully connected: {reachErr}";
+            QueueRedraw();
+            return;
         }
 
         OnSaveSlot(_slot);
@@ -995,6 +1177,102 @@ public partial class MapEditorMain : Node2D
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    //  BFS REACHABILITY
+    // ══════════════════════════════════════════════════════════════════════════
+    /// <summary>
+    /// BFS from the Start piece across all same-floor and cross-floor (stair) edges.
+    /// Returns true if every piece in the maze is reachable from Start.
+    /// Also returns false if there is no Start piece.
+    /// </summary>
+    bool IsMapFullyReachable(out string unreachableDesc)
+    {
+        unreachableDesc = "";
+        var start = _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Start);
+        if (start == null) { unreachableDesc = "No Start piece"; return false; }
+
+        var lookup = BuildLookup();
+        var visited = new HashSet<(int, int, int)>();
+        var queue = new Queue<MazePiece>();
+        queue.Enqueue(start);
+        visited.Add((start.X, start.Y, start.Floor));
+
+        while (queue.Count > 0)
+        {
+            var piece = queue.Dequeue();
+            Dir open = PieceDB.GetOpenings(piece.Type, piece.Rotation);
+
+            for (int i = 0; i < AllDirs.Length; i++)
+            {
+                Dir dir = AllDirs[i];
+                if ((open & dir) == 0) continue;
+
+                var (dx, dy) = DirDelta[i];
+                Dir opp = Opposite[i];
+
+                // Determine target floor: stairs cross to adjacent floor on their cross-dir face.
+                int nFloor = piece.Floor;
+                if (PieceDB.IsStair(piece.Type) && dir == PieceDB.GetStairCrossDir(piece.Type, piece.Rotation))
+                    nFloor = piece.Floor + PieceDB.StairFloorDelta(piece.Type);
+
+                int nx = piece.X + dx, ny = piece.Y + dy;
+                var key = (nx, ny, nFloor);
+                if (visited.Contains(key)) continue;
+                if (!lookup.TryGetValue(key, out var nb)) continue;
+                if ((PieceDB.GetOpenings(nb.Type, nb.Rotation) & opp) == 0) continue;
+
+                visited.Add(key);
+                queue.Enqueue(nb);
+            }
+        }
+
+        // Find any piece not reached
+        var unreached = _maze.Pieces.Where(p => !visited.Contains((p.X, p.Y, p.Floor))).ToList();
+        if (unreached.Count > 0)
+        {
+            unreachableDesc = $"{unreached.Count} piece(s) not reachable from Start " +
+                              $"(e.g. {PieceDB.Labels[unreached[0].Type]} at ({unreached[0].X},{unreached[0].Y},F{unreached[0].Floor}))";
+            return false;
+        }
+        return true;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  STAIR RESERVATION HELPERS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// Returns true if (x, y, floor) is reserved as the shadow cell of an
+    /// adjacent stair on a neighboring floor.
+    ///   StairsUp / Stairs at (x, y, floor-1)  → reserves (x, y, floor)   [shadow above]
+    ///   StairsDown at (x, y, floor+1)          → reserves (x, y, floor)   [shadow below]
+    static bool IsStairReserved(int x, int y, int floor, System.Collections.Generic.IEnumerable<MazePiece> pieces)
+    {
+        foreach (var p in pieces)
+        {
+            if (p.X != x || p.Y != y) continue;
+            if (!PieceDB.IsStair(p.Type)) continue;
+            int shadowFloor = p.Floor + PieceDB.StairFloorDelta(p.Type);
+            if (shadowFloor == floor) return true;
+        }
+        return false;
+    }
+
+    /// Returns all (x, y, floor) cells that are reserved as shadow cells of
+    /// placed stair pieces (i.e. the floor the stair rises/falls into, not
+    /// the floor the stair piece itself sits on).
+    static System.Collections.Generic.HashSet<(int, int, int)> GetStairReservedCells(
+        System.Collections.Generic.IEnumerable<MazePiece> pieces)
+    {
+        var reserved = new System.Collections.Generic.HashSet<(int, int, int)>();
+        foreach (var p in pieces)
+        {
+            if (!PieceDB.IsStair(p.Type)) continue;
+            int shadowFloor = p.Floor + PieceDB.StairFloorDelta(p.Type);
+            reserved.Add((p.X, p.Y, shadowFloor));
+        }
+        return reserved;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     //  HELPERS
     // ══════════════════════════════════════════════════════════════════════════
     Dictionary<(int, int, int), MazePiece> BuildLookup()
@@ -1006,11 +1284,8 @@ public partial class MapEditorMain : Node2D
 
     void SyncRotLabelToSelected()
     {
-        // StairsUp/StairsDown have no rotation
-        bool fixedRot = (_picked != null && (_picked.Type == PieceType.StairsUp || _picked.Type == PieceType.StairsDown))
-                     || (_picked == null  && (_selType    == PieceType.StairsUp || _selType    == PieceType.StairsDown));
         int deg = _picked != null ? _picked.Rotation * 90 : _rotation * 90;
-        _rotLbl.Text = fixedRot ? "–" : $"{deg}°";
+        _rotLbl.Text = $"{deg}°";
         UpdateRotateButtonState();
         if (_picked != null)
         {
@@ -1063,13 +1338,26 @@ public partial class MapEditorMain : Node2D
 
     void UpdateAllSlotLabels()
     {
-        for (int i = 0; i < 5; i++)
+        for (int i = 0; i < MazeSerializer.SlotCount; i++)
         {
             var data = MazeSerializer.Load(i);
             _slotBtns[i].Text = data != null
-                ? $"Slot {i}: {data.Name}  {data.GoldSpent}g"
-                : $"Slot {i}: (empty)";
+                ? $"{i}: {data.Name}  {data.GoldSpent}g"
+                : $"{i}: (empty)";
             StyleSlotBtn(_slotBtns[i], i == _slot);
         }
+        // Refresh arena dropdowns so names stay in sync
+        for (int i = 0; i < MazeSerializer.SlotCount; i++)
+        {
+            _arenaSlotA.SetItemText(i, ArenaSlotLabel(i));
+            _arenaSlotB.SetItemText(i, ArenaSlotLabel(i));
+        }
+    }
+
+    // Short label for arena dropdowns — shows name if the slot has data.
+    string ArenaSlotLabel(int i)
+    {
+        var data = MazeSerializer.Load(i);
+        return data != null ? $"{i}: {data.Name}" : $"{i}: (empty)";
     }
 }

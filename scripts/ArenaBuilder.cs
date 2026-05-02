@@ -277,7 +277,9 @@ void fragment(){
         var mi = new MeshInstance3D { Name = name, Mesh = mesh };
         mi.SetSurfaceOverrideMaterial(0, isFloor ? FloorMat() : StoneMat());
         body.AddChild(mi);
-        body.AddChild(new CollisionShape3D { Name = name + "Col", Shape = mesh.CreateTrimeshShape() });
+        var shape = mesh.CreateTrimeshShape();
+        shape.BackfaceCollision = true;   // collide from both sides; fixes player walking through walls from inside
+        body.AddChild(new CollisionShape3D { Name = name + "Col", Shape = shape });
     }
 
     static SurfaceTool MakeST()

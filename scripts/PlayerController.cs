@@ -102,6 +102,10 @@ public partial class PlayerController : CharacterBody3D
     float       _tpDistCurrent  = 5.0f;
     float       _tpElevCurrent  = 2.5f;
 
+    // ── Hold-R reset ──────────────────────────────────────────────────────────
+    float _resetHoldTime = 0f;
+    const float ResetHoldThreshold = 0.5f;
+
     // ── Animator ──────────────────────────────────────────────────────────────
     PlayerAnimator _animator = null!;
 
@@ -232,6 +236,30 @@ public partial class PlayerController : CharacterBody3D
             NormalTick(ref vel, dt, onFloor);
 
         _wasOnFloor = onFloor;
+
+        // ── Hold R to teleport back to maze start ─────────────────────────────
+        if (Input.IsKeyPressed(Key.R))
+        {
+            _resetHoldTime += dt;
+            if (_resetHoldTime >= ResetHoldThreshold)
+            {
+                _resetHoldTime = 0f;
+                var startPos = DungeonBuilder.MazeStartPosition;
+                if (startPos != Vector3.Zero)
+                {
+                    Position = startPos;
+                    vel      = Vector3.Zero;
+                    _sliding        = false;
+                    _wallRunning    = false;
+                    _airFallSpeed   = 0f;
+                    _coyote         = 0f;
+                }
+            }
+        }
+        else
+        {
+            _resetHoldTime = 0f;
+        }
 
         AdjustStairVelocity(ref vel, dt);
 
@@ -461,7 +489,8 @@ public partial class PlayerController : CharacterBody3D
     }
 
     // ── Stair speed regulation ────────────────────────────────────────────────
-    // Caps uphill movement to WalkSpeed; adds gravity boost on the way down.
+    // Going uphill: no speed penalty — momentum carries through at full speed.
+    // Adds gravity boost when sliding downhill.
     // Only fires on steep floors (stairs ~51°, so floorNormal.Y ≈ 0.63).
     void AdjustStairVelocity(ref Vector3 vel, float dt)
     {
@@ -479,14 +508,8 @@ public partial class PlayerController : CharacterBody3D
 
         if (slopeSign < 0f)
         {
-            // Going uphill: cap horizontal speed to SprintSpeed (slightly quicker on stairs)
-            float spd = velXZ.Length();
-            if (spd > SprintSpeed)
-            {
-                velXZ = velXZ.Normalized() * SprintSpeed;
-                vel.X = velXZ.X;
-                vel.Z = velXZ.Z;
-            }
+            // Going uphill: no penalty — allow momentum-driven stair climbing at any speed.
+            // (No cap applied; let the player carry full sprint momentum up stairs.)
         }
         else if (_sliding)
         {

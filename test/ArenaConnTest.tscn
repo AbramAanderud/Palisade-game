@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://arenaconntesttscn1"]
+
+[ext_resource type="Script" path="res://test/ArenaConnTest.cs" id="1_s"]
+
+[node name="ArenaConnTest" type="Node3D"]
+script = ExtResource("1_s")

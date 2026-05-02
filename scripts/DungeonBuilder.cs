@@ -103,6 +103,9 @@ void fragment() {
 
     [Signal] public delegate void DungeonReadyEventHandler();
 
+    // ── Static start position — set when the Start piece is built ─────────────
+    public static Vector3 MazeStartPosition = Vector3.Zero;
+
     // ── World-space offset (arena mode: second maze is shifted along Z) ────────
     Vector3 _worldOffset  = Vector3.Zero;
     /// Which side of the Exit piece is left open (no cap wall) to face the arena.
@@ -148,6 +151,13 @@ void fragment() {
 
         foreach (var p in pieces)
         {
+            // Record start position so PlayerController can teleport back here.
+            if (p.Type == PieceType.Start)
+                MazeStartPosition = _worldOffset + new Vector3(
+                    p.X * CellSize + CellSize * 0.5f,
+                    yBase + 1.0f,
+                    p.Y * CellSize + CellSize * 0.5f);
+
             var wallST  = MakeST();
             var floorST = MakeST();
             var ceilST  = MakeST();
@@ -165,13 +175,16 @@ void fragment() {
 
             if (PieceDB.IsStair(p.Type))
             {
-                // Walls still need collision (player bumps the side walls).
-                // Tread/riser floor and ceiling are visual-only so they don't
-                // conflict with the smooth ramp CollisionShape3D added below.
-                AddMesh(body, Commit(wallST), $"Wall_{p.X}_{p.Y}", default);
-                AddMeshVisual(body, Commit(floorST), $"Floor_{p.X}_{p.Y}", isFloor: true);
-                AddMeshVisual(body, Commit(ceilST),  $"Ceil_{p.X}_{p.Y}",  isFloor: false);
+                // Walls need BackfaceCollision so side walls / gable triangles are
+                // solid from both sides (wall-running, jumping against outer face).
+                // Tread/riser floor is visual-only so it doesn't conflict with
+                // the smooth ramp CollisionShape3D added below.
+                // Ceiling gets BackfaceCollision so the player can't jump through it.
+                AddMeshWithBackface(body, Commit(wallST), $"Wall_{p.X}_{p.Y}", isFloor: false, doubleSided: true);
+                AddMeshVisual(body, Commit(floorST), $"Floor_{p.X}_{p.Y}", isFloor: true, doubleSided: true);
+                AddMeshWithBackface(body, Commit(ceilST), $"Ceil_{p.X}_{p.Y}", isFloor: false, doubleSided: true);
                 AddStairRamp(body, p, geomBase);
+                AddWingCaps(body, p, geomBase);
             }
             else
             {
@@ -191,11 +204,13 @@ void fragment() {
         float cx = x0 + CellSize * 0.5f, cz = z0 + CellSize * 0.5f;
         float hw = OpeningW * 0.5f;
         float yLo = yBase, yHi = yBase + FloorHeight;
-        // For StairsDown the geomBase is already shifted; the high end is always N.
-        // For legacy Stairs/StairsUp use the cross dir (which equals GetStairUpDir for those types).
+        // For StairsDown the geomBase is already shifted to floor-1; the ramp's high end
+        // is the same-floor (flat) side — the side that connects to the same-floor corridor.
+        // For legacy Stairs/StairsUp the high end IS the cross dir (pointing to floor+1).
+        var stairInfo = PieceDB.GetStairInfo(p.Type, p.Rotation);
         Dir upDir = p.Type == PieceType.StairsDown
-            ? Dir.N
-            : PieceDB.GetStairCrossDir(p.Type, p.Rotation);
+            ? stairInfo.FlatDir
+            : stairInfo.CrossDir;
 
         var rampST = MakeST();
         switch (upDir)
@@ -219,17 +234,41 @@ void fragment() {
         }
         var rampMesh = Commit(rampST);
         if (rampMesh != null)
-            body.AddChild(new CollisionShape3D { Name = "StairRamp", Shape = rampMesh.CreateTrimeshShape() });
+        {
+            var rampShape = rampMesh.CreateTrimeshShape();
+            rampShape.BackfaceCollision = true;
+            body.AddChild(new CollisionShape3D { Name = "StairRamp", Shape = rampShape });
+        }
     }
 
     // Add a mesh as visual-only (no collision). Used for stair tread/riser geometry
     // so the stepped trimesh doesn't conflict with the smooth ramp collision shape.
-    void AddMeshVisual(Node3D parent, ArrayMesh? mesh, string name, bool isFloor)
+    void AddMeshVisual(Node3D parent, ArrayMesh? mesh, string name, bool isFloor,
+        bool doubleSided = false)
     {
         if (mesh == null) return;
         var mi = new MeshInstance3D { Name = name, Mesh = mesh };
-        mi.SetSurfaceOverrideMaterial(0, isFloor ? GetFloorMat() : GetStoneMat());
+        mi.SetSurfaceOverrideMaterial(0, doubleSided
+            ? (isFloor ? GetStairFloorMat() : GetStairStoneMat())
+            : (isFloor ? GetFloorMat()      : GetStoneMat()));
         parent.AddChild(mi);
+    }
+
+    // Add a mesh with visual AND collision, using BackfaceCollision=true on the trimesh
+    // so one-sided vault geometry blocks from both sides (needed for stair ceilings).
+    // doubleSided=true uses cull_disabled materials so the mesh also renders from the outside.
+    void AddMeshWithBackface(StaticBody3D body, ArrayMesh? mesh, string name, bool isFloor,
+        bool doubleSided = false)
+    {
+        if (mesh == null) return;
+        var mi = new MeshInstance3D { Name = name, Mesh = mesh };
+        mi.SetSurfaceOverrideMaterial(0, doubleSided
+            ? (isFloor ? GetStairFloorMat() : GetStairStoneMat())
+            : (isFloor ? GetFloorMat()      : GetStoneMat()));
+        body.AddChild(mi);
+        var shape = mesh.CreateTrimeshShape();
+        shape.BackfaceCollision = true;
+        body.AddChild(new CollisionShape3D { Name = name + "Col", Shape = shape });
     }
 
     // Instance fields — NOT static. Static Godot resources get silently freed when
@@ -237,6 +276,11 @@ void fragment() {
     // meshes to render black. Per-instance materials are recreated each dungeon build.
     ShaderMaterial? _stoneMat;
     ShaderMaterial? _floorMat;
+    // Stair-specific variants with cull_disabled so the geometry renders from both
+    // sides — stair walls and ceilings are visible/solid from outside (wall-running,
+    // looking down through from upper floor, jumping against outer face).
+    ShaderMaterial? _stairStoneMat;
+    ShaderMaterial? _stairFloorMat;
 
     ShaderMaterial GetStoneMat()
     {
@@ -251,6 +295,26 @@ void fragment() {
         var sh = new Shader(); sh.Code = FloorShaderSrc;
         _floorMat = new ShaderMaterial { Shader = sh };
         return _floorMat;
+    }
+    // Stair variants: cull_disabled so side walls, gable faces, and vault ceiling
+    // render from both sides (visible + collidable from outside for wall-running).
+    ShaderMaterial GetStairStoneMat()
+    {
+        if (_stairStoneMat != null && GodotObject.IsInstanceValid(_stairStoneMat)) return _stairStoneMat;
+        var sh = new Shader(); sh.Code = StoneShaderSrc.Replace(
+            "render_mode diffuse_burley, specular_schlick_ggx;",
+            "render_mode diffuse_burley, specular_schlick_ggx, cull_disabled;");
+        _stairStoneMat = new ShaderMaterial { Shader = sh };
+        return _stairStoneMat;
+    }
+    ShaderMaterial GetStairFloorMat()
+    {
+        if (_stairFloorMat != null && GodotObject.IsInstanceValid(_stairFloorMat)) return _stairFloorMat;
+        var sh = new Shader(); sh.Code = FloorShaderSrc.Replace(
+            "render_mode diffuse_burley, specular_schlick_ggx;",
+            "render_mode diffuse_burley, specular_schlick_ggx, cull_disabled;");
+        _stairFloorMat = new ShaderMaterial { Shader = sh };
+        return _stairFloorMat;
     }
 
     void AddMesh(StaticBody3D body, ArrayMesh? mesh, string name, Color _unused)
@@ -287,7 +351,7 @@ void fragment() {
         {
             // StairsDown's geomBase is already shifted to floor-1 level by BuildFloor,
             // so its geometry is identical to a Dir.N StairsUp at that shifted base.
-            AddStairGeometry(piece, wallST, floorST, ceilST, x0, z0, yBase);
+            AddStairGeometry(piece, lookup, wallST, floorST, ceilST, x0, z0, yBase);
             return;
         }
 
@@ -388,7 +452,7 @@ void fragment() {
     //   StairsDown own S face       — connects to floor-1 neighbor
     static bool IsConnected(Dir dir, MazePiece piece, Dictionary<(int, int, int), MazePiece> lookup)
     {
-        Dir opposite = dir switch { Dir.N => Dir.S, Dir.S => Dir.N, Dir.E => Dir.W, _ => Dir.E };
+        Dir opposite = PieceDB.Opposite(dir);
         (int nx, int ny) = dir switch
         {
             Dir.N => (piece.X, piece.Y - 1),
@@ -402,14 +466,14 @@ void fragment() {
             if ((PieceDB.GetOpenings(neighbor.Type, neighbor.Rotation) & opposite) != 0)
                 return true;
 
-        // ── StairsDown: S face connects down to floor-1 ───────────────────────
-        // The piece's own S face goes to floor-1 at (nx, ny).
-        if (piece.Type == PieceType.StairsDown && dir == Dir.S)
+        // ── StairsDown: cross face connects down to floor-1 ──────────────────
+        // The cross-floor exit of StairsDown at rot=0 is Dir.S, rotating with the piece.
+        if (piece.Type == PieceType.StairsDown && dir == PieceDB.GetStairCrossDir(PieceType.StairsDown, piece.Rotation))
         {
             if (lookup.TryGetValue((nx, ny, piece.Floor - 1), out var belowNeighbor))
                 if ((PieceDB.GetOpenings(belowNeighbor.Type, belowNeighbor.Rotation) & opposite) != 0)
                     return true;
-            return true; // S face of StairsDown is always open (leads down) — no cap wall
+            return false; // no floor-1 neighbor → cap wall needed to close the cross face
         }
 
         // ── StairsUp/Stairs on floor-1 whose high exit faces toward us ────────
@@ -418,14 +482,32 @@ void fragment() {
                 PieceDB.GetStairCrossDir(below.Type, below.Rotation) == opposite)
                 return true;
 
-        // ── StairsDown on floor+1 whose S (low) exit faces toward us ─────────
-        // A piece at (x, y, F) checking dir D: if there's a StairsDown at (nx, ny, F+1)
-        // whose S face connects to (nx, ny+1, F) == us when dir==N, nx==piece.X, ny==piece.Y-1.
+        // ── StairsDown on floor+1 whose cross (low) exit faces toward us ─────
         if (lookup.TryGetValue((nx, ny, piece.Floor + 1), out var above))
-            if (above.Type == PieceType.StairsDown && Dir.S == opposite)
+            if (above.Type == PieceType.StairsDown &&
+                PieceDB.GetStairCrossDir(PieceType.StairsDown, above.Rotation) == opposite)
                 return true;
 
         return false;
+    }
+
+    /// Returns true when a connected piece exists on the correct floor adjacent to the stair's high end.
+    /// For StairsUp/Stairs the high end is Floor+1; for StairsDown it is the same Floor
+    /// (because geomBase is already shifted to Floor-1, so the high end lands on Floor).
+    /// The neighbor must also have an opening facing back toward the stair (not just exist).
+    static bool StairHighEndHasNeighbor(MazePiece piece, Dir highDir,
+        Dictionary<(int,int,int), MazePiece> lookup)
+    {
+        (int nx, int ny) = highDir switch {
+            Dir.N => (piece.X, piece.Y - 1),
+            Dir.S => (piece.X, piece.Y + 1),
+            Dir.E => (piece.X + 1, piece.Y),
+            _     => (piece.X - 1, piece.Y),
+        };
+        int targetFloor = (piece.Type == PieceType.StairsDown) ? piece.Floor : piece.Floor + 1;
+        Dir opposite = PieceDB.Opposite(highDir);
+        if (!lookup.TryGetValue((nx, ny, targetFloor), out var neighbor)) return false;
+        return (PieceDB.GetOpenings(neighbor.Type, neighbor.Rotation) & opposite) != 0;
     }
 
     // ── Corridor wall helpers ─────────────────────────────────────────────────
@@ -467,8 +549,8 @@ void fragment() {
     // Treads + risers (visible), plus clean full-height side walls and vault ceiling.
     // Smooth ramp collision is added separately in AddStairRamps so CharacterBody3D
     // can walk up without hitting the individual riser faces.
-    void AddStairGeometry(MazePiece piece, SurfaceTool wallST,
-        SurfaceTool floorST, SurfaceTool ceilST, float x0, float z0, float yBase)
+    void AddStairGeometry(MazePiece piece, Dictionary<(int,int,int), MazePiece> lookup,
+        SurfaceTool wallST, SurfaceTool floorST, SurfaceTool ceilST, float x0, float z0, float yBase)
     {
         float x1      = x0 + CellSize, z1 = z0 + CellSize;
         float cx      = x0 + CellSize * 0.5f, cz = z0 + CellSize * 0.5f;
@@ -476,11 +558,12 @@ void fragment() {
         float yLo      = yBase, yHi = yBase + FloorHeight;
         float springLo = yBase + CellHeight;          // vault spring at low end of stair
         float springHi = yBase + FloorHeight + CellHeight; // vault spring at high end
-        // For StairsDown (geomBase is floor-1 level), the geometry's high end is always N.
+        // For StairsDown (geomBase is floor-1 level), the ramp's high end is the flat (same-floor) side.
         // For legacy Stairs and StairsUp, use the rotation-based cross dir.
+        var   sInfo    = PieceDB.GetStairInfo(piece.Type, piece.Rotation);
         Dir   upDir    = piece.Type == PieceType.StairsDown
-            ? Dir.N
-            : PieceDB.GetStairCrossDir(piece.Type, piece.Rotation);
+            ? sInfo.FlatDir
+            : sInfo.CrossDir;
         int   N        = StairSteps;
         float rise     = FloorHeight / N;
 
@@ -505,12 +588,37 @@ void fragment() {
                     // Riser (vertical face, faces south +Z toward approaching player)
                     EWWall(wallST, zFront, cx-hw, cx+hw, yPrev, yTread, +1);
                 }
-                // Full-height side walls
-                NSWall(wallST, cx-hw, z0, z1, yLo, yHi, +1);  // west wall, faces +X
-                NSWall(wallST, cx+hw, z0, z1, yLo, yHi, -1);  // east wall, faces -X
-                // No cap wall at z0 (north/top exit) — the upper floor piece handles that face
+                // Full two-story side walls: trapezoidal quads following the vault spring.
+                // Bottom edge is flat at yLo; top edge slants from springLo (low/south z1) to springHi (high/north z0).
+                // West wall (normal +X): same winding pattern as NSWall normalSign=+1, heights varied per end.
+                Quad(wallST, new(cx-hw,yLo,z0), new(cx-hw,yLo,z1),
+                             new(cx-hw,springLo,z1), new(cx-hw,springHi,z0));
+                // East wall (normal -X): reversed winding.
+                Quad(wallST, new(cx+hw,yLo,z1), new(cx+hw,yLo,z0),
+                             new(cx+hw,springHi,z0), new(cx+hw,springLo,z1));
+                // Low end cap wall at z1 (south/bottom) — only when not connected to a corridor piece.
+                if (!IsConnected(Dir.S, piece, lookup))
+                    EWWall(wallST, z1, cx-hw, cx+hw, yLo, springLo + ArchRise, +1);
+                // Outer low-end wall sections (x0..cx-hw and cx+hw..x1) are always solid — no opening there.
+                EWWall(wallST, z1, x0, cx-hw, yLo, springLo + ArchRise, +1);
+                EWWall(wallST, z1, cx+hw, x1,  yLo, springLo + ArchRise, +1);
+                // High end cap wall at z0 (north/top) — only when no upper-floor piece is present.
+                if (!StairHighEndHasNeighbor(piece, Dir.N, lookup))
+                    EWWall(wallST, z0, cx-hw, cx+hw, yLo, springHi + ArchRise, -1);
+                // Outer high-end wall sections always solid.
+                EWWall(wallST, z0, x0, cx-hw, yLo, springHi + ArchRise, -1);
+                EWWall(wallST, z0, cx+hw, x1,  yLo, springHi + ArchRise, -1);
+                // Outer perpendicular side walls (east and west cell boundaries) — seal the sides of the stairwell.
+                // These are the full exterior faces at x=x0 and x=x1 spanning z=[z0,z1] from floor to vault peak.
+                NSWall(wallST, x0, z0, z1, yLo, springHi + ArchRise, +1); // west outer wall (normal +X)
+                NSWall(wallST, x1, z0, z1, yLo, springHi + ArchRise, -1); // east outer wall (normal -X)
                 // Rising vault: spring grows from springLo (south/bottom) to springHi (north/top)
                 SlantedBarrelX(ceilST, cx-hw, z0, cx+hw, z1, springHi, springLo);
+                // Outer wing floors: flat quads at yLo (seal the bottom of the shoulder blocks).
+                Quad(floorST, new(x0,yLo,z0), new(cx-hw,yLo,z0),
+                              new(cx-hw,yLo,z1), new(x0,yLo,z1));            // west wing floor
+                Quad(floorST, new(cx+hw,yLo,z0), new(x1,yLo,z0),
+                              new(x1,yLo,z1), new(cx+hw,yLo,z1));            // east wing floor
                 break;
             }
             case Dir.S: // low at north (z0), high at south (z1)
@@ -529,11 +637,35 @@ void fragment() {
                         new(cx+hw, yTread, zBack),  new(cx-hw, yTread, zBack));
                     EWWall(wallST, zFront, cx-hw, cx+hw, yPrev, yTread, -1);
                 }
-                NSWall(wallST, cx-hw, z0, z1, yLo, yHi, +1);
-                NSWall(wallST, cx+hw, z0, z1, yLo, yHi, -1);
-                // No cap wall at z1 (south/top exit) — the upper floor piece handles that face
+                // Full two-story side walls: trapezoidal — springLo at low/north end (z0), springHi at high/south end (z1).
+                // West wall (normal +X):
+                Quad(wallST, new(cx-hw,yLo,z0), new(cx-hw,yLo,z1),
+                             new(cx-hw,springHi,z1), new(cx-hw,springLo,z0));
+                // East wall (normal -X):
+                Quad(wallST, new(cx+hw,yLo,z1), new(cx+hw,yLo,z0),
+                             new(cx+hw,springLo,z0), new(cx+hw,springHi,z1));
+                // Low end cap wall at z0 (north/bottom) — only when not connected to a corridor piece.
+                if (!IsConnected(Dir.N, piece, lookup))
+                    EWWall(wallST, z0, cx-hw, cx+hw, yLo, springLo + ArchRise, -1);
+                // Outer low-end wall sections always solid.
+                EWWall(wallST, z0, x0, cx-hw, yLo, springLo + ArchRise, -1);
+                EWWall(wallST, z0, cx+hw, x1,  yLo, springLo + ArchRise, -1);
+                // High end cap wall at z1 (south/top) — only when no upper-floor piece is present.
+                if (!StairHighEndHasNeighbor(piece, Dir.S, lookup))
+                    EWWall(wallST, z1, cx-hw, cx+hw, yLo, springHi + ArchRise, +1);
+                // Outer high-end wall sections always solid.
+                EWWall(wallST, z1, x0, cx-hw, yLo, springHi + ArchRise, +1);
+                EWWall(wallST, z1, cx+hw, x1,  yLo, springHi + ArchRise, +1);
+                // Outer perpendicular side walls (east and west cell boundaries) — seal the sides of the stairwell.
+                NSWall(wallST, x0, z0, z1, yLo, springHi + ArchRise, +1); // west outer wall (normal +X)
+                NSWall(wallST, x1, z0, z1, yLo, springHi + ArchRise, -1); // east outer wall (normal -X)
                 // Rising vault: spring grows from springLo (north/bottom) to springHi (south/top)
                 SlantedBarrelX(ceilST, cx-hw, z0, cx+hw, z1, springLo, springHi);
+                // Outer wing floors:
+                Quad(floorST, new(x0,yLo,z0), new(cx-hw,yLo,z0),
+                              new(cx-hw,yLo,z1), new(x0,yLo,z1));
+                Quad(floorST, new(cx+hw,yLo,z0), new(x1,yLo,z0),
+                              new(x1,yLo,z1), new(cx+hw,yLo,z1));
                 break;
             }
             case Dir.E: // low at west (x0), high at east (x1)
@@ -552,11 +684,35 @@ void fragment() {
                         new(xFront, yTread, cz-hw), new(xFront, yTread, cz+hw));
                     NSWall(wallST, xFront, cz-hw, cz+hw, yPrev, yTread, -1);
                 }
-                EWWall(wallST, cz-hw, x0, x1, yLo, yHi, +1);  // north wall
-                EWWall(wallST, cz+hw, x0, x1, yLo, yHi, -1);  // south wall
-                // No cap wall at x1 (east/top exit) — the upper floor piece handles that face
+                // Full two-story side walls: trapezoidal — springLo at low/west end (x0), springHi at high/east end (x1).
+                // North wall (normal +Z): same winding pattern as EWWall normalSign=+1, heights varied.
+                Quad(wallST, new(x1,yLo,cz-hw), new(x0,yLo,cz-hw),
+                             new(x0,springLo,cz-hw), new(x1,springHi,cz-hw));
+                // South wall (normal -Z): EWWall normalSign=-1 pattern.
+                Quad(wallST, new(x0,yLo,cz+hw), new(x1,yLo,cz+hw),
+                             new(x1,springHi,cz+hw), new(x0,springLo,cz+hw));
+                // Low end cap wall at x0 (west/bottom) — only when not connected to a corridor piece.
+                if (!IsConnected(Dir.W, piece, lookup))
+                    NSWall(wallST, x0, cz-hw, cz+hw, yLo, springLo + ArchRise, -1);
+                // Outer low-end wall sections always solid.
+                NSWall(wallST, x0, z0, cz-hw, yLo, springLo + ArchRise, -1);
+                NSWall(wallST, x0, cz+hw, z1,  yLo, springLo + ArchRise, -1);
+                // High end cap wall at x1 (east/top) — only when no upper-floor piece is present.
+                if (!StairHighEndHasNeighbor(piece, Dir.E, lookup))
+                    NSWall(wallST, x1, cz-hw, cz+hw, yLo, springHi + ArchRise, +1);
+                // Outer high-end wall sections always solid.
+                NSWall(wallST, x1, z0, cz-hw, yLo, springHi + ArchRise, +1);
+                NSWall(wallST, x1, cz+hw, z1,  yLo, springHi + ArchRise, +1);
+                // Outer perpendicular side walls (north and south cell boundaries) — seal the sides of the stairwell.
+                EWWall(wallST, z0, x0, x1, yLo, springHi + ArchRise, -1); // north outer wall (normal -Z)
+                EWWall(wallST, z1, x0, x1, yLo, springHi + ArchRise, +1); // south outer wall (normal +Z)
                 // Rising vault: spring grows from springLo (west/bottom) to springHi (east/top)
                 SlantedBarrelZ(ceilST, x0, cz-hw, x1, cz+hw, springLo, springHi);
+                // Outer wing floors:
+                Quad(floorST, new(x0,yLo,z0), new(x1,yLo,z0),
+                              new(x1,yLo,cz-hw), new(x0,yLo,cz-hw));
+                Quad(floorST, new(x0,yLo,cz+hw), new(x1,yLo,cz+hw),
+                              new(x1,yLo,z1), new(x0,yLo,z1));
                 break;
             }
             case Dir.W: // low at east (x1), high at west (x0)
@@ -575,14 +731,86 @@ void fragment() {
                         new(xBack,  yTread, cz+hw), new(xBack,  yTread, cz-hw));
                     NSWall(wallST, xFront, cz-hw, cz+hw, yPrev, yTread, +1);
                 }
-                EWWall(wallST, cz-hw, x0, x1, yLo, yHi, +1);
-                EWWall(wallST, cz+hw, x0, x1, yLo, yHi, -1);
-                // No cap wall at x0 (west/top exit) — the upper floor piece handles that face
+                // Full two-story side walls: trapezoidal — springHi at high/west end (x0), springLo at low/east end (x1).
+                // North wall (normal +Z):
+                Quad(wallST, new(x1,yLo,cz-hw), new(x0,yLo,cz-hw),
+                             new(x0,springHi,cz-hw), new(x1,springLo,cz-hw));
+                // South wall (normal -Z):
+                Quad(wallST, new(x0,yLo,cz+hw), new(x1,yLo,cz+hw),
+                             new(x1,springLo,cz+hw), new(x0,springHi,cz+hw));
+                // Low end cap wall at x1 (east/bottom) — only when not connected to a corridor piece.
+                if (!IsConnected(Dir.E, piece, lookup))
+                    NSWall(wallST, x1, cz-hw, cz+hw, yLo, springLo + ArchRise, +1);
+                // Outer low-end wall sections always solid.
+                NSWall(wallST, x1, z0, cz-hw, yLo, springLo + ArchRise, +1);
+                NSWall(wallST, x1, cz+hw, z1,  yLo, springLo + ArchRise, +1);
+                // High end cap wall at x0 (west/top) — only when no upper-floor piece is present.
+                if (!StairHighEndHasNeighbor(piece, Dir.W, lookup))
+                    NSWall(wallST, x0, cz-hw, cz+hw, yLo, springHi + ArchRise, -1);
+                // Outer high-end wall sections always solid.
+                NSWall(wallST, x0, z0, cz-hw, yLo, springHi + ArchRise, -1);
+                NSWall(wallST, x0, cz+hw, z1,  yLo, springHi + ArchRise, -1);
+                // Outer perpendicular side walls (north and south cell boundaries) — seal the sides of the stairwell.
+                EWWall(wallST, z0, x0, x1, yLo, springHi + ArchRise, -1); // north outer wall (normal -Z)
+                EWWall(wallST, z1, x0, x1, yLo, springHi + ArchRise, +1); // south outer wall (normal +Z)
                 // Rising vault: spring grows from springHi (west/top) to springLo (east/bottom)
                 SlantedBarrelZ(ceilST, x0, cz-hw, x1, cz+hw, springHi, springLo);
+                // Outer wing floors:
+                Quad(floorST, new(x0,yLo,z0), new(x1,yLo,z0),
+                              new(x1,yLo,cz-hw), new(x0,yLo,cz-hw));
+                Quad(floorST, new(x0,yLo,cz+hw), new(x1,yLo,cz+hw),
+                              new(x1,yLo,z1), new(x0,yLo,z1));
                 break;
             }
         }
+    }
+
+    // Wing caps: cull_back stone quads sealing the top of the 2 m shoulder blocks
+    // that flank the stair tunnel. Heights match the outer wall tops (archPeak).
+    // Using AddMesh (cull_back) so only the top face renders — no visible underside
+    // from the approach corridor below.
+    void AddWingCaps(StaticBody3D body, MazePiece piece, float yBase)
+    {
+        float x0 = piece.X * CellSize, z0 = piece.Y * CellSize;
+        float x1 = x0 + CellSize, z1 = z0 + CellSize;
+        float cx = x0 + CellSize * 0.5f;
+        float cz = z0 + CellSize * 0.5f;
+        float hw = OpeningW * 0.5f;
+        float archPeakLo = yBase + CellHeight + ArchRise;           // springLo + ArchRise
+        float archPeakHi = yBase + FloorHeight + CellHeight + ArchRise; // springHi + ArchRise
+
+        var sInfo  = PieceDB.GetStairInfo(piece.Type, piece.Rotation);
+        Dir upDir  = piece.Type == PieceType.StairsDown ? sInfo.FlatDir : sInfo.CrossDir;
+        var capST  = MakeST();
+
+        switch (upDir)
+        {
+            case Dir.N: // low at south (z1/archPeakLo), high at north (z0/archPeakHi)
+                Quad(capST, new(x0,   archPeakHi, z0), new(cx-hw, archPeakHi, z0),
+                            new(cx-hw, archPeakLo, z1), new(x0,   archPeakLo, z1));
+                Quad(capST, new(cx+hw, archPeakHi, z0), new(x1,   archPeakHi, z0),
+                            new(x1,   archPeakLo, z1), new(cx+hw, archPeakLo, z1));
+                break;
+            case Dir.S: // low at north (z0/archPeakLo), high at south (z1/archPeakHi)
+                Quad(capST, new(x0,   archPeakLo, z0), new(cx-hw, archPeakLo, z0),
+                            new(cx-hw, archPeakHi, z1), new(x0,   archPeakHi, z1));
+                Quad(capST, new(cx+hw, archPeakLo, z0), new(x1,   archPeakLo, z0),
+                            new(x1,   archPeakHi, z1), new(cx+hw, archPeakHi, z1));
+                break;
+            case Dir.E: // low at west (x0/archPeakLo), high at east (x1/archPeakHi)
+                Quad(capST, new(x0,   archPeakLo, z0), new(x1,   archPeakHi, z0),
+                            new(x1,   archPeakHi, cz-hw), new(x0,   archPeakLo, cz-hw));
+                Quad(capST, new(x0,   archPeakLo, cz+hw), new(x1,   archPeakHi, cz+hw),
+                            new(x1,   archPeakHi, z1), new(x0,   archPeakLo, z1));
+                break;
+            case Dir.W: // low at east (x1/archPeakLo), high at west (x0/archPeakHi)
+                Quad(capST, new(x0,   archPeakHi, z0), new(x1,   archPeakLo, z0),
+                            new(x1,   archPeakLo, cz-hw), new(x0,   archPeakHi, cz-hw));
+                Quad(capST, new(x0,   archPeakHi, cz+hw), new(x1,   archPeakLo, cz+hw),
+                            new(x1,   archPeakLo, z1), new(x0,   archPeakHi, z1));
+                break;
+        }
+        AddMesh(body, Commit(capST), $"WingCap_{piece.X}_{piece.Y}", default);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -759,6 +987,14 @@ void fragment() {
         st.SetUV(UV(d)); st.AddVertex(d);
     }
 
+    // Single triangle — used for gable end-caps on stairwell side walls.
+    static void Tri(SurfaceTool st, Vector3 a, Vector3 b, Vector3 c)
+    {
+        st.SetUV(UV(a)); st.AddVertex(a);
+        st.SetUV(UV(b)); st.AddVertex(b);
+        st.SetUV(UV(c)); st.AddVertex(c);
+    }
+
     static Vector2 UV(Vector3 v) => new(v.X * 0.2f, v.Z * 0.2f);
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -774,12 +1010,28 @@ void fragment() {
         int idx = 0;
         foreach (var piece in pieces)
         {
-            if (PieceDB.IsStair(piece.Type)) continue;
-
             float cx    = piece.X * CellSize + CellSize * 0.5f;
             float cz    = piece.Y * CellSize + CellSize * 0.5f;
             float yBase = piece.Floor * FloorHeight;
             float ty    = yBase + CellHeight * 0.50f;  // mid-wall height
+
+            if (PieceDB.IsStair(piece.Type))
+            {
+                // StairsDown geometry is anchored at floor-1, so shift torch down likewise.
+                float geomY = (piece.Type == PieceType.StairsDown) ? yBase - FloorHeight : yBase;
+                AddChild(new OmniLight3D
+                {
+                    Name            = $"StairTorch{idx}",
+                    Position        = new(cx, geomY + CellHeight * 0.5f, cz),
+                    LightColor      = new(1.0f, 0.65f, 0.20f),
+                    LightEnergy     = 2.5f,
+                    OmniRange       = 14f,
+                    OmniAttenuation = 0.6f,
+                    ShadowEnabled   = false,
+                });
+                idx++;
+                continue;
+            }
 
             // Colour-coded landmark lights for Start (green) and Exit (red)
             if (piece.Type == PieceType.Start)
