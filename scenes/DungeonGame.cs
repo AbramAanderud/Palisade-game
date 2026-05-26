@@ -57,27 +57,19 @@ public partial class DungeonGame : Node3D
         var canvas = new CanvasLayer();
         AddChild(canvas);
 
+        var wkFont = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
         var hint = new Label
         {
             Text     = "ESC = release mouse   ESC again = back to editor",
             Position = new Vector2(10, 10),
         };
+        if (wkFont != null) hint.AddThemeFontOverride("font", wkFont);
         hint.AddThemeFontSizeOverride("font_size", 13);
         hint.AddThemeColorOverride("font_color", new Color(0.7f, 0.7f, 0.7f));
         canvas.AddChild(hint);
 
         GD.Print($"[DungeonGame] Loaded slot {slot}: {data.Pieces.Count} pieces. " +
                  $"Player at ({cx:F0},{cy:F0},{cz:F0}) yaw={spawnYaw}°");
-    }
-
-    public override void _Input(InputEvent ev)
-    {
-        // If mouse is already released (visible) and player presses Escape again → back to editor
-        if (ev.IsActionPressed("pause") && Input.MouseMode == Input.MouseModeEnum.Visible)
-        {
-            _player?.ReleaseMouse();
-            GetTree().ChangeSceneToFile("res://scenes/MapEditor.tscn");
-        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

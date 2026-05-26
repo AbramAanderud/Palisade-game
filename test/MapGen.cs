@@ -313,19 +313,6 @@ public static class MapGen
                 bool injected = false;
                 foreach (var src in srcCells)
                 {
-                    // StairsUp at rot=0: flat=S (same-floor exit), cross=N (goes to forceFloor)
-                    // Landing cell is at (src.x, src.y - 1, forceFloor)
-                    int landX = src.Item1, landY = src.Item2 - 1;
-                    if (landY < 1 || landY >= GridH - 1) continue;
-
-                    var stairKey = (src.Item1, src.Item2, srcFloor);
-                    var landKey  = (landX, landY, forceFloor);
-
-                    if (grid.ContainsKey(landKey)) continue;
-                    // Skip if the landing cell is already reserved by another stair's shadow
-                    if (ComputeReserved(grid).Contains(landKey)) continue;
-                    // Skip if the stair's own shadow floor cell is already occupied
-                    if (grid.ContainsKey((src.Item1, src.Item2, forceFloor))) continue;
                     // Reject side-by-side stair: no same-floor cardinal neighbor may be a stair
                     bool bbUpAdj = false;
                     for (int dbi = 0; dbi < 4 && !bbUpAdj; dbi++) {
@@ -335,9 +322,18 @@ public static class MapGen
                     }
                     if (bbUpAdj) continue;
 
+                    // Find a rotation where FlatDir connects to the backbone and
+                    // CrossDir has a free landing cell on forceFloor.
+                    if (!TryPickBackboneStairRotation((src.Item1, src.Item2), srcFloor,
+                            PieceType.StairsUp, forceFloor, grid,
+                            out int chosenRot, out int landX, out int landY)) continue;
+
                     int stairCost = PieceDB.GoldCosts[PieceType.StairsUp];
                     int landCost  = PieceDB.GoldCosts[PieceType.Straight];
                     if (targetBudget > 0 && goldSpent + stairCost + landCost > targetBudget) continue;
+
+                    var stairKey = (src.Item1, src.Item2, srcFloor);
+                    var landKey  = (landX, landY, forceFloor);
 
                     // Refund current piece at stairKey if present (replacing it with StairsUp)
                     if (grid.TryGetValue(stairKey, out var existingStairCell))
@@ -347,22 +343,25 @@ public static class MapGen
                     grid[stairKey] = new MazePiece
                     {
                         Type = PieceType.StairsUp, X = src.Item1, Y = src.Item2,
-                        Floor = srcFloor, Rotation = 0
+                        Floor = srcFloor, Rotation = chosenRot
                     };
                     usedTypes.Add(PieceType.StairsUp);
                     stairCount++;
 
+                    // Landing piece: Straight oriented to open back toward the stair's cross face
+                    var upInfo = PieceDB.GetStairInfo(PieceType.StairsUp, chosenRot);
+                    int landRot = (upInfo.CrossDir == Dir.N || upInfo.CrossDir == Dir.S) ? 0 : 1;
                     goldSpent += landCost;
                     grid[landKey] = new MazePiece
                     {
                         Type = PieceType.Straight, X = landX, Y = landY,
-                        Floor = forceFloor, Rotation = 0
+                        Floor = forceFloor, Rotation = landRot
                     };
                     usedTypes.Add(PieceType.Straight);
 
                     injected = true;
                     verticalMode   = true;
-                    verticalBudget = 80; // big head-start for upper-floor fill
+                    verticalBudget = 80;
                     break;
                 }
                 if (!injected)
@@ -385,19 +384,6 @@ public static class MapGen
                 bool injected = false;
                 foreach (var src in srcCells)
                 {
-                    // StairsDown at rot=0: flat=N (same-floor exit faces north), cross=S (goes to floor-1)
-                    // CrossDir for StairsDown at rot=0 is Dir.S, so landing is at (src.x, src.y+1, forceFloor)
-                    int landX = src.Item1, landY = src.Item2 + 1;
-                    if (landY < 1 || landY >= GridH - 1) continue;
-
-                    var stairKey = (src.Item1, src.Item2, srcFloor);
-                    var landKey  = (landX, landY, forceFloor);
-
-                    if (grid.ContainsKey(landKey)) continue;
-                    // Skip if the landing cell is already reserved by another stair's shadow
-                    if (ComputeReserved(grid).Contains(landKey)) continue;
-                    // Skip if the stair's own shadow floor cell is already occupied
-                    if (grid.ContainsKey((src.Item1, src.Item2, forceFloor))) continue;
                     // Reject side-by-side stair: no same-floor cardinal neighbor may be a stair
                     bool bbDnAdj = false;
                     for (int dbi = 0; dbi < 4 && !bbDnAdj; dbi++) {
@@ -407,11 +393,19 @@ public static class MapGen
                     }
                     if (bbDnAdj) continue;
 
+                    // Find a rotation where FlatDir connects to backbone, CrossDir has free landing.
+                    if (!TryPickBackboneStairRotation((src.Item1, src.Item2), srcFloor,
+                            PieceType.StairsDown, forceFloor, grid,
+                            out int chosenRot, out int landX, out int landY)) continue;
+
                     int stairCost = PieceDB.GoldCosts[PieceType.StairsDown];
                     int landCost  = PieceDB.GoldCosts[PieceType.Straight];
                     if (targetBudget > 0 && goldSpent + stairCost + landCost > targetBudget) continue;
 
-                    // Refund current piece at stairKey if present (replacing it with StairsDown)
+                    var stairKey = (src.Item1, src.Item2, srcFloor);
+                    var landKey  = (landX, landY, forceFloor);
+
+                    // Refund current piece at stairKey if present
                     if (grid.TryGetValue(stairKey, out var existingStairCell))
                         goldSpent = Math.Max(0, goldSpent - PieceDB.GoldCosts[existingStairCell.Type]);
 
@@ -419,16 +413,18 @@ public static class MapGen
                     grid[stairKey] = new MazePiece
                     {
                         Type = PieceType.StairsDown, X = src.Item1, Y = src.Item2,
-                        Floor = srcFloor, Rotation = 0
+                        Floor = srcFloor, Rotation = chosenRot
                     };
                     usedTypes.Add(PieceType.StairsDown);
                     stairCount++;
 
+                    var dnInfo = PieceDB.GetStairInfo(PieceType.StairsDown, chosenRot);
+                    int landRot = (dnInfo.CrossDir == Dir.N || dnInfo.CrossDir == Dir.S) ? 0 : 1;
                     goldSpent += landCost;
                     grid[landKey] = new MazePiece
                     {
                         Type = PieceType.Straight, X = landX, Y = landY,
-                        Floor = forceFloor, Rotation = 0
+                        Floor = forceFloor, Rotation = landRot
                     };
                     usedTypes.Add(PieceType.Straight);
 
@@ -882,6 +878,60 @@ public static class MapGen
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    //  BACKBONE STAIR ROTATION PICKER
+    // ══════════════════════════════════════════════════════════════════════════
+    /// Try each rotation of <paramref name="stairType"/> placed at <paramref name="src"/> on
+    /// <paramref name="srcFloor"/>. Return the first rotation where:
+    ///   (a) FlatDir points to an existing piece on srcFloor that opens back toward src.
+    ///   (b) Landing cell (src + CrossDir) on <paramref name="forceFloor"/> is free.
+    ///   (c) No same-floor piece at the cross side opens toward src (height mismatch).
+    /// Returns false if no valid rotation exists.
+    static bool TryPickBackboneStairRotation(
+        (int x, int y) src, int srcFloor,
+        PieceType stairType,
+        int forceFloor,
+        Dictionary<(int,int,int), MazePiece> grid,
+        out int chosenRot, out int landX, out int landY)
+    {
+        chosenRot = -1; landX = 0; landY = 0;
+
+        for (int rot = 0; rot < 4; rot++)
+        {
+            var info = PieceDB.GetStairInfo(stairType, rot);
+
+            // (a) Flat end must connect to an existing backbone piece on srcFloor
+            int fi = Array.IndexOf(AllDirs, info.FlatDir);
+            var (fdx, fdy) = DirDelta[fi];
+            int flatNx = src.x + fdx, flatNy = src.y + fdy;
+            if (!grid.TryGetValue((flatNx, flatNy, srcFloor), out var flatNb)) continue;
+            Dir flatBack = OppDirs[fi];
+            if ((PieceDB.GetOpenings(flatNb.Type, flatNb.Rotation) & flatBack) == 0) continue;
+
+            // (b) Landing cell on forceFloor must be free
+            int ci = Array.IndexOf(AllDirs, info.CrossDir);
+            var (cdx, cdy) = DirDelta[ci];
+            int lx = src.x + cdx, ly = src.y + cdy;
+            if (ly < 1 || ly >= GridH - 1) continue;
+            if (!InBounds(lx, ly, forceFloor)) continue;
+            if (grid.ContainsKey((lx, ly, forceFloor))) continue;
+            if (grid.ContainsKey((src.x, src.y, forceFloor))) continue;
+
+            var reserved = ComputeReserved(grid);
+            if (reserved.Contains((lx, ly, forceFloor))) continue;
+            if (reserved.Contains((src.x, src.y, forceFloor))) continue;
+
+            // (c) No same-floor piece at the cross face opening toward us (height mismatch)
+            Dir crossBack = OppDirs[ci];
+            if (grid.TryGetValue((lx, ly, srcFloor), out var crossNb) &&
+                (PieceDB.GetOpenings(crossNb.Type, crossNb.Rotation) & crossBack) != 0) continue;
+
+            chosenRot = rot; landX = lx; landY = ly;
+            return true;
+        }
+        return false;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     //  STAIR DENSIFICATION HELPER
     // ══════════════════════════════════════════════════════════════════════════
     static void TryAddStairCandidates(
@@ -913,6 +963,10 @@ public static class MapGen
                 if ((open & forbiddenOpen) != 0) continue;
 
                 Dir crossDir = PieceDB.GetStairCrossDir(st, rot);
+                // Reject backward orientation: if any required same-floor opening is the cross
+                // direction, the incoming corridor would connect to the high/cross end of the stair.
+                // That is a height mismatch — the arch there is at floor+1 height, not same-floor height.
+                if ((requiredOpen & crossDir) != 0) continue;
                 int ci = Array.IndexOf(AllDirs, crossDir);
                 var (cdx, cdy) = DirDelta[ci];
                 int lx = cx + cdx, ly = cy + cdy;
@@ -990,6 +1044,10 @@ public static class MapGen
                 var nKey = (cur.Item1 + dx, cur.Item2 + dy, nfl);
                 if (dist.ContainsKey(nKey)) continue;
                 if (!grid.TryGetValue(nKey, out var nb)) continue;
+                // Entering a stair from its cross-floor (high) end at the same floor is a height
+                // mismatch: the arch there is floor+1 height, not same-floor height. Treat as wall.
+                if (PieceDB.IsStair(nb.Type) && back == PieceDB.GetStairCrossDir(nb.Type, nb.Rotation))
+                    continue;
                 if ((PieceDB.GetOpenings(nb.Type, nb.Rotation) & back) == 0) continue;
 
                 dist[nKey] = dist[cur] + 1;
@@ -1385,6 +1443,9 @@ public static class MapGen
                 var nKey = (cur.X + dx, cur.Y + dy, nfl);
                 if (visited.Contains(nKey)) continue;
                 if (!grid.TryGetValue(nKey, out var nb)) continue;
+                // Same-floor entry from a stair's cross/high face is a height mismatch — treat as wall.
+                if (PieceDB.IsStair(nb.Type) && back == PieceDB.GetStairCrossDir(nb.Type, nb.Rotation))
+                    continue;
                 if ((PieceDB.GetOpenings(nb.Type, nb.Rotation) & back) == 0) continue;
 
                 visited.Add(nKey);

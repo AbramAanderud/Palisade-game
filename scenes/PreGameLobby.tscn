@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://pl21ug7hck53"]
+
+[ext_resource type="Script" path="res://scenes/PreGameLobby.cs" id="1_pgl"]
+
+[node name="PreGameLobby" type="Control"]
+script = ExtResource("1_pgl")

@@ -9,4 +9,8 @@ public static class GameState
     public static bool IsArenaMode = false;
     public static int  ArenaSlotA  = 0;   // first maze  (spawned at Z=0)
     public static int  ArenaSlotB  = 1;   // second maze (flipped, spawned beyond arena)
+
+    /// Scene to return to when the pause-menu "Exit" is chosen from DungeonGame.
+    /// Set by whichever editor launched the dungeon test.
+    public static string EditorReturnScene = "res://scenes/MapEditor.tscn";
 }

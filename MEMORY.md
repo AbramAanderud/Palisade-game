@@ -1,5 +1,17 @@
 # Palisade — Build Memory
 
+## Stair Physics — Final Solution (2026-05-07)
+
+**Pattern**: Visual steps, invisible ramp collision. Industry standard (Source Engine, Unreal, Unity).
+
+- `DungeonBuilder.cs` stair branch: `AddMeshVisual` for `floorST` (treads) and `riserST` (risers) — no collision. `AddStairRamp` adds the physics ramp.
+- `PlayerController.cs`: `FloorMaxAngle` must exceed the ramp angle. Formula: `atan(FloorHeight / CellSize)` degrees. Currently `FloorHeight=18, CellSize=10` → ~61°, `FloorMaxAngle=68°`.
+- **If `FloorHeight` or `CellSize` change, update `FloorMaxAngle` to stay ≥5° above `atan(FloorHeight/CellSize)`.**
+- `FloorSnapLength = 1.5f`, `TryStepUp` kept for non-stair obstacles (harmless on ramp — `TestMove` never fires on a slope).
+- Root cause of old bugs: per-tread collision let the capsule step off tread edges → brief airborne → horizontal momentum arced the player. No amount of snap tuning fixed this reliably.
+
+---
+
 ## Player Setup (2026-04-20)
 
 ### Rascal.glb inspection

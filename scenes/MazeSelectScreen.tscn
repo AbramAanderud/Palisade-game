@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://mazeselect001"]
+
+[ext_resource type="Script" path="res://scenes/MazeSelectScreen.cs" id="1_ms"]
+
+[node name="MazeSelectScreen" type="Control"]
+script = ExtResource("1_ms")

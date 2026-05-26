@@ -1,142 +1,129 @@
 # Game Plan: Palisade
 
-## Game Description
+## Vision
 
-Players design modular dungeons using snap-together pieces (straight hall, L-hall, T-junction, stairs). Before matchmaking, a player builds up to 5 saved mazes and selects the best one. Matchmaking pairs players by gold spent. Both mazes are joined at a small central weapon room or "arena". The game plays first-person: race to find your exit, claim the weapon, hunt the opponent. First out earns 50 gold; killing the opponent earns +50 (total 100). Winning by kill earns 200 gold. Gold funds new maze pieces.
+Two players each build and run their own maze, meet in a central arena, and fight. The loop: survive your maze → escape → grab the arena sword → hunt your opponent. Over time, players craft builds from trinket chests and choose what sword waits in the middle.
+
+## Core Gameplay Loop (Playtest Target)
+
+1. Each player runs through their generated maze (first-person, fast movement)
+2. After 20s, torches near the exit start glowing blue (BFS wave outward) — signal to find the exit
+3. Exit the maze → earn **100 gold**
+4. 30-second arena phase begins
+5. Grab the **two-handed arena sword** (30 dmg) → opponent highlighted red for 5s (wall-hack)
+6. Kill opponent within 30s → earn **+50 gold** + prestige currency
+7. Use prestige currency to buy cosmetic/trinket chests and choose what sword appears in the next arena
 
 ## Piece System
 
-Each piece occupies exactly one 10×10m grid cell. Openings are fixed at the center of each face (N/S/E/W). All pieces fit together automatically — no geometry math needed.
+Each piece occupies exactly one 10×10m grid cell. Openings are fixed at the center of each face (N/S/E/W).
 
-| Piece    | Openings (rot=0)            | Cost |
-| -------- | --------------------------- | ---- |
-| Start    | S only                      | free |
-| Exit     | N only                      | free |
-| Straight | N + S                       | free |
-| LHall    | N + E                       | free |
-| THall    | N + E + S                   | 25g  |
-| Stairs   | S (floor F) + N (floor F+1) | 50g  |
+| Piece      | Openings (rot=0)            | Cost |
+| ---------- | --------------------------- | ---- |
+| Start      | S only                      | free |
+| Exit       | N only                      | free |
+| Straight   | N + S                       | free |
+| LHall      | N + E                       | free |
+| THall      | N + E + S                   | 25g  |
+| Cross      | N + E + S + W               | 40g  |
+| StairsUp   | N (up) + S (flat)           | 50g  |
+| StairsDown | N (flat) + S (down)         | 50g  |
 
-Openings rotate clockwise with the piece.
+## Combat
 
-## Risk Tasks
+- **Starter sword** (spawn item, weaker model — distinct from arena sword): 23 damage per hit, 3-hit combo. Every player spawns with one at match start; no pickup required.
+- **Arena two-hander** (center of arena, stronger model): 30 damage per hit
+- Player health: **100 HP**, shown as world-space bar above head + HUD bar bottom-left
+- Floating red damage numbers at hit location
+- Grabbing arena sword highlights enemy in red for 5s (wall-hack through geometry)
 
-### 1. Modular Piece → 3D Dungeon Mesh
+## Trinket / Chest System (Future — Do Not Implement Yet)
 
-- **Why isolated:** Each piece maps to a pre-defined 3D mesh segment. Must get winding, UVs, and seams correct at piece boundaries. Openings must align at face centers.
-- **Aesthetic:** Liminal / backrooms feel — very tall ceilings, nearly full-height openings, pale off-white walls, harsh flat lighting. Oppressive scale.
-- **Dimensions:** Cell = 10m × 10m footprint. Ceiling height = 6m (tall and liminal). Opening gap = 3m wide × 5.5m tall, centered on face. Floor F+1 starts at Y = 6m (floor-to-floor height = 6m). Stairs ramp from Y=0 at S face to Y=6m at N face across 10m depth (~31° incline).
-- **Approach:** Per piece type, procedurally build walls/floor/ceiling using SurfaceTool quads. Call GenerateNormals(). UV = world position / tileSize for seamless tiling. StaticBody3D with ConcavePolygonShape3D for collision (mesh shape, not CSG). No textures for risk prototype — solid color materials only.
-- **Verify:** Screenshot from inside generated dungeon — tall corridor visible, opening gaps align between pieces, floor and ceiling present, no holes, no inside-out faces.
+**Status**: design only. No chests/trinkets in code until after multiplayer playtest. Placeholder UI tab is acceptable; do not place chests in mazes yet.
 
-### 2. First-Person Player Controller
+### How it works
 
-- **Why isolated:** Mouse look + capsule in narrow (3m wide) corridors. Clamp, gravity, and step-through are finicky.
-- **Approach:** CharacterBody3D GROUNDED mode. CapsuleShape3D radius=0.35m height=1.6m. Mouse captured in \_Ready(). Horizontal yaw on root node, vertical pitch on Camera3D child (clamped ±85°). Gravity constant. MoveAndSlide() each physics tick.
-- **Verify:** Walk all 4 directions, 360° horizontal look, vertical clamp, no clipping through walls in 3m-wide corridors.
+1. **Fixed 4 chests per maze.** Always exactly four — no more, no less.
+2. **Player places chests in their own maze** during map editing. Strategic axis: hide them in hard-to-reach spots so the opponent must choose between hunting chests (stronger but slower) or sprinting to the exit early.
+3. **Player does NOT assign trinkets to specific chests.** Chests are just placement markers.
+4. **Customization tab** (new, separate from map editor): each player picks **4 trinkets from their personal trinket pool** as their match loadout — like a deck.
+5. **At match start**, the opponent's 4 chosen trinkets are randomly distributed across your 4 placed chests. So when you run your opponent's maze, the chests contain *their* loadout — you don't know which trinket is in which chest.
+6. **Trinket pool** grows via rolling (currency-based gacha) — design TBD. Placeholder pool of fixed trinkets for now.
+7. **Set bonuses**: trinkets belong to sets (e.g. ice, fire, speed). Each additional trinket from the same set boosts the bonus. Encourages building around a theme.
+8. **Trinket effects**: stat bonuses (damage, move speed) or movement abilities (ice slide, air dash, double jump).
 
-## Main Build
+### Strategic loop
 
-Use verified risk systems + existing piece editor to assemble full game loop.
+- I build a brutal maze with chests buried deep → opponent loses tempo hunting them.
+- I stack an ice-set loadout in my chests → opponent who fully clears my maze comes into arena with my ice build.
+- Skipping chests = faster exit but weaker arena fight.
 
-- Map editor redesign: piece-based drag/snap system with 5 save slots + select-for-matchmaking
-- Main menu: Play (→ map selection), Map Builder, Settings
-- Map selection screen: shows saved mazes, gold spent, Select for matchmaking button
-- Dungeon assembly: load both players' mazes, join Exit-to-Exit via a connector corridor (see Dual-Maze Connection below)
-- Weapon pickup: one iron sword in central room (Area3D detect), weapon disappears on pickup
-- Enemy AI: simple NavigationAgent3D path-to-player
-- Combat: swing weapon on LMB, 1-hit kill on enemy
-- Survival timer: 30s countdown starts when first player exits
-- Game state machine: Menu → MapSelect → Loading → Playing → Result
-- HUD: HP dot indicator, timer (hidden until one player exits), gold counter
-- Result screen: outcome text + gold earned + continue button
-- Gold persistence: saved to user://profile.json
+### Placeholder scope (when we start scaffolding)
 
-**Assets needed:**
+- New "Customization" tab in main menu / lobby flow
+- Trinket pool data structure + a handful of stub trinkets
+- 4-slot loadout selector UI
+- Chest piece in map editor palette (placement only, no contents yet)
 
-- Stone wall texture (tileable 512×512)
-- Stone floor texture (tileable 512×512)
-- Iron sword sprite/model (for pickup + held weapon)
+### Why this is in PLAN.md and not code yet
 
-**Verify:**
+Multiplayer + health/combat + arena loop ship first. The chest/trinket layer is the **next major system after** the playtest build is stable. Capturing the design here so the vision survives.
 
-- All 5 piece types snap correctly in editor
-- Mazes save and load across sessions
-- 3D dungeon generates from saved piece data, correctly joined to central room
-- Movement, look, collision all correct
-- Weapon pickup works, disappears from room
-- Timer starts only after first player exits
-- Gold awarded correctly for each outcome
-- HUD readable, no overlap
-- No missing textures
-- reference.png consistency: stone dungeon, torch lighting, HUD layout
-- **Presentation video:** ~30s MP4 — editor placing pieces → switch to 3D → walk → pick up sword → fight
+## Playtest-Ready Feature Checklist
 
-## Dual-Maze Connection Architecture
+- [ ] **Multiplayer** — ENet host/client, lobby with IP connect, 2-player core
+- [ ] **Health + damage** — HP bars, damage numbers, death
+- [ ] **Iron sword spawns on player** — no pickup required for playtest
+- [ ] **Exit BFS torch signal** — torches turn blue from exit outward after 20s
+- [ ] **Gold system** — 100g exit, 50g kill bonus
+- [ ] **Arena sword + wall-hack** — 30-second hunt phase
+- [ ] **Synty character models** — replace placeholder capsule
 
-### Layout
+## Build Order
 
-```
-[Player A Maze]          [Connector]         [Player B Maze]
-  Start (row 0)                                Start (row 0)
-  ↓  (corridors)                               ↓  (corridors)
-  Exit (row 9) → [ 6m wide bridge corridor ] ← Exit (row 9)
-```
+1. NetworkManager + Lobby scene
+2. PlayerHealth + SwordCombat hitbox (23/30 dmg)
+3. Damage numbers + health bar above head
+4. GoldSystem + exit Area3D trigger
+5. TorchSignalSystem (BFS from exit piece)
+6. Arena sword pickup + wall-hack highlight + kill bonus
+7. Synty character model import + animation retarget
 
-### Implementation Plan
+## New Scripts Required
 
-1. **Maze A** is built normally at world offset (0, 0, 0).
-2. **Maze B** is flipped 180° (rotated around Y) and placed so its Exit
-   aligns with Maze A's Exit. The bridge between them is a straight 6m-wide
-   corridor segment, length = 1 cell (10 m). Both exit openings face this
-   bridge.
-3. **World offset for Maze B**:
-   - Maze B is placed at `z = GridH * CellSize + BridgeLen` (south of Maze A),
-     then its pieces are rendered with `z' = offset - piece.Y * CellSize`
-     (mirror Z) so its row 0 is farthest from the bridge and row 9 (Exit) faces
-     Maze A's Exit.
-4. **Bridge corridor**: a single straight N-S corridor piece placed between the
-   two exits at `z = GridH * CellSize` (Maze A's exit face) to `z + CellSize`
-   (Maze B's exit face). The weapon pickup spawns in the center of the bridge.
-5. **Single DungeonGame scene** hosts both maze builds and the bridge, sharing
-   one physics world. Both players spawn at their respective Start pieces.
+| File | Purpose |
+|------|---------|
+| `scripts/NetworkManager.cs` | ENet autoload — host/join, player registry |
+| `scripts/PlayerHealth.cs` | 100 HP, TakeDamage RPC, Die RPC |
+| `scripts/PlayerSync.cs` | MultiplayerSynchronizer for position/state |
+| `scripts/DamageNumber.cs` | Floating red damage text, pooled |
+| `scripts/TorchSignalSystem.cs` | BFS exit signal, torch color wave |
+| `scripts/GoldSystem.cs` | Per-player gold tracking + HUD display |
+| `scenes/Lobby.tscn` + `.cs` | Host/Join UI, player list, ready/start |
 
-### Key Design Constraints (enforced by editor)
+## Modified Files
 
-- **Start** piece: row 0 only, floor 0 only → always at the far end of the maze.
-- **Exit** piece: row GridH-1 only, **any floor** → must be in the last row (farthest from Start)
-  but can be on any floor. Editor highlights the EXIT ZONE row on every floor.
-- **StairsUp**: fixed orientation (no rotation), N face → floor+1.  Replaces legacy Stairs.
-- **StairsDown**: fixed orientation (no rotation), S face → floor-1.  Must be placed on floor 1+.
-- All constraints enforced in `PlaceNew()` in MapEditorMain.cs.
+| File | What Changes |
+|------|-------------|
+| `scripts/SwordCombat.cs` | Add Area3D hitbox, damage values |
+| `scripts/PlayerController.cs` | PlayerHealth ref, death, Synty model hookup |
+| `scripts/DungeonBuilder.cs` | Store torch OmniLight3D refs, expose BuiltPieces |
+| `scenes/DungeonArena.cs` | Exit triggers, arena timer, kill detection |
+| `project.godot` | NetworkManager autoload, main scene = Lobby |
 
-### Arena Y-Anchoring
+## Deferred (Post-Playtest)
 
-Each maze is shifted in Y so its Exit piece's floor sits at world Y=0 (arena floor level).
-- `offsetY = -exitFloor × FloorHeight`
-- Maze A and Maze B anchored independently → one maze may float high, the other low.
-- Both exits always meet the arena doorways at Y=0 regardless of which floor they're on.
+- **Trinket / Chest system** — see "Trinket / Chest System" section above. Customization tab + 4-trinket loadout + 4 chests placed in maze + opponent's trinkets randomly fill your chests + set bonuses.
+- Trinket pool / rolling (gacha-style) economy
+- Trinket effects + item PNG HUD bar
+- 3-4 player expansion (NetworkManager already supports 4 peers)
+- Maze piece visual variations (5 variants per piece type, bookshelf/cubby props)
+- New wall/floor textures
+- Trinket unlock + prestige shop UI
 
-### Data Flow
+## Multiplayer Notes
 
-```
-GameState.SlotA (int)   → MazeSerializer.Load(SlotA) → DungeonBuilder.Build(dataA, offsetA, flipA=false)
-GameState.SlotB (int)   → MazeSerializer.Load(SlotB) → DungeonBuilder.Build(dataB, offsetB, flipB=true)
-Bridge corridor         → DungeonBuilder.BuildBridge(exitA_pos, exitB_pos)
-```
-
-### Next Implementation Steps (Risk 3)
-
-- Add `Build(MazeData, Vector3 offset, bool flipZ)` overload to DungeonBuilder
-- Add `BuildBridge(Vector3 posA, Vector3 posB)` helper
-- Add `GameState.SlotA`, `GameState.SlotB` fields
-- Add maze-selection screen so each player picks their slot before entering
-
-## Task Status
-
-- [x] Piece system data layer (PieceDB, MazeData, MazeSerializer)
-- [x] Map editor rewrite (piece placement, save slots)
-- [x] Risk 1: Piece → 3D Mesh
-- [x] Risk 2: First-Person Controller (ULTRAKILL movement — slide, slide-jump, wall-run, wall-jump)
-- [ ] Main Build
-- [ ] Presentation Video
+- **Transport**: Godot 4 ENet, port 7777 UDP
+- **For internet playtest**: host port-forwards 7777, or use ZeroTier/Hamachi (no server needed)
+- **Authority model**: host = server authority; clients send inputs, server validates hits
+- **Syncing**: `MultiplayerSynchronizer` for continuous state (position, HP); `@rpc` for events (damage, pickup, die)

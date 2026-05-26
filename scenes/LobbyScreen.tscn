@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://lobbyscreen001"]
+
+[ext_resource type="Script" path="res://scenes/LobbyScreen.cs" id="1_ls"]
+
+[node name="LobbyScreen" type="Control"]
+script = ExtResource("1_ls")

@@ -1,0 +1,12 @@
+[gd_scene format=3 uid="uid://dnggtak2i5l4s"]
+
+[ext_resource type="Script" path="res://scenes/TrainingSetupScreen.cs" id="1_tss"]
+
+[node name="TrainingSetupScreen" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1_tss")

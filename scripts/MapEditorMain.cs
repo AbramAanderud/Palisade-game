@@ -28,7 +28,13 @@ public partial class MapEditorMain : Node2D
     static readonly Color CGoldText   = new(0.90f, 0.75f, 0.20f);
     static readonly Color CSelFill    = new(1.00f, 1.00f, 0.00f, 0.18f);
     static readonly Color CSelBorder  = new(1.00f, 0.90f, 0.10f, 1.00f);
-    static readonly Color CMoveDst    = new(0.60f, 0.60f, 1.00f, 0.20f);
+    static readonly Color CMoveDst      = new(0.60f, 0.60f, 1.00f, 0.20f);
+    static readonly Color CStairCross   = new(0.20f, 0.80f, 1.00f);
+    static readonly Color CStairFlat    = new(0.20f, 0.85f, 0.20f);
+    static readonly Color CStairCrossOk = new(0.30f, 0.50f, 0.70f, 0.75f);
+    static readonly Color CStairFlatOk  = new(0.30f, 0.70f, 0.30f, 0.75f);
+    static readonly Color CStairWall    = new(0.65f, 0.25f, 0.25f, 0.75f);
+    static readonly Color CWallBand     = new(0.40f, 0.40f, 0.40f, 0.60f);
 
     // ── Piece type list (palette order) ──────────────────────────────────────
     static readonly PieceType[] PieceTypes =
@@ -67,6 +73,13 @@ public partial class MapEditorMain : Node2D
     OptionButton _arenaSlotB   = null!;
     OptionButton _arenaSpawn   = null!;
 
+    // ── 3-D preview ───────────────────────────────────────────────────────────
+    bool                   _preview3dVisible  = false;
+    SubViewportContainer?  _previewContainer  = null;
+    Editor3DFloorPreview?  _previewRoot       = null;
+    Button?                _previewBtn        = null;
+    bool                   _orbitDragging     = false;
+
     // ══════════════════════════════════════════════════════════════════════════
     //  LIFECYCLE
     // ══════════════════════════════════════════════════════════════════════════
@@ -88,6 +101,69 @@ public partial class MapEditorMain : Node2D
         _arenaSlotA.Selected = GameState.ArenaSlotA;
         _arenaSlotB.Selected = GameState.ArenaSlotB;
         _arenaSpawn.Selected = (int)DungeonArena.ChosenSpawn;
+        SetupPreview3D();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  3-D PREVIEW
+    // ══════════════════════════════════════════════════════════════════════════
+    void SetupPreview3D()
+    {
+        // Layer 2: preview sits above Node2D (0) but below the UI panels (layer 3).
+        // This lets the UI panels always show on top while the 3D view covers the map area.
+        var previewLayer = new CanvasLayer { Layer = 2 };
+        AddChild(previewLayer);
+
+        _previewContainer = new SubViewportContainer
+        {
+            AnchorLeft   = 0f, AnchorRight  = 1f,
+            AnchorTop    = 0f, AnchorBottom = 1f,
+            OffsetLeft   = 0f, OffsetRight  = 0f,
+            OffsetTop    = 0f, OffsetBottom = 0f,
+            Stretch      = true,
+            Visible      = false,
+        };
+        previewLayer.AddChild(_previewContainer);
+
+        var viewport = new SubViewport
+        {
+            Size                   = new Vector2I(1280, 720),
+            TransparentBg          = false,
+            RenderTargetUpdateMode = SubViewport.UpdateMode.WhenVisible,
+        };
+        _previewContainer.AddChild(viewport);
+
+        // Black background environment
+        var worldEnv = new WorldEnvironment();
+        var env = new Godot.Environment();
+        env.BackgroundMode  = Godot.Environment.BGMode.Color;
+        env.BackgroundColor = new Color(0f, 0f, 0f);
+        worldEnv.Environment = env;
+        viewport.AddChild(worldEnv);
+
+        _previewRoot = new Editor3DFloorPreview();
+        viewport.AddChild(_previewRoot);
+        // Camera is owned by the preview and added to the viewport here
+        _previewRoot.InitCamera(viewport);
+    }
+
+    void TogglePreview3D()
+    {
+        _preview3dVisible = !_preview3dVisible;
+        if (_previewContainer != null)
+            _previewContainer.Visible = _preview3dVisible;
+
+        if (_previewBtn != null)
+            _previewBtn.Text = _preview3dVisible ? "3D Preview [V] ON" : "3D Preview [V]";
+
+        if (_preview3dVisible)
+            _previewRoot?.Rebuild(_maze.Pieces);
+    }
+
+    void RefreshPreview()
+    {
+        if (_preview3dVisible)
+            _previewRoot?.Rebuild(_maze.Pieces);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -95,21 +171,20 @@ public partial class MapEditorMain : Node2D
     // ══════════════════════════════════════════════════════════════════════════
     void BuildUI()
     {
-        var canvas = new CanvasLayer();
+        var canvas = new CanvasLayer { Layer = 3 };
         // FollowViewportEnabled makes the CanvasLayer scale with the game viewport
         // so the panels stay in sync with the Node2D drawing coordinate space at all
         // window sizes (critical when stretch mode is "canvas_items" + "expand").
         canvas.FollowViewportEnabled = true;
         AddChild(canvas);
-        BuildLeftPanel(canvas);
-        BuildRightPanel(canvas);
+        var wkFont = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
+        BuildLeftPanel(canvas, wkFont);
+        BuildRightPanel(canvas, wkFont);
     }
 
-    void BuildLeftPanel(CanvasLayer canvas)
+    void BuildLeftPanel(CanvasLayer canvas, FontFile? font = null)
     {
         var panel = MakePanel(new Color(0.07f, 0.07f, 0.10f, 0.97f));
-        // Anchor the left edge firmly to the left side of the viewport (offset 0)
-        // so nothing is pushed off-screen on any window size.
         panel.SetAnchor(Side.Left, 0f);  panel.SetAnchor(Side.Right, 0f);
         panel.SetAnchor(Side.Top, 0f);   panel.SetAnchor(Side.Bottom, 1f);
         panel.SetOffset(Side.Left, 0);   panel.SetOffset(Side.Right, GridOffX - 8);
@@ -117,11 +192,30 @@ public partial class MapEditorMain : Node2D
         panel.ClipContents = true;
         canvas.AddChild(panel);
 
+        // Two-row outer layout: scrollable editor area (top) + fixed play section (bottom).
+        // This guarantees ENTER DUNGEON and PLAY ARENA are always on screen regardless of
+        // viewport height, because the scroll container absorbs any overflow above them.
+        var outerVBox = new VBoxContainer();
+        outerVBox.SizeFlagsVertical   = Control.SizeFlags.ExpandFill;
+        outerVBox.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+        outerVBox.AddThemeConstantOverride("separation", 0);
+        panel.AddChild(outerVBox);
+
+        // ── Top: scrollable editor controls ──────────────────────────────────
+        var topScroll = new ScrollContainer
+        {
+            SizeFlagsVertical   = Control.SizeFlags.ExpandFill,
+            SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
+        };
+        outerVBox.AddChild(topScroll);
+
         var vbox = new VBoxContainer();
+        vbox.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
         vbox.AddThemeConstantOverride("separation", 6);
-        panel.AddChild(vbox);
+        topScroll.AddChild(vbox);
 
         var title = new Label { Text = "PALISADE", HorizontalAlignment = HorizontalAlignment.Center };
+        if (font != null) title.AddThemeFontOverride("font", font);
         title.AddThemeFontSizeOverride("font_size", 20);
         title.AddThemeColorOverride("font_color", CGoldText);
         vbox.AddChild(title);
@@ -132,7 +226,6 @@ public partial class MapEditorMain : Node2D
         hdr.AddThemeColorOverride("font_color", new Color(0.65f, 0.65f, 0.65f));
         vbox.AddChild(hdr);
 
-        // Map name field — edits the currently loaded maze's Name field live
         var nameRow = new HBoxContainer();
         nameRow.AddThemeConstantOverride("separation", 4);
         vbox.AddChild(nameRow);
@@ -148,19 +241,18 @@ public partial class MapEditorMain : Node2D
         _nameEdit.TextChanged += text => { _maze.Name = text; };
         nameRow.AddChild(_nameEdit);
 
-        // Scrollable slot list — 30 slots at 36 px each needs scroll
-        var scroll = new ScrollContainer
+        // Slot list — inside a nested scroll so the slot list itself is independently scrollable
+        var slotScroll = new ScrollContainer
         {
-            SizeFlagsVertical   = Control.SizeFlags.ExpandFill,
-            CustomMinimumSize   = new Vector2(0, 200),
+            CustomMinimumSize = new Vector2(0, 160),
         };
-        scroll.AddThemeConstantOverride("v_separation", 0);
-        vbox.AddChild(scroll);
+        slotScroll.AddThemeConstantOverride("v_separation", 0);
+        vbox.AddChild(slotScroll);
 
         var slotVBox = new VBoxContainer();
         slotVBox.AddThemeConstantOverride("separation", 2);
         slotVBox.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
-        scroll.AddChild(slotVBox);
+        slotScroll.AddChild(slotVBox);
 
         for (int i = 0; i < MazeSerializer.SlotCount; i++)
         {
@@ -194,17 +286,14 @@ public partial class MapEditorMain : Node2D
         int maxBudget = MapGen.GetMaxBudget();
         _budgetSlider = new HSlider
         {
-            MinValue          = 0,
-            MaxValue          = maxBudget,
-            Step              = 10,
-            Value             = maxBudget / 2,
-            CustomMinimumSize = new Vector2(200, 24),
+            MinValue            = 0,
+            MaxValue            = maxBudget,
+            Step                = 10,
+            Value               = maxBudget / 2,
+            CustomMinimumSize   = new Vector2(200, 24),
             SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
         };
-        _budgetSlider.ValueChanged += v =>
-        {
-            _budgetEdit.Text = ((int)v).ToString();
-        };
+        _budgetSlider.ValueChanged += v => { _budgetEdit.Text = ((int)v).ToString(); };
         vbox.AddChild(_budgetSlider);
 
         var goldRow = new HBoxContainer();
@@ -217,8 +306,8 @@ public partial class MapEditorMain : Node2D
 
         _budgetEdit = new LineEdit
         {
-            Text              = ((int)_budgetSlider.Value).ToString(),
-            CustomMinimumSize = new Vector2(80, 26),
+            Text                = ((int)_budgetSlider.Value).ToString(),
+            CustomMinimumSize   = new Vector2(80, 26),
             SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
         };
         _budgetEdit.TextChanged += text =>
@@ -238,6 +327,7 @@ public partial class MapEditorMain : Node2D
             Text              = "Generate Map (current slot)",
             CustomMinimumSize = new Vector2(0, 32),
         };
+        if (font != null) genBtn.AddThemeFontOverride("font", font);
         genBtn.AddThemeFontSizeOverride("font_size", 11);
         StyleColorBtn(genBtn, new Color(0.10f, 0.20f, 0.35f));
         genBtn.Pressed += () =>
@@ -251,9 +341,30 @@ public partial class MapEditorMain : Node2D
             RefreshGold();
             UpdateStatusLine();
             UpdateAllSlotLabels();
+            RefreshPreview();
             QueueRedraw();
         };
         vbox.AddChild(genBtn);
+
+        var clearBtn = new Button
+        {
+            Text              = "Clear Map",
+            CustomMinimumSize = new Vector2(0, 28),
+        };
+        if (font != null) clearBtn.AddThemeFontOverride("font", font);
+        clearBtn.AddThemeFontSizeOverride("font_size", 11);
+        StyleColorBtn(clearBtn, new Color(0.35f, 0.08f, 0.08f));
+        clearBtn.Pressed += () =>
+        {
+            _maze.Pieces.Clear();
+            _maze.GoldSpent = 0;
+            _picked = null;
+            RefreshGold();
+            UpdateStatusLine();
+            RefreshPreview();
+            QueueRedraw();
+        };
+        vbox.AddChild(clearBtn);
 
         vbox.AddChild(new HSeparator());
 
@@ -263,34 +374,43 @@ public partial class MapEditorMain : Node2D
 
         _statusLbl = new Label
         {
-            Text             = "",
+            Text                = "",
             HorizontalAlignment = HorizontalAlignment.Center,
-            AutowrapMode     = TextServer.AutowrapMode.Word,
+            AutowrapMode        = TextServer.AutowrapMode.Word,
         };
         _statusLbl.AddThemeColorOverride("font_color", CInvalid);
         vbox.AddChild(_statusLbl);
 
-        var spacer = new Control { SizeFlagsVertical = Control.SizeFlags.ExpandFill };
-        vbox.AddChild(spacer);
+        // ── Bottom: fixed play section — always visible ───────────────────────
+        var playVBox = new VBoxContainer();
+        playVBox.AddThemeConstantOverride("separation", 4);
+        outerVBox.AddChild(playVBox);
 
-        vbox.AddChild(new HSeparator());
+        _previewBtn = new Button { Text = "3D Preview [V]", CustomMinimumSize = new Vector2(0, 32) };
+        StyleColorBtn(_previewBtn, new Color(0.15f, 0.25f, 0.40f));
+        _previewBtn.Pressed += TogglePreview3D;
+        playVBox.AddChild(_previewBtn);
+
+        playVBox.AddChild(new HSeparator());
 
         var enterBtn = new Button { Text = "ENTER DUNGEON", CustomMinimumSize = new Vector2(0, 44) };
+        if (font != null) enterBtn.AddThemeFontOverride("font", font);
         enterBtn.AddThemeFontSizeOverride("font_size", 14);
         StyleColorBtn(enterBtn, new Color(0.15f, 0.55f, 0.15f));
         enterBtn.Pressed += OnEnterDungeon;
-        vbox.AddChild(enterBtn);
+        playVBox.AddChild(enterBtn);
 
-        vbox.AddChild(new HSeparator());
+        playVBox.AddChild(new HSeparator());
 
         var arenaHdr = new Label { Text = "ARENA MODE", HorizontalAlignment = HorizontalAlignment.Center };
+        if (font != null) arenaHdr.AddThemeFontOverride("font", font);
         arenaHdr.AddThemeFontSizeOverride("font_size", 12);
         arenaHdr.AddThemeColorOverride("font_color", new Color(0.85f, 0.65f, 0.20f));
-        vbox.AddChild(arenaHdr);
+        playVBox.AddChild(arenaHdr);
 
         var rowA = new HBoxContainer();
         rowA.AddThemeConstantOverride("separation", 4);
-        vbox.AddChild(rowA);
+        playVBox.AddChild(rowA);
         var lblA = new Label { Text = "Maze A:", CustomMinimumSize = new Vector2(48, 0) };
         lblA.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
         rowA.AddChild(lblA);
@@ -301,7 +421,7 @@ public partial class MapEditorMain : Node2D
 
         var rowB = new HBoxContainer();
         rowB.AddThemeConstantOverride("separation", 4);
-        vbox.AddChild(rowB);
+        playVBox.AddChild(rowB);
         var lblB = new Label { Text = "Maze B:", CustomMinimumSize = new Vector2(48, 0) };
         lblB.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
         rowB.AddChild(lblB);
@@ -312,25 +432,32 @@ public partial class MapEditorMain : Node2D
 
         var spawnRow = new HBoxContainer();
         spawnRow.AddThemeConstantOverride("separation", 4);
-        vbox.AddChild(spawnRow);
+        playVBox.AddChild(spawnRow);
         var spawnLbl = new Label { Text = "Spawn:", CustomMinimumSize = new Vector2(48, 0) };
         spawnLbl.AddThemeColorOverride("font_color", new Color(0.75f, 0.75f, 0.75f));
         spawnRow.AddChild(spawnLbl);
         _arenaSpawn = new OptionButton { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill };
-        _arenaSpawn.AddItem("Maze A",  0);
-        _arenaSpawn.AddItem("Maze B",  1);
-        _arenaSpawn.AddItem("Arena",   2);
+        _arenaSpawn.AddItem("Maze A", 0);
+        _arenaSpawn.AddItem("Maze B", 1);
+        _arenaSpawn.AddItem("Arena",  2);
         _arenaSpawn.Selected = 0;
         spawnRow.AddChild(_arenaSpawn);
 
         var arenaBtn = new Button { Text = "PLAY ARENA", CustomMinimumSize = new Vector2(0, 40) };
+        if (font != null) arenaBtn.AddThemeFontOverride("font", font);
         arenaBtn.AddThemeFontSizeOverride("font_size", 13);
         StyleColorBtn(arenaBtn, new Color(0.45f, 0.25f, 0.05f));
         arenaBtn.Pressed += OnPlayArena;
-        vbox.AddChild(arenaBtn);
+        playVBox.AddChild(arenaBtn);
+
+        var hubBtn = new Button { Text = "< Main Menu", CustomMinimumSize = new Vector2(0, 32) };
+        if (font != null) hubBtn.AddThemeFontOverride("font", font);
+        hubBtn.AddThemeFontSizeOverride("font_size", 12);
+        hubBtn.Pressed += () => GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
+        playVBox.AddChild(hubBtn);
     }
 
-    void BuildRightPanel(CanvasLayer canvas)
+    void BuildRightPanel(CanvasLayer canvas, FontFile? font = null)
     {
         int panelW = 1280 - RightX;
         var panel = MakePanel(new Color(0.07f, 0.07f, 0.10f, 0.97f));
@@ -345,6 +472,7 @@ public partial class MapEditorMain : Node2D
         panel.AddChild(vbox);
 
         var pHdr = new Label { Text = "PIECES", HorizontalAlignment = HorizontalAlignment.Center };
+        if (font != null) pHdr.AddThemeFontOverride("font", font);
         pHdr.AddThemeFontSizeOverride("font_size", 15);
         pHdr.AddThemeColorOverride("font_color", new Color(0.9f, 0.9f, 0.9f));
         vbox.AddChild(pHdr);
@@ -369,6 +497,7 @@ public partial class MapEditorMain : Node2D
         vbox.AddChild(rotHdr);
 
         _rotLbl = new Label { Text = "0°", HorizontalAlignment = HorizontalAlignment.Center };
+        if (font != null) _rotLbl.AddThemeFontOverride("font", font);
         _rotLbl.AddThemeFontSizeOverride("font_size", 22);
         _rotLbl.AddThemeColorOverride("font_color", Colors.White);
         vbox.AddChild(_rotLbl);
@@ -720,30 +849,57 @@ public partial class MapEditorMain : Node2D
 
         // ── Opening edge accents (connection-state indicator) ─────────────────
         const float ew = 3f;
+        bool isStairPiece = PieceDB.IsStair(piece.Type);
+        Dir  crossDir     = isStairPiece ? PieceDB.GetStairCrossDir(piece.Type, piece.Rotation) : Dir.None;
+
         foreach (Dir dir in AllDirs)
         {
-            if ((open & dir) == 0) continue;
             int  di      = System.Array.IndexOf(AllDirs, dir);
             var (dx, dy) = DirDelta[di];
-            Dir  opp     = Opposite[di];
+            bool isOpen  = (open & dir) != 0;
 
-            // Determine which floor this opening connects to (cross-floor for stair types)
-            int nFloor = piece.Floor;
-            if (PieceDB.IsStair(piece.Type) && dir == PieceDB.GetStairCrossDir(piece.Type, piece.Rotation))
-                nFloor = piece.Floor + PieceDB.StairFloorDelta(piece.Type);
-            bool nbExists   = lookup.ContainsKey((piece.X + dx, piece.Y + dy, nFloor));
-            bool nbConnects = nbExists &&
-                (PieceDB.GetOpenings(lookup[(piece.X + dx, piece.Y + dy, nFloor)].Type,
-                                     lookup[(piece.X + dx, piece.Y + dy, nFloor)].Rotation)
-                 & opp) != 0;
-
-            Color accent = (nbExists && !nbConnects) ? CInvalid : col.Lightened(0.35f);
-            switch (dir)
+            if (isOpen)
             {
-                case Dir.N: DrawRect(new Rect2(cx - hw, py,              hw * 2, ew), accent); break;
-                case Dir.S: DrawRect(new Rect2(cx - hw, py + CellPx - ew, hw * 2, ew), accent); break;
-                case Dir.E: DrawRect(new Rect2(px + CellPx - ew, cy - hw, ew, hw * 2), accent); break;
-                case Dir.W: DrawRect(new Rect2(px,               cy - hw, ew, hw * 2), accent); break;
+                Dir opp    = Opposite[di];
+                bool isCross  = dir == crossDir;
+                int  nFloor   = (isStairPiece && isCross) ? piece.Floor + PieceDB.StairFloorDelta(piece.Type) : piece.Floor;
+                bool nbExists = lookup.ContainsKey((piece.X + dx, piece.Y + dy, nFloor));
+                bool nbConnects = false;
+                if (nbExists)
+                {
+                    var nb = lookup[(piece.X + dx, piece.Y + dy, nFloor)];
+                    nbConnects = nFloor == piece.Floor
+                        ? PieceDB.HasSameFloorOpening(nb.Type, nb.Rotation, opp)
+                        : (PieceDB.GetOpenings(nb.Type, nb.Rotation) & opp) != 0;
+                }
+
+                Color accent;
+                if (isStairPiece)
+                    accent = (nbExists && !nbConnects) ? CInvalid
+                           : nbConnects ? (isCross ? CStairCross : CStairFlat)
+                           : (isCross ? CStairCrossOk : CStairFlatOk);
+                else
+                    accent = (nbExists && !nbConnects) ? CInvalid : col.Lightened(0.35f);
+
+                switch (dir)
+                {
+                    case Dir.N: DrawRect(new Rect2(cx - hw, py,               hw * 2, ew), accent); break;
+                    case Dir.S: DrawRect(new Rect2(cx - hw, py + CellPx - ew, hw * 2, ew), accent); break;
+                    case Dir.E: DrawRect(new Rect2(px + CellPx - ew, cy - hw, ew, hw * 2), accent); break;
+                    case Dir.W: DrawRect(new Rect2(px,                cy - hw, ew, hw * 2), accent); break;
+                }
+            }
+            else if (lookup.ContainsKey((piece.X + dx, piece.Y + dy, piece.Floor)))
+            {
+                // Closed face with an adjacent same-floor piece → wall-forced band
+                Color wallCol = isStairPiece ? CStairWall : CWallBand;
+                switch (dir)
+                {
+                    case Dir.N: DrawRect(new Rect2(cx - hw, py,               hw * 2, ew), wallCol); break;
+                    case Dir.S: DrawRect(new Rect2(cx - hw, py + CellPx - ew, hw * 2, ew), wallCol); break;
+                    case Dir.E: DrawRect(new Rect2(px + CellPx - ew, cy - hw, ew, hw * 2), wallCol); break;
+                    case Dir.W: DrawRect(new Rect2(px,                cy - hw, ew, hw * 2), wallCol); break;
+                }
             }
         }
 
@@ -802,6 +958,26 @@ public partial class MapEditorMain : Node2D
     // ══════════════════════════════════════════════════════════════════════════
     //  INPUT
     // ══════════════════════════════════════════════════════════════════════════
+
+    // _Input runs before _UnhandledInput and handles orbit drag when preview is on.
+    public override void _Input(InputEvent ev)
+    {
+        if (!_preview3dVisible) return;
+
+        if (ev is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Left)
+        {
+            _orbitDragging = mb.Pressed;
+            GetViewport().SetInputAsHandled();
+            return;
+        }
+
+        if (ev is InputEventMouseMotion motion && _orbitDragging)
+        {
+            _previewRoot?.Drag(motion.Relative.X, motion.Relative.Y);
+            GetViewport().SetInputAsHandled();
+        }
+    }
+
     public override void _UnhandledInput(InputEvent ev)
     {
         if (ev is InputEventKey key && key.Pressed && !key.Echo)
@@ -809,6 +985,7 @@ public partial class MapEditorMain : Node2D
             switch (key.PhysicalKeycode)
             {
                 case Key.R:      OnRotate(); return;
+                case Key.V:      TogglePreview3D(); return;
                 case Key.Escape: Deselect(); return;
                 case Key.Delete: DeleteSelected(); return;
                 case Key.F11:
@@ -922,6 +1099,7 @@ public partial class MapEditorMain : Node2D
         _maze.Pieces.Add(new MazePiece { Type = _selType, X = x, Y = y, Floor = _floor, Rotation = rot });
         RefreshGold();
         UpdateStatusLine();
+        RefreshPreview();
         QueueRedraw();
     }
 
@@ -930,6 +1108,7 @@ public partial class MapEditorMain : Node2D
         _maze.Pieces.RemoveAll(p => p.X == x && p.Y == y && p.Floor == _floor);
         RefreshGold();
         UpdateStatusLine();
+        RefreshPreview();
         QueueRedraw();
     }
 
@@ -947,6 +1126,7 @@ public partial class MapEditorMain : Node2D
         _picked = null;
         RefreshGold();
         UpdateStatusLine();
+        RefreshPreview();
         QueueRedraw();
     }
 
@@ -1096,6 +1276,7 @@ public partial class MapEditorMain : Node2D
     void OnLoadSlot(int slot)
     {
         // Auto-save any unsaved changes to the current slot before switching
+        _maze.IsOnline = false;
         MazeSerializer.Save(_slot, _maze);
 
         _picked = null;
@@ -1108,12 +1289,14 @@ public partial class MapEditorMain : Node2D
         UpdateAllSlotLabels();
         RefreshGold();
         UpdateStatusLine();
+        RefreshPreview();
         QueueRedraw();
     }
 
     void OnSaveSlot(int slot)
     {
         _slot = slot;
+        _maze.IsOnline = false;
         MazeSerializer.Save(slot, _maze);
         UpdateAllSlotLabels();
         GD.Print($"[MapEditor] Saved slot {slot}: {_maze.Pieces.Count} pieces, {_maze.GoldSpent}g");
@@ -1149,7 +1332,8 @@ public partial class MapEditorMain : Node2D
         }
 
         OnSaveSlot(_slot);
-        GameState.ActiveSlot = _slot;
+        GameState.ActiveSlot        = _slot;
+        GameState.EditorReturnScene = "res://scenes/MapEditor.tscn";
         GetTree().ChangeSceneToFile("res://scenes/DungeonGame.tscn");
     }
 
@@ -1218,6 +1402,10 @@ public partial class MapEditorMain : Node2D
                 var key = (nx, ny, nFloor);
                 if (visited.Contains(key)) continue;
                 if (!lookup.TryGetValue(key, out var nb)) continue;
+                // Entering a stair from its cross-floor face at the same floor level is
+                // geometrically invalid (that arch is at ±1 floor height, not the same floor).
+                if (PieceDB.IsStair(nb.Type) && opp == PieceDB.GetStairCrossDir(nb.Type, nb.Rotation))
+                    continue;
                 if ((PieceDB.GetOpenings(nb.Type, nb.Rotation) & opp) == 0) continue;
 
                 visited.Add(key);
@@ -1225,7 +1413,15 @@ public partial class MapEditorMain : Node2D
             }
         }
 
-        // Find any piece not reached
+        // Exit reachability is the primary gate — give a specific message.
+        var exitPiece = _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+        if (exitPiece != null && !visited.Contains((exitPiece.X, exitPiece.Y, exitPiece.Floor)))
+        {
+            unreachableDesc = "No path from Start to Exit — connect the corridor all the way through";
+            return false;
+        }
+
+        // Secondary: report any other unreachable pieces (dead islands).
         var unreached = _maze.Pieces.Where(p => !visited.Contains((p.X, p.Y, p.Floor))).ToList();
         if (unreached.Count > 0)
         {

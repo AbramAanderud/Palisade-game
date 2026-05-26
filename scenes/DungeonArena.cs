@@ -8,9 +8,6 @@ using System.Linq;
 ///   Maze B is Z-flipped and placed so its (flipped) Exit north face aligns with the
 ///   arena's south opening.
 ///
-/// The Arena acts as the bridge — no fixed coordinates. The Exit tile's world position
-/// determines where the entire maze sits. Arena centre is derived from that.
-///
 ///   Maze A origin Z = 0
 ///   Exit A south face = MazeDepth  (row 9, south face = 10*CellSize = 100 m)
 ///   Arena north apothem = exit south face  →  ArenaCentreZ = MazeDepth + Apothem
@@ -32,6 +29,7 @@ public partial class DungeonArena : Node3D
     public static SpawnPoint ChosenSpawn = SpawnPoint.MazeA;
 
     PlayerController? _player;
+    MazeTimer?        _mazeTimer;   // stopped by exit trigger when implemented
 
     public override void _Ready()
     {
@@ -44,8 +42,8 @@ public partial class DungeonArena : Node3D
         if (dataA == null || dataA.Pieces.Count == 0 ||
             dataB == null || dataB.Pieces.Count == 0)
         {
-            GD.PushError("[DungeonArena] Missing maze data — returning to editor");
-            GetTree().ChangeSceneToFile("res://scenes/MapEditor.tscn");
+            GD.PushError("[DungeonArena] Missing maze data — returning to title");
+            GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
             return;
         }
 
@@ -79,8 +77,6 @@ public partial class DungeonArena : Node3D
         float offsetBX = exitAX - exitBX;
 
         // Each maze is shifted down in Y so its exit piece's floor sits at Y=0 (arena floor level).
-        // Example: Maze A exit on floor 2 → offsetAY = -2×FloorHeight, bringing exit to Y=0.
-        // Maze B works independently, so one maze can tower high while the other sits low.
         float offsetAY = exitA != null ? -exitA.Floor  * DungeonBuilder.FloorHeight : 0f;
         float offsetBY = exitB != null ? -exitB.Floor  * DungeonBuilder.FloorHeight : 0f;
 
@@ -95,8 +91,16 @@ public partial class DungeonArena : Node3D
         AddChild(builderB);
         builderB.Build(dataFlipped, new Vector3(offsetBX, offsetBY, MazeBOffset), Dir.N);
 
+        // ── Torch signal systems — BFS wave from Exit after 20 s ─────────────
+        var torchA = new TorchSignalSystem { Name = "TorchSignalA" };
+        AddChild(torchA);
+        torchA.Init(dataA, builderA);
+
+        var torchB = new TorchSignalSystem { Name = "TorchSignalB" };
+        AddChild(torchB);
+        torchB.Init(dataFlipped, builderB);
+
         // ── Build arena centred at (exitAX, 0, ArenaCentreZ) ─────────────────
-        // Arena floor is always Y=0; both exits have been anchored to meet it.
         var arena = new ArenaBuilder { Name = "Arena" };
         AddChild(arena);
         arena.Build(new Vector3(exitAX, 0f, ArenaCentreZ), openNorth: true, openSouth: true);
@@ -116,7 +120,6 @@ public partial class DungeonArena : Node3D
                           ?? dataFlipped.Pieces[0];
                 float cx = startB.X * CellSize + CellSize * 0.5f + offsetBX;
                 float cz = startB.Y * CellSize + CellSize * 0.5f + MazeBOffset;
-                // Apply the same Y and X offsets used when building Maze B
                 float cy = startB.Floor * DungeonBuilder.FloorHeight + 1f + offsetBY;
                 spawnPos = new Vector3(cx, cy, cz);
                 spawnYaw = DirToYaw(PieceDB.GetOpenings(PieceType.Start, startB.Rotation));
@@ -132,7 +135,6 @@ public partial class DungeonArena : Node3D
                           ?? dataA.Pieces[0];
                 float cx = startA.X * CellSize + CellSize * 0.5f;
                 float cz = startA.Y * CellSize + CellSize * 0.5f;
-                // Apply the same Y offset used when building Maze A
                 float cy = startA.Floor * DungeonBuilder.FloorHeight + 1f + offsetAY;
                 spawnPos = new Vector3(cx, cy, cz);
                 spawnYaw = DirToYaw(PieceDB.GetOpenings(PieceType.Start, startA.Rotation));
@@ -142,34 +144,16 @@ public partial class DungeonArena : Node3D
 
         _player = PlayerController.Spawn(this, spawnPos, spawnYaw);
 
-        // ── HUD ───────────────────────────────────────────────────────────────
-        var canvas = new CanvasLayer();
-        AddChild(canvas);
-        var hint = new Label
-        {
-            Text     = "ESC = release mouse   ESC again = back to editor",
-            Position = new Vector2(10, 10),
-        };
-        hint.AddThemeFontSizeOverride("font_size", 13);
-        hint.AddThemeColorOverride("font_color", new Color(0.7f, 0.7f, 0.7f));
-        canvas.AddChild(hint);
+        _mazeTimer = new MazeTimer { Name = "MazeTimer" };
+        AddChild(_mazeTimer);
 
         GD.Print($"[DungeonArena] A=slot{slotA}(exitX={exitAX:F1},exitFloor={exitA?.Floor ?? 0},offsetY={offsetAY:F1}) " +
                  $"B=slot{slotB}(exitX={exitBX:F1},offsetBX={offsetBX:F1},exitFloor={exitB?.Floor ?? 0},offsetY={offsetBY:F1}) " +
                  $"arenaZ={ArenaCentreZ:F1} mazeBZ={MazeBOffset:F1} spawn={ChosenSpawn}");
     }
 
-    public override void _Input(InputEvent ev)
-    {
-        if (ev.IsActionPressed("pause") && Input.MouseMode == Input.MouseModeEnum.Visible)
-        {
-            _player?.ReleaseMouse();
-            GetTree().ChangeSceneToFile("res://scenes/MapEditor.tscn");
-        }
-    }
-
     // ── Z-flip a maze so it runs in the opposite direction ────────────────────
-    static MazeData FlipMazeZ(MazeData src)
+    internal static MazeData FlipMazeZ(MazeData src)
     {
         const int GridH = 10;
         var dst = new MazeData { Name = src.Name + "_flipped", GoldSpent = src.GoldSpent };
@@ -186,21 +170,19 @@ public partial class DungeonArena : Node3D
         return dst;
     }
 
-    static int FlipRotation(PieceType type, int rot) => type switch
+    internal static int FlipRotation(PieceType type, int rot) => type switch
     {
         PieceType.LHall      => rot ^ 1,
         PieceType.THall      => rot switch { 1 => 3, 3 => 1, _ => rot },
         PieceType.Start      => (rot + 2) % 4,
         PieceType.Exit       => (rot + 2) % 4,
-        // N-S stairs flip their cross-floor direction when Z is mirrored.
-        // E-W stairs (rot=1,3) are unaffected by a Z-flip.
         PieceType.Stairs     => rot switch { 0 => 2, 2 => 0, _ => rot },
         PieceType.StairsUp   => rot switch { 0 => 2, 2 => 0, _ => rot },
         PieceType.StairsDown => rot switch { 0 => 2, 2 => 0, _ => rot },
         _                    => rot,
     };
 
-    static float DirToYaw(Dir dir)
+    internal static float DirToYaw(Dir dir)
     {
         if ((dir & Dir.N) != 0) return 0f;
         if ((dir & Dir.E) != 0) return 90f;

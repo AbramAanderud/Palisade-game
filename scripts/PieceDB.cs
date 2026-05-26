@@ -34,6 +34,16 @@ public static class PieceDB
         return d;
     }
 
+    /// Returns true if this piece has an opening in `dir` that connects at the SAME floor.
+    /// For stair pieces, the cross-floor (high) opening is only valid from floor±1,
+    /// so adjacent same-floor pieces at the cross face are NOT considered connected.
+    public static bool HasSameFloorOpening(PieceType type, int rotation, Dir dir)
+    {
+        if ((GetOpenings(type, rotation) & dir) == 0) return false;
+        if (!IsStair(type)) return true;
+        return dir != GetStairCrossDir(type, rotation);
+    }
+
     /// Returns true for any stair piece type.
     public static bool IsStair(PieceType t)
         => t == PieceType.Stairs || t == PieceType.StairsUp || t == PieceType.StairsDown;

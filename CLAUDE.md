@@ -75,10 +75,23 @@ When fixing bugs, first identify the most likely file/function responsible, then
 
 ## Current Known Bugs
 
-- Wall behind stairs is not filled correctly for both stairs up and stairs down.
 - Generated maps and handmade maps are no longer fixed/stitching together through the middle room.
-- Stairs previously became vertical-only when rotation logic broke.
 - Arena floor/wall collision has broken before.
+
+## Solved Architecture Decisions — Do Not Revert
+
+### Stair Physics: Visual Steps + Invisible Ramp (FINAL)
+
+Stairs use the industry-standard pattern: **visual geometry has no collision; an invisible diagonal ramp handles all physics**.
+
+- `DungeonBuilder.cs` `BuildFloor` stair branch uses `AddMeshVisual` for treads (`floorST`) and risers (`riserST`) — no collision shapes on them
+- `AddStairRamp(body, p, geomBase)` adds the invisible physics ramp
+- `PlayerController.cs` `FloorMaxAngle` must stay **above** the ramp angle: `atan(FloorHeight / CellSize)` in degrees. Currently `FloorHeight = 18f`, `CellSize = 10f` → ramp ≈ 61°, `FloorMaxAngle = 68°`
+- **If `CellHeight` or `FloorHeight` ever changes, recalculate: `atan(FloorHeight / CellSize)` and keep `FloorMaxAngle` at least 5° above that**
+
+Why this is correct: per-tread collision causes the capsule to step off tread edges and become briefly airborne. Once airborne, horizontal momentum arcs the player instead of snapping them to the next step — this feels like flying regardless of how `FloorSnapLength` or gravity are tuned. The ramp eliminates the airborne moment entirely.
+
+Do NOT revert to `AddMeshWithBackface` / `AddMesh` for stair treads or risers. Do NOT remove `AddStairRamp`. Do NOT lower `FloorMaxAngle` below the ramp angle.
 
 ## Likely Important Files
 
