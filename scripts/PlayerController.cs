@@ -168,9 +168,11 @@ public partial class PlayerController : CharacterBody3D
     PlayerAnimator _animator = null!;
 
     // ── Combat ────────────────────────────────────────────────────────────────
-    SwordCombat _combat     = null!;
-    Vector3     _lungeDir   = Vector3.Zero;
-    float       _lungeSpeed = 0f;
+    SwordCombat _combat          = null!;
+    Vector3     _lungeDir        = Vector3.Zero;
+    float       _lungeSpeed      = 0f;
+    // 0.5 = starter sword (half momentum), 1.0 = middle sword (full momentum)
+    float       _aerialLungePow  = 0.5f;
 
     // ── Public ────────────────────────────────────────────────────────────────
     public bool HasWeapon { get; private set; } = false;
@@ -244,7 +246,9 @@ public partial class PlayerController : CharacterBody3D
         var   horiz    = new Vector3(Velocity.X, 0f, Velocity.Z);
         float horizSpd = horiz.Length();
         float momentumScale = 1f + _momentum * 0.5f;   // up to 1.5× at full momentum
-        float dashSpd  = Mathf.Clamp(horizSpd * 2.0f * momentumScale, 18f, 42f);
+        // Base: 9 (starter) → 18 (middle). Scale: 1.0× (starter) → 2.0× (middle).
+        float dashSpd  = Mathf.Clamp(horizSpd * 2.0f * _aerialLungePow * momentumScale,
+                                     18f * _aerialLungePow, 42f * _aerialLungePow);
         _combat.AerialLungeSpeed = horizSpd;
         var fwd  = new Vector3(-Mathf.Sin(_yaw), 0f, -Mathf.Cos(_yaw));
         _lungeDir   = fwd;
@@ -290,14 +294,24 @@ public partial class PlayerController : CharacterBody3D
     public float Pitch => _pitch;
 
     Vector3 _puppetTargetPos   = Vector3.Zero;
+    Vector3 _puppetTargetVel   = Vector3.Zero;
     float   _puppetTargetYaw   = 0f;
     float   _puppetTargetPitch = 0f;
+    ulong   _puppetReceiveMs   = 0;   // local Time.GetTicksMsec at receive
+    bool    _puppetHasTarget   = false;
 
-    public void SetPuppetTarget(Vector3 pos, float yaw, float pitch)
+    const float PuppetExtrapolateCapSec = 0.2f;   // cap forward prediction at 200 ms
+    const float PuppetSnapDistance      = 2.0f;   // snap if extrapolated target drifts > 2 m
+
+    /// Set puppet target with velocity for extrapolation. Velocity is in world units/sec.
+    public void SetPuppetTarget(Vector3 pos, Vector3 velocity, float yaw, float pitch)
     {
         _puppetTargetPos   = pos;
+        _puppetTargetVel   = velocity;
         _puppetTargetYaw   = yaw;
         _puppetTargetPitch = pitch;
+        _puppetReceiveMs   = Time.GetTicksMsec();
+        _puppetHasTarget   = true;
     }
 
     /// Re-assert this player's camera as current and re-capture the mouse.
@@ -420,9 +434,13 @@ public partial class PlayerController : CharacterBody3D
         return sfx;
     }
 
+    /// When true, the player ignores all input and stops physics — used to lock
+    /// movement / mouse / swings while the end-of-match overlay is up.
+    public bool Frozen { get; set; } = false;
+
     public override void _Input(InputEvent ev)
     {
-        if (IsRemotePuppet || _isDead) return;
+        if (IsRemotePuppet || _isDead || Frozen) return;
         if (ev is InputEventMouseMotion mm && Input.MouseMode == Input.MouseModeEnum.Captured)
         {
             _frameMouseDelta += mm.Relative;   // accumulate for weapon sway
@@ -440,12 +458,24 @@ public partial class PlayerController : CharacterBody3D
 
     public override void _PhysicsProcess(double delta)
     {
-        if (_isDead) return;
+        if (_isDead || Frozen) return;
 
         if (IsRemotePuppet)
         {
             float dt2 = (float)delta;
-            GlobalPosition = GlobalPosition.Lerp(_puppetTargetPos, 20f * dt2);
+            if (_puppetHasTarget)
+            {
+                // Extrapolate forward by time since packet arrived, capped to 200 ms.
+                float elapsedSec = (Time.GetTicksMsec() - _puppetReceiveMs) / 1000f;
+                if (elapsedSec > PuppetExtrapolateCapSec) elapsedSec = PuppetExtrapolateCapSec;
+                Vector3 predicted = _puppetTargetPos + _puppetTargetVel * elapsedSec;
+
+                // Snap on big jumps (respawn / teleport / packet loss recovery).
+                if (GlobalPosition.DistanceTo(predicted) > PuppetSnapDistance)
+                    GlobalPosition = predicted;
+                else
+                    GlobalPosition = GlobalPosition.Lerp(predicted, 20f * dt2);
+            }
             _yaw   = Mathf.LerpAngle(_yaw,   _puppetTargetYaw,   20f * dt2);
             _pitch = Mathf.Lerp(_pitch, _puppetTargetPitch, 20f * dt2);
             ApplyLook();
@@ -1113,6 +1143,7 @@ public partial class PlayerController : CharacterBody3D
         PickupWeapon();
         _combat.DamageMultiplier = 0.5f;
         _combat.Lifesteal        = 0f;
+        _aerialLungePow          = 0.5f;
     }
 
     public void EquipMiddleSword()
@@ -1120,6 +1151,7 @@ public partial class PlayerController : CharacterBody3D
         PickupWeapon();
         _combat.DamageMultiplier = 1.0f;
         _combat.Lifesteal        = 0.10f;
+        _aerialLungePow          = 1.0f;
         TriggerOpponentWallhack();
     }
 

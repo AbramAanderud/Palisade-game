@@ -7,6 +7,7 @@ public partial class TitleScreen : Control
     SettingsPanel?      _settingsPanel;
     AudioStreamPlayer? _clickSfx;
     AudioStreamPlayer? _playGameSfx;
+    bool _changingScene = false;
 
     const float CornerPad = 36f;
     const float BtnH      = 52f;
@@ -14,6 +15,9 @@ public partial class TitleScreen : Control
     public override void _Ready()
     {
         Input.MouseMode = Input.MouseModeEnum.Visible;
+
+        // Load the active account's profile so RANK reflects the latest gold.
+        PlayerProfile.Load();
 
         _clickSfx = new AudioStreamPlayer();
         var clickStream = GD.Load<AudioStream>("res://assets/audio/ui/MenuButtonClick.wav");
@@ -65,22 +69,32 @@ public partial class TitleScreen : Control
         title.AddThemeColorOverride("font_color", Colors.White);
         vbox.AddChild(title);
 
-        vbox.AddChild(new Control { CustomMinimumSize = new Vector2(0, 52) });
+        // Fame readout (same underlying gold pool — labelled as the player's rank/fame on the menu).
+        var fameLbl = new Label
+        {
+            Text                = $"FAME: {OnlineGameState.Gold}",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (font != null) fameLbl.AddThemeFontOverride("font", font);
+        fameLbl.AddThemeFontSizeOverride("font_size", 22);
+        fameLbl.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.3f));
+        vbox.AddChild(fameLbl);
 
-        var onlineMazeBtn = MakeBtn("Online Maze", font, 26, OnOnlineMaze);
+        vbox.AddChild(new Control { CustomMinimumSize = new Vector2(0, 36) });
+
+        var mazeBtn = MakeBtn("Maze", font, 26, OnMaze);
         if (!HasAnyOnlineMaze())
         {
-            onlineMazeBtn.Text = "! Online Maze";
-            onlineMazeBtn.AddThemeColorOverride("font_color",         new Color(1f, 0.85f, 0f));
-            onlineMazeBtn.AddThemeColorOverride("font_hover_color",   new Color(1f, 1f,    0.4f));
-            onlineMazeBtn.AddThemeColorOverride("font_pressed_color", new Color(0.8f, 0.7f, 0f));
-            onlineMazeBtn.AddThemeColorOverride("font_focus_color",   new Color(1f, 0.85f, 0f));
+            mazeBtn.Text = "! Maze";
+            mazeBtn.AddThemeColorOverride("font_color",         new Color(1f, 0.85f, 0f));
+            mazeBtn.AddThemeColorOverride("font_hover_color",   new Color(1f, 1f,    0.4f));
+            mazeBtn.AddThemeColorOverride("font_pressed_color", new Color(0.8f, 0.7f, 0f));
+            mazeBtn.AddThemeColorOverride("font_focus_color",   new Color(1f, 0.85f, 0f));
         }
-        vbox.AddChild(MakeBtn("Play Game",     font, 30, OnPlayGame));
-        vbox.AddChild(onlineMazeBtn);
-        vbox.AddChild(MakeBtn("Training",      font, 26, OnTraining));
-        vbox.AddChild(MakeBtn("Settings",      font, 26, OnSettings));
-        vbox.AddChild(MakeBtn("Testing Maze",  font, 22, OnTestingMaze));
+        vbox.AddChild(MakeBtn("Play Game", font, 30, OnPlayGame));
+        vbox.AddChild(mazeBtn);
+        vbox.AddChild(MakeBtn("Training",  font, 26, OnTraining));
+        vbox.AddChild(MakeBtn("Settings",  font, 26, OnSettings));
 
         // ── Bottom-centre: Exit ───────────────────────────────────────────────
         var exitBtn = MakeBtn("Exit", font, 20, () => { _clickSfx?.Play(); GetTree().Quit(); });
@@ -150,27 +164,28 @@ public partial class TitleScreen : Control
 
     void OnPlayGame()
     {
+        if (_changingScene) return;
+        _changingScene = true;
         _clickSfx?.Play();
         OnlineGameState.Reset();
-        GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
+        GetTree().CreateTimer(0.25).Timeout += () =>
+            GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
     }
 
-    void OnOnlineMaze()
+    void OnMaze()
     {
+        if (_changingScene) return;
+        _changingScene = true;
         _clickSfx?.Play();
         _playGameSfx?.Play();
         GetTree().CreateTimer(0.5).Timeout += () =>
             GetTree().ChangeSceneToFile("res://scenes/MazeEditor3D.tscn");
     }
 
-    void OnTestingMaze()
-    {
-        _clickSfx?.Play();
-        GetTree().ChangeSceneToFile("res://scenes/MapEditor.tscn");
-    }
-
     void OnTraining()
     {
+        if (_changingScene) return;
+        _changingScene = true;
         _clickSfx?.Play();
         GetTree().ChangeSceneToFile("res://scenes/TrainingSetupScreen.tscn");
     }

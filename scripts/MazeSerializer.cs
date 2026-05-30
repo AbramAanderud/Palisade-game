@@ -1,14 +1,15 @@
 using Godot;
 using System.Text.Json;
 
-/// res://scripts/MazeSerializer.cs — Multi-slot save/load for MazeData (user://maze_slot_N.json).
+/// res://scripts/MazeSerializer.cs — Multi-slot save/load for MazeData.
+/// Paths are resolved per-account via AccountManager, e.g. user://accounts/alice/maze_2.json.
 public static class MazeSerializer
 {
-    public const int SlotCount = 30;
+    public const int SlotCount = 5;
 
     static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
 
-    static string SlotPath(int slot) => $"user://maze_slot_{slot}.json";
+    static string SlotPath(int slot) => AccountManager.MazeSlotPath(slot);
 
     public static void Save(int slot, MazeData data)
     {

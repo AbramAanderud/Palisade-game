@@ -21,7 +21,19 @@ public partial class PlayGameScreen : Control
     string?       _outgoingTargetId;     // player we sent a challenge to
     string?       _incomingChallengerId; // player who challenged us
 
-    const float BtnH = 48f;
+    bool _changingScene = false;
+    bool _connectedOnce = false;
+
+    Timer? _connectWaitTimer;        // shows "Waking server…" after 5 s
+    Timer? _connectFailTimer;        // shows Retry/Back after 35 s
+    Timer? _outgoingChallengeTimer;  // 30 s timeout on outgoing challenge
+    Timer? _statusClearTimer;        // clears status label after 5 s
+
+    Button? _retryBtn;
+    Button? _backToMenuBtn;
+
+    const float BtnH       = 48f;
+    const int   MaxNameLen = 24;
 
     public override void _Ready()
     {
@@ -40,31 +52,37 @@ public partial class PlayGameScreen : Control
         AddChild(_playGameSfx);
 
         PlayerProfile.Load();
-        if (string.IsNullOrEmpty(OnlineGameState.PlayerName))
+        bool hasSavedName = !string.IsNullOrEmpty(OnlineGameState.PlayerName);
+        if (!hasSavedName)
             OnlineGameState.PlayerName = "Player_" + (int)GD.RandRange(100, 999);
 
         SetAnchorsPreset(LayoutPreset.FullRect);
         BuildUI();
 
-        _nm.LobbyJoined       += OnLobbyJoined;
-        _nm.LobbyUpdated      += OnLobbyUpdated;
-        _nm.IncomingChallenge += OnIncomingChallenge;
-        _nm.ChallengeDeclined += OnChallengeDeclined;
-        _nm.MatchMade         += OnMatchMade;
-        _nm.ConnectionFailed  += OnConnectionFailed;
+        _nm.LobbyJoined        += OnLobbyJoined;
+        _nm.LobbyUpdated       += OnLobbyUpdated;
+        _nm.IncomingChallenge  += OnIncomingChallenge;
+        _nm.ChallengeDeclined  += OnChallengeDeclined;
+        _nm.ChallengeCancelled += OnChallengeCancelled;
+        _nm.MatchMade          += OnMatchMade;
+        _nm.ConnectionFailed   += OnConnectionFailed;
 
-        _statusLabel.Text = "Connecting…";
-        _nm.ConnectAndJoinLobby(OnlineGameState.PlayerName);
+        if (hasSavedName)
+            BeginConnect();
+        else
+            PromptForName();
     }
 
     public override void _ExitTree()
     {
-        _nm.LobbyJoined       -= OnLobbyJoined;
-        _nm.LobbyUpdated      -= OnLobbyUpdated;
-        _nm.IncomingChallenge -= OnIncomingChallenge;
-        _nm.ChallengeDeclined -= OnChallengeDeclined;
-        _nm.MatchMade         -= OnMatchMade;
-        _nm.ConnectionFailed  -= OnConnectionFailed;
+        _nm.LobbyJoined        -= OnLobbyJoined;
+        _nm.LobbyUpdated       -= OnLobbyUpdated;
+        _nm.IncomingChallenge  -= OnIncomingChallenge;
+        _nm.ChallengeDeclined  -= OnChallengeDeclined;
+        _nm.ChallengeCancelled -= OnChallengeCancelled;
+        _nm.MatchMade          -= OnMatchMade;
+        _nm.ConnectionFailed   -= OnConnectionFailed;
+        PlayerProfile.Save();
     }
 
     // ── UI construction ───────────────────────────────────────────────────────
@@ -106,7 +124,7 @@ public partial class PlayGameScreen : Control
 
         _goldLabel = new Label
         {
-            Text                = $"Gold: {OnlineGameState.Gold}",
+            Text                = $"Fame: {OnlineGameState.Gold}",
             HorizontalAlignment = HorizontalAlignment.Right,
             CustomMinimumSize   = new Vector2(130, 0),
             SizeFlagsVertical   = SizeFlags.ShrinkCenter,
@@ -133,6 +151,23 @@ public partial class PlayGameScreen : Control
         _statusLabel.AddThemeFontSizeOverride("font_size", 16);
         _statusLabel.AddThemeColorOverride("font_color", new Color(0.8f, 0.8f, 0.5f));
         outer.AddChild(_statusLabel);
+
+        // ── Retry / Back-to-menu buttons (hidden until connection fails) ───────
+        var failRow = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.Center };
+        failRow.AddThemeConstantOverride("separation", 16);
+        outer.AddChild(failRow);
+
+        _retryBtn = new Button { Text = "Retry", CustomMinimumSize = new Vector2(140, 40), Visible = false };
+        if (_font != null) _retryBtn.AddThemeFontOverride("font", _font);
+        _retryBtn.AddThemeFontSizeOverride("font_size", 16);
+        _retryBtn.Pressed += OnRetryConnect;
+        failRow.AddChild(_retryBtn);
+
+        _backToMenuBtn = new Button { Text = "Back to menu", CustomMinimumSize = new Vector2(160, 40), Visible = false };
+        if (_font != null) _backToMenuBtn.AddThemeFontOverride("font", _font);
+        _backToMenuBtn.AddThemeFontSizeOverride("font_size", 16);
+        _backToMenuBtn.Pressed += OnCancel;
+        failRow.AddChild(_backToMenuBtn);
 
         // ── Player list ───────────────────────────────────────────────────────
         var listHeader = new Label { Text = "Online Players:" };
@@ -210,11 +245,147 @@ public partial class PlayGameScreen : Control
         OnlineGameState.SelectedMazeSlot = _mazeDropdown.GetItemId(0);
     }
 
+    // ── Status / connection state machine ─────────────────────────────────────
+
+    void SetStatus(string text, bool autoClear = true)
+    {
+        _statusLabel.Text = text;
+        _statusClearTimer?.Stop();
+        if (!autoClear) return;
+        _statusClearTimer ??= NewOneShotTimer(5.0, () => { if (_statusLabel != null) _statusLabel.Text = ""; });
+        _statusClearTimer.Start(5.0);
+    }
+
+    Timer NewOneShotTimer(double seconds, Action onTimeout)
+    {
+        var t = new Timer { WaitTime = seconds, OneShot = true };
+        t.Timeout += onTimeout;
+        AddChild(t);
+        return t;
+    }
+
+    void BeginConnect()
+    {
+        _connectedOnce = false;
+        SetStatus("Connecting…", autoClear: false);
+        GD.Print($"[LOBBY] Connecting as '{OnlineGameState.PlayerName}'");
+        _nm.ConnectAndJoinLobby(OnlineGameState.PlayerName);
+
+        _connectWaitTimer?.Stop();
+        _connectFailTimer?.Stop();
+        _connectWaitTimer ??= NewOneShotTimer(5.0,  OnConnectWaitElapsed);
+        _connectFailTimer ??= NewOneShotTimer(35.0, OnConnectFailElapsed);
+        _connectWaitTimer.Start(5.0);
+        _connectFailTimer.Start(35.0);
+    }
+
+    void OnConnectWaitElapsed()
+    {
+        if (_connectedOnce) return;
+        SetStatus("Waking server — this can take up to 30 s…", autoClear: false);
+    }
+
+    void OnConnectFailElapsed()
+    {
+        if (_connectedOnce) return;
+        ShowConnectionFailureUI("Could not reach server.");
+    }
+
+    void ShowConnectionFailureUI(string reason)
+    {
+        SetStatus(reason, autoClear: false);
+        if (_retryBtn != null) { _retryBtn.Visible = true; }
+        if (_backToMenuBtn != null) { _backToMenuBtn.Visible = true; }
+    }
+
+    void HideConnectionFailureUI()
+    {
+        if (_retryBtn != null) _retryBtn.Visible = false;
+        if (_backToMenuBtn != null) _backToMenuBtn.Visible = false;
+    }
+
+    void OnRetryConnect()
+    {
+        if (_changingScene) return;
+        _clickSfx?.Play();
+        HideConnectionFailureUI();
+        _nm.Disconnect();
+        BeginConnect();
+    }
+
+    // ── Name prompt ───────────────────────────────────────────────────────────
+
+    void PromptForName()
+    {
+        _dialogLayer = MakeDialogLayer();
+        var vbox = MakeDialogVBox(_dialogLayer);
+
+        var lbl = new Label { Text = "Choose your name" };
+        StyleDialogLabel(lbl, 24);
+        vbox.AddChild(lbl);
+
+        var edit = new LineEdit
+        {
+            Text              = OnlineGameState.PlayerName,
+            MaxLength         = MaxNameLen,
+            CustomMinimumSize = new Vector2(280, 44),
+            SizeFlagsHorizontal = SizeFlags.ShrinkCenter,
+        };
+        if (_font != null) edit.AddThemeFontOverride("font", _font);
+        edit.AddThemeFontSizeOverride("font_size", 18);
+        vbox.AddChild(edit);
+
+        var okBtn = new Button { Text = "Continue", CustomMinimumSize = new Vector2(160, 44) };
+        StyleDialogBtn(okBtn, 18);
+        okBtn.SizeFlagsHorizontal = SizeFlags.ShrinkCenter;
+        Action submit = () =>
+        {
+            string raw = edit.Text ?? "";
+            string clean = SanitizeName(raw);
+            OnlineGameState.PlayerName = clean;
+            PlayerProfile.Save();
+            _clickSfx?.Play();
+            _dialogLayer?.QueueFree();
+            _dialogLayer = null;
+            BeginConnect();
+        };
+        okBtn.Pressed += submit;
+        edit.TextSubmitted += _ => submit();
+        vbox.AddChild(okBtn);
+
+        edit.GrabFocus();
+    }
+
+    static string SanitizeName(string raw)
+    {
+        string s = (raw ?? "").Trim();
+        var sb = new System.Text.StringBuilder();
+        foreach (char c in s)
+        {
+            if (c >= 32 && c != 127) sb.Append(c);
+            if (sb.Length >= MaxNameLen) break;
+        }
+        s = sb.ToString().Trim();
+        if (string.IsNullOrEmpty(s)) s = "Player_" + (int)GD.RandRange(100, 999);
+        return s;
+    }
+
     // ── Network callbacks ──────────────────────────────────────────────────────
 
     void OnLobbyJoined(string myId)
     {
-        _statusLabel.Text = "Connected — waiting for opponents…";
+        _connectedOnce = true;
+        _connectWaitTimer?.Stop();
+        _connectFailTimer?.Stop();
+        HideConnectionFailureUI();
+        GD.Print($"[LOBBY] Joined lobby as id {myId}");
+
+        // Refresh dropdown + gold every time we (re-)enter the lobby so a maze
+        // saved during this session, or gold earned in a prior match, appears.
+        PopulateMazeDropdown();
+        _goldLabel.Text = $"Fame: {OnlineGameState.Gold}";
+
+        SetStatus("Connected — waiting for opponents…", autoClear: false);
     }
 
     void OnLobbyUpdated(string raw)
@@ -246,9 +417,10 @@ public partial class PlayGameScreen : Control
                 _playerList.AddChild(empty);
             }
 
-            _statusLabel.Text = count == 1 ? "1 player online" : $"{count} players online";
+            // Persistent — don't auto-clear since this updates with each lobby_update.
+            SetStatus(count == 1 ? "1 player online" : $"{count} players online", autoClear: false);
         }
-        catch { _statusLabel.Text = "Error loading player list"; }
+        catch { SetStatus("Error loading player list"); }
     }
 
     void AddPlayerRow(string id, string name)
@@ -287,14 +459,32 @@ public partial class PlayGameScreen : Control
     void OnChallengeBtnPressed(string targetId, string targetName)
     {
         if (_outgoingTargetId != null) return;
+        if (_incomingChallengerId != null)
+        {
+            SetStatus("Respond to the incoming challenge first.");
+            return;
+        }
         if (_mazeDropdown.Disabled || OnlineGameState.SelectedMazeSlot < 0)
         {
-            _statusLabel.Text = "Build and select a maze first!";
+            SetStatus("Build and select a maze first!");
             return;
         }
         _outgoingTargetId = targetId;
         _nm.SendChallenge(targetId);
+        GD.Print($"[LOBBY] Sent challenge to {targetName} ({targetId})");
         ShowOutgoingDialog(targetName);
+
+        _outgoingChallengeTimer?.Stop();
+        _outgoingChallengeTimer ??= NewOneShotTimer(30.0, OnOutgoingChallengeTimeout);
+        _outgoingChallengeTimer.Start(30.0);
+    }
+
+    void OnOutgoingChallengeTimeout()
+    {
+        if (_outgoingTargetId == null) return;
+        GD.Print("[LOBBY] Outgoing challenge timed out.");
+        CancelOutgoingChallenge();
+        SetStatus("Opponent didn't respond.");
     }
 
     // ── Challenge dialogs ──────────────────────────────────────────────────────
@@ -320,16 +510,25 @@ public partial class PlayGameScreen : Control
     void CancelOutgoingChallenge()
     {
         _outgoingTargetId = null;
+        _outgoingChallengeTimer?.Stop();
         _dialogLayer?.QueueFree();
         _dialogLayer = null;
     }
 
     void OnIncomingChallenge(string fromId, string fromName)
     {
+        // Re-entry guard: if a dialog is already up (incoming or outgoing), ignore.
+        if (_incomingChallengerId != null || _outgoingTargetId != null)
+        {
+            GD.Print($"[LOBBY] Ignoring incoming challenge from {fromName} — already busy.");
+            _nm.RespondChallenge(fromId, false); // auto-decline so they don't hang
+            return;
+        }
         _incomingChallengerId = fromId;
         _dialogLayer?.QueueFree();
         _dialogLayer = MakeDialogLayer();
         var vbox = MakeDialogVBox(_dialogLayer);
+        GD.Print($"[LOBBY] Incoming challenge from {fromName} ({fromId})");
 
         var lbl = new Label { Text = $"{fromName}\nwants to play!" };
         StyleDialogLabel(lbl, 26);
@@ -368,25 +567,48 @@ public partial class PlayGameScreen : Control
     void OnChallengeDeclined()
     {
         _outgoingTargetId = null;
+        _outgoingChallengeTimer?.Stop();
         _dialogLayer?.QueueFree();
         _dialogLayer = null;
-        _statusLabel.Text = "Challenge declined.";
+        SetStatus("Challenge declined.");
+    }
+
+    void OnChallengeCancelled(string fromId)
+    {
+        // The challenger left the lobby — dismiss any incoming dialog from them.
+        if (_incomingChallengerId == fromId)
+        {
+            _incomingChallengerId = null;
+            _dialogLayer?.QueueFree();
+            _dialogLayer = null;
+            SetStatus("Challenger disconnected.");
+        }
     }
 
     void OnMatchMade(bool isHost)
     {
+        if (_changingScene) return;
+        _changingScene = true;
+        _outgoingChallengeTimer?.Stop();
         _dialogLayer?.QueueFree();
         _clickSfx?.Play();
+        GD.Print($"[LOBBY] MatchMade isHost={isHost} — entering PreGameLobby");
         GetTree().ChangeSceneToFile("res://scenes/PreGameLobby.tscn");
     }
 
     void OnConnectionFailed(string reason)
     {
-        _statusLabel.Text = $"Connection failed: {reason}";
+        GD.Print($"[LOBBY] ConnectionFailed: {reason}");
+        if (!_connectedOnce)
+            ShowConnectionFailureUI($"Could not reach server ({reason}).");
+        else
+            SetStatus($"Disconnected: {reason}", autoClear: false);
     }
 
     void OnCancel()
     {
+        if (_changingScene) return;
+        _changingScene = true;
         _clickSfx?.Play();
         _nm.Disconnect();
         GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");

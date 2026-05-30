@@ -1,7 +1,8 @@
 using Godot;
 
 /// Autoload CanvasLayer — hidden by default.
-/// ESC opens/closes the pause menu in gameplay scenes.
+/// ESC opens/closes the pause menu in every scene except the title screen
+/// (the title already has its own Settings panel).
 /// Three panels swap: Main → Character Settings → Exit Confirmation.
 public partial class PauseMenu : CanvasLayer
 {
@@ -9,7 +10,12 @@ public partial class PauseMenu : CanvasLayer
     Control   _settingsPanel = null!;
     Control   _confirmPanel  = null!;
     Label     _confirmLabel  = null!;
+    Button    _exitBtn       = null!;
     FontFile? _font;
+
+    // Mouse mode at the moment Open() was called — restored on Close()
+    // so editor scenes (visible) don't get auto-captured like gameplay does.
+    Input.MouseModeEnum _prevMouseMode = Input.MouseModeEnum.Visible;
 
     public override void _Ready()
     {
@@ -55,9 +61,19 @@ public partial class PauseMenu : CanvasLayer
 
     public void Open()
     {
+        _prevMouseMode   = Input.MouseMode;
         Visible          = true;
         GetTree().Paused = true;
         Input.MouseMode  = Input.MouseModeEnum.Visible;
+
+        // In the editor scenes the "exit" action returns to the title screen, so call it
+        // "Main Menu" there. In gameplay scenes it leaves the match/playtest, so "Exit Game"
+        // matches the player's mental model.
+        var p = GetTree().CurrentScene?.SceneFilePath ?? "";
+        bool isGameplay = p.Contains("DungeonGame") || p.Contains("DungeonArena") ||
+                          p.Contains("TrainingArena");
+        _exitBtn.Text = isGameplay ? "Exit Game" : "Main Menu";
+
         ShowMain();
     }
 
@@ -65,7 +81,7 @@ public partial class PauseMenu : CanvasLayer
     {
         Visible          = false;
         GetTree().Paused = false;
-        Input.MouseMode  = Input.MouseModeEnum.Captured;
+        Input.MouseMode  = _prevMouseMode;
     }
 
     // ── Panel builders ────────────────────────────────────────────────────────
@@ -87,7 +103,8 @@ public partial class PauseMenu : CanvasLayer
         vbox.AddChild(MakeBtn("Resume",    Close));
         vbox.AddChild(MakeBtn("Settings",  ShowSettings));
         vbox.AddChild(new HSeparator());
-        vbox.AddChild(MakeBtn("Exit Game", ShowConfirm));
+        _exitBtn = MakeBtn("Exit Game", ShowConfirm);   // label refreshed per-scene on Open()
+        vbox.AddChild(_exitBtn);
 
         return root;
     }
@@ -196,10 +213,19 @@ public partial class PauseMenu : CanvasLayer
     {
         var p = GetTree().CurrentScene?.SceneFilePath ?? "";
         string editorLabel = GameState.EditorReturnScene.Contains("MazeEditor3D")
-            ? "Online Maze Editor"
-            : "Map Editor";
-        _confirmLabel.Text = p.Contains("DungeonGame")   ? $"Exit to {editorLabel}?"
-                           : p.Contains("TrainingArena") ? "Exit to Training?"
+            ? "Maze Editor"
+            : "Map Editor";   // legacy testing editor — kept but no longer in menu
+
+        // OnlineDungeonArena must be checked BEFORE the more permissive "DungeonArena"
+        // substring match, since the online scene path also contains "DungeonArena".
+        bool isOnlineMatch = p.Contains("OnlineDungeonArena");
+        bool isPlayTest    = !isOnlineMatch &&
+                             (p.Contains("DungeonGame") || p.Contains("DungeonArena"));
+        bool isTraining    = !isOnlineMatch && p.Contains("TrainingArena");
+
+        _confirmLabel.Text = isOnlineMatch  ? "Forfeit and exit match?"
+                           : isPlayTest     ? $"Exit to {editorLabel}?"
+                           : isTraining     ? "Exit to Training?"
                            : "Exit to main menu?";
 
         _mainPanel.Visible     = false;
@@ -212,9 +238,16 @@ public partial class PauseMenu : CanvasLayer
         GetTree().Paused = false;
         Visible          = false;
         var path = GetTree().CurrentScene?.SceneFilePath ?? "";
-        var dest = path.Contains("DungeonGame")    ? GameState.EditorReturnScene
-                 : path.Contains("TrainingArena")  ? "res://scenes/TrainingSetupScreen.tscn"
-                 : "res://scenes/TitleScreen.tscn";
+
+        bool isOnlineMatch = path.Contains("OnlineDungeonArena");
+        bool isPlayTest    = !isOnlineMatch &&
+                             (path.Contains("DungeonGame") || path.Contains("DungeonArena"));
+        bool isTraining    = !isOnlineMatch && path.Contains("TrainingArena");
+
+        string dest = isOnlineMatch  ? "res://scenes/PlayGameScreen.tscn"
+                    : isPlayTest     ? GameState.EditorReturnScene
+                    : isTraining     ? "res://scenes/TrainingSetupScreen.tscn"
+                                     : "res://scenes/TitleScreen.tscn";
         GetTree().ChangeSceneToFile(dest);
     }
 
@@ -225,10 +258,9 @@ public partial class PauseMenu : CanvasLayer
         var scene = GetTree().CurrentScene;
         if (scene == null) return false;
         var p = scene.SceneFilePath;
-        return p.Contains("DungeonGame")     ||
-               p.Contains("DungeonArena")    ||
-               p.Contains("OnlineDungeonArena") ||
-               p.Contains("TrainingArena");
+        // Pause menu is available in every scene EXCEPT the title screen
+        // (which already shows its own Settings panel and has nothing to "resume" from).
+        return !p.Contains("TitleScreen");
     }
 
     // Creates a full-rect CenterContainer → PanelContainer → MarginContainer.

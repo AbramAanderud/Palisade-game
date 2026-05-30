@@ -61,9 +61,8 @@ public partial class TrainingArena : Node3D
         floorBody.AddChild(floorShape);
         AddChild(floorBody);
 
-        // Spawn player above the floor with sword
+        // Spawn player above the floor — PlayerController._Ready() auto-equips the weaker sword
         _player = PlayerController.Spawn(this, new Vector3(0f, 1.5f, 0f), 0f);
-        _player.PickupWeapon();
 
         var ph = _player.GetNodeOrNull<PlayerHealth>("PlayerHealth");
         if (ph != null)
@@ -154,8 +153,16 @@ public partial class TrainingArena : Node3D
     {
         if (_deathCam != null) return;   // guard against double-fire
 
-        _player?.ReleaseMouse();
-        _player?.TriggerDeath();
+        // Stop 3D picking immediately — otherwise clicks during the 2 s death-cam
+        // pan get eaten by physics (registered as swings on bot bodies / floor).
+        GetViewport().PhysicsObjectPicking = false;
+
+        if (_player != null)
+        {
+            _player.Frozen = true;        // belt-and-suspenders with _isDead
+            _player.ReleaseMouse();
+            _player.TriggerDeath();
+        }
         Input.MouseMode = Input.MouseModeEnum.Visible;
 
         var playerPos   = _player?.GlobalPosition ?? Vector3.Zero;
@@ -174,15 +181,19 @@ public partial class TrainingArena : Node3D
     void ShowDeathButtons()
     {
         if (_overlay != null) return;
-        _overlay = new CanvasLayer();
+        _overlay = new CanvasLayer { Layer = 100 };  // sit above any other CanvasLayer
         AddChild(_overlay);
 
-        // 3D physics picking marks mouse-button events as handled before GUI sees them.
-        // Disable it so the Restart/Exit buttons receive clicks normally.
+        // Belt-and-suspenders: ShowLose already disables this, but make sure.
         GetViewport().PhysicsObjectPicking = false;
+        Input.MouseMode = Input.MouseModeEnum.Visible;
 
-        // Fade the screen to dark before showing UI
-        var fade = new ColorRect { Color = new Color(0f, 0f, 0f, 0f) };
+        // Fade the screen to dark — Ignore mouse so clicks fall through to buttons.
+        var fade = new ColorRect
+        {
+            Color       = new Color(0f, 0f, 0f, 0f),
+            MouseFilter = Control.MouseFilterEnum.Ignore,
+        };
         fade.SetAnchorsPreset(Control.LayoutPreset.FullRect);
         _overlay.AddChild(fade);
         fade.CreateTween().TweenProperty(fade, "color:a", 0.80f, 0.55f);
@@ -224,22 +235,46 @@ public partial class TrainingArena : Node3D
         kills.AddThemeColorOverride("font_color", new Color(0.85f, 0.85f, 0.85f));
         _overlay.AddChild(kills);
 
-        AddOverlayBtn("Restart", -110, 110, 25,  75,
-            () => GetTree().ChangeSceneToFile("res://scenes/TrainingArena.tscn"));
-        AddOverlayBtn("Exit",    -110, 110, 85, 135,
-            () => GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn"));
+        bool clicked = false;
+        var restartBtn = AddOverlayBtn("Restart", -150, 150, 25, 85, () =>
+        {
+            if (clicked) return;
+            clicked = true;
+            GetTree().ChangeSceneToFile("res://scenes/TrainingArena.tscn");
+        });
+        AddOverlayBtn("Exit", -150, 150, 100, 160, () =>
+        {
+            if (clicked) return;
+            clicked = true;
+            GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
+        });
+
+        // Auto-focus Restart so Enter/Space activates it (also helps if mouse fails).
+        restartBtn.GrabFocus();
     }
 
-    void AddOverlayBtn(string text, float oL, float oR, float oT, float oB, Action cb)
+    Button AddOverlayBtn(string text, float oL, float oR, float oT, float oB, Action cb)
     {
-        var btn = new Button { Text = text };
+        var btn = new Button
+        {
+            Text              = text,
+            CustomMinimumSize = new Vector2(300, 60),
+            MouseFilter       = Control.MouseFilterEnum.Stop,
+            FocusMode         = Control.FocusModeEnum.All,
+        };
         btn.AnchorLeft     = 0.5f; btn.AnchorRight  = 0.5f;
         btn.AnchorTop      = 0.5f; btn.AnchorBottom = 0.5f;
         btn.GrowHorizontal = Control.GrowDirection.Both;
         btn.GrowVertical   = Control.GrowDirection.Both;
         btn.OffsetLeft = oL; btn.OffsetRight = oR;
         btn.OffsetTop  = oT; btn.OffsetBottom = oB;
-        btn.Pressed   += cb;
+        if (_font != null) btn.AddThemeFontOverride("font", _font);
+        btn.AddThemeFontSizeOverride("font_size", 22);
+        btn.AddThemeColorOverride("font_color",         Colors.White);
+        btn.AddThemeColorOverride("font_hover_color",   new Color(1f, 0.9f, 0.5f));
+        btn.AddThemeColorOverride("font_pressed_color", new Color(0.6f, 0.6f, 0.6f));
+        btn.Pressed += cb;
         _overlay!.AddChild(btn);
+        return btn;
     }
 }

@@ -46,18 +46,26 @@ public partial class OnlineDungeonArena : Node3D
     string? _pendingMazePayload;
 
     // ── Game-end state ────────────────────────────────────────────────────────
-    bool   _gameEnded    = false;
-    bool   _swordPickedUp = false;
-    bool   _localHasSword = false;
-    int    _matchGold    = 0;
+    bool   _gameEnded      = false;
+    bool   _localPlayerDead = false;
+    bool   _swordPickedUp  = false;
+    bool   _localHasSword  = false;
+    int    _matchGold      = 0;
     Timer? _combatTimer;
     Label? _combatTimerLabel;
+
+    // ── Client maze handshake ─────────────────────────────────────────────────
+    Timer? _clientMazeRetryTimer;   // re-sends ready_for_maze every 2 s on client
+    int    _clientMazeRetries = 0;  // gives up at 15 retries (~30 s)
+
+    bool _softLightToastShown = false;
 
     // ── Ready ─────────────────────────────────────────────────────────────────
     public override void _Ready()
     {
         _nm = GetNode<NetworkManager>("/root/NetworkManager");
         _nm.PeerDisconnected += OnPeerDisconnected;
+        _nm.GameDataReceived += OnGameData;
         _font = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
 
         BuildEnvironment();
@@ -90,6 +98,8 @@ public partial class OnlineDungeonArena : Node3D
     {
         _nm.PeerDisconnected -= OnPeerDisconnected;
         _nm.GameDataReceived -= OnGameData;
+        // Safety net: never leave the cursor captured when the arena unloads.
+        Input.MouseMode = Input.MouseModeEnum.Visible;
     }
 
     public override void _Process(double delta)
@@ -146,15 +156,15 @@ public partial class OnlineDungeonArena : Node3D
 
         _localPlayer.MakeActive();
         WireHitRelay();
+        ShowToast("Find the sword.", 4.0, new Color(1f, 0.9f, 0.6f));
 
-        _nm.GameDataReceived += OnGameData;
-
+        // Serialize maze BEFORE sending so a late ready_for_maze always finds a payload.
         string mazeJson = JsonSerializer.Serialize(data);
         string escaped  = JsonSerializer.Serialize(mazeJson);
         _pendingMazePayload = $"{{\"t\":\"maze\",\"json\":{escaped}}}";
         _nm.SendGameData(_pendingMazePayload);
 
-        GD.Print($"[OnlineDungeonArena] Host ready — slot {slot}");
+        GD.Print($"[ARENA] Host ready — slot {slot}, maze payload {_pendingMazePayload.Length} chars");
     }
 
     // ── Client ────────────────────────────────────────────────────────────────
@@ -181,10 +191,41 @@ public partial class OnlineDungeonArena : Node3D
 
         AddChild(_loadingCanvas);
 
-        _nm.GameDataReceived += OnGameData;
         _nm.SendGameData("{\"t\":\"ready_for_maze\"}");
 
-        GD.Print("[OnlineDungeonArena] Client waiting for maze…");
+        // Retry every 2 s in case the first request or the maze response was dropped.
+        _clientMazeRetryTimer = new Timer { WaitTime = 2.0, Autostart = true, Name = "MazeRetry" };
+        _clientMazeRetryTimer.Timeout += OnClientMazeRetry;
+        AddChild(_clientMazeRetryTimer);
+
+        GD.Print("[ARENA] Client waiting for maze…");
+    }
+
+    void OnClientMazeRetry()
+    {
+        if (_localPlayer != null) return;       // already received and built
+        _clientMazeRetries++;
+        if (_clientMazeRetries > 15)            // ~30 s
+        {
+            GD.PushError("[ARENA] Client: gave up waiting for maze after 30 s");
+            _clientMazeRetryTimer?.Stop();
+            if (_loadingCanvas != null)
+            {
+                foreach (var child in _loadingCanvas.GetChildren())
+                    if (child is Label l) l.Text = "Could not receive maze from host.\nReturning to lobby…";
+            }
+            GetTree().CreateTimer(3.0).Timeout += () =>
+            {
+                if (IsInstanceValid(this))
+                {
+                    _nm.Disconnect();
+                    GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
+                }
+            };
+            return;
+        }
+        GD.Print($"[ARENA] Client re-requesting maze (attempt {_clientMazeRetries})");
+        _nm.SendGameData("{\"t\":\"ready_for_maze\"}");
     }
 
     void FinishClientSetup(MazeData hostMaze)
@@ -212,8 +253,53 @@ public partial class OnlineDungeonArena : Node3D
 
         _localPlayer.MakeActive();
         WireHitRelay();
+        ShowToast("Find the sword.", 4.0, new Color(1f, 0.9f, 0.6f));
 
-        GD.Print("[OnlineDungeonArena] Client arena built and spawned.");
+        GD.Print("[ARENA] Client arena built and spawned.");
+    }
+
+    /// Center-screen toast: fades in 0.3 s, holds `hold` seconds, fades out 0.7 s.
+    void ShowToast(string text, double hold = 4.0, Color? color = null)
+    {
+        var canvas = new CanvasLayer { Name = "Toast" };
+        AddChild(canvas);
+
+        var label = new Label
+        {
+            Text                = text,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment   = VerticalAlignment.Center,
+            AnchorLeft          = 0f,   AnchorRight  = 1f,
+            AnchorTop           = 0.5f, AnchorBottom = 0.5f,
+            GrowHorizontal      = Control.GrowDirection.Both,
+            GrowVertical        = Control.GrowDirection.Both,
+            Modulate            = new Color(1, 1, 1, 0),
+        };
+        label.OffsetTop    = -40;
+        label.OffsetBottom =  40;
+        if (_font != null) label.AddThemeFontOverride("font", _font);
+        label.AddThemeFontSizeOverride("font_size", 46);
+        label.AddThemeColorOverride("font_color",         color ?? Colors.White);
+        label.AddThemeColorOverride("font_outline_color", new Color(0f, 0f, 0f, 0.85f));
+        label.AddThemeConstantOverride("outline_size", 6);
+        canvas.AddChild(label);
+
+        var tw = CreateTween();
+        tw.TweenProperty(label, "modulate:a", 1f, 0.3);
+        tw.TweenInterval(hold);
+        tw.TweenProperty(label, "modulate:a", 0f, 0.7);
+        tw.TweenCallback(Callable.From(() =>
+        {
+            if (IsInstanceValid(canvas)) canvas.QueueFree();
+        }));
+    }
+
+    void OnSoftLightTriggered()
+    {
+        if (_softLightToastShown || _gameEnded) return;
+        _softLightToastShown = true;
+        ShowToast("The soft light guides you.", 4.0, new Color(0.55f, 0.75f, 1f));
+        GD.Print("[ARENA] Soft light toast shown.");
     }
 
     // ── Geometry ──────────────────────────────────────────────────────────────
@@ -260,6 +346,11 @@ public partial class OnlineDungeonArena : Node3D
         AddChild(torchB);
         torchB.Init(dataFlipped, builderB);
 
+        // Both mazes use the same TriggerDelay (20 s) so subscribing to either is fine.
+        // Listen on the maze the local player actually plays in.
+        var localTorch = OnlineGameState.IsHost ? torchA : torchB;
+        localTorch.FirstCellLit += OnSoftLightTriggered;
+
         var arena = new ArenaBuilder { Name = "Arena" };
         AddChild(arena);
         arena.Build(new Vector3(_exitAX, 0f, ArenaCentreZ), openNorth: true, openSouth: true);
@@ -289,8 +380,10 @@ public partial class OnlineDungeonArena : Node3D
     {
         if (_localPlayer == null || !_nm.IsOpen) return;
         var pos = _localPlayer.GlobalPosition;
+        var vel = _localPlayer.Velocity;
         _nm.SendGameData(
             $"{{\"t\":\"pos\",\"x\":{pos.X:F3},\"y\":{pos.Y:F3},\"z\":{pos.Z:F3}," +
+            $"\"vx\":{vel.X:F2},\"vy\":{vel.Y:F2},\"vz\":{vel.Z:F2}," +
             $"\"yaw\":{_localPlayer.Yaw:F4},\"pitch\":{_localPlayer.Pitch:F4}," +
             $"\"stam\":{_localPlayer.PlayerStamina:F1}}}");
     }
@@ -316,11 +409,13 @@ public partial class OnlineDungeonArena : Node3D
                     {
                         string mazeJson = root.GetProperty("json").GetString()!;
                         var data = JsonSerializer.Deserialize<MazeData>(mazeJson)!;
+                        _clientMazeRetryTimer?.Stop();
+                        GD.Print($"[ARENA] Client received maze ({mazeJson.Length} chars), building.");
                         FinishClientSetup(data);
                     }
                     catch (Exception ex)
                     {
-                        GD.PushError($"[OnlineDungeonArena] Client: bad maze JSON — {ex.Message}");
+                        GD.PushError($"[ARENA] Client: bad maze JSON — {ex.Message}");
                     }
                 }
                 break;
@@ -328,11 +423,18 @@ public partial class OnlineDungeonArena : Node3D
             case "pos":
                 if (_puppet != null)
                 {
+                    Vector3 ppos = new(
+                        root.GetProperty("x").GetSingle(),
+                        root.GetProperty("y").GetSingle(),
+                        root.GetProperty("z").GetSingle());
+                    Vector3 pvel = Vector3.Zero;
+                    if (root.TryGetProperty("vx", out var vx))
+                        pvel = new Vector3(
+                            vx.GetSingle(),
+                            root.GetProperty("vy").GetSingle(),
+                            root.GetProperty("vz").GetSingle());
                     _puppet.SetPuppetTarget(
-                        new Vector3(
-                            root.GetProperty("x").GetSingle(),
-                            root.GetProperty("y").GetSingle(),
-                            root.GetProperty("z").GetSingle()),
+                        ppos, pvel,
                         root.GetProperty("yaw").GetSingle(),
                         root.GetProperty("pitch").GetSingle());
                     if (root.TryGetProperty("stam", out var sp))
@@ -341,14 +443,17 @@ public partial class OnlineDungeonArena : Node3D
                 break;
 
             case "hit":
-                _localPlayer?.GetNodeOrNull<PlayerHealth>("PlayerHealth")
-                             ?.TakeDamage(root.GetProperty("dmg").GetSingle(), Vector3.Zero);
+                if (_localPlayer != null && !_gameEnded && !_localPlayerDead)
+                {
+                    var hp = _localPlayer.GetNodeOrNull<PlayerHealth>("PlayerHealth");
+                    hp?.TakeDamage(root.GetProperty("dmg").GetSingle(), Vector3.Zero);
+                }
                 break;
 
             case "ready_for_maze":
                 if (OnlineGameState.IsHost && _pendingMazePayload != null)
                 {
-                    GD.Print("[OnlineDungeonArena] Host: client ready, re-sending maze.");
+                    GD.Print("[ARENA] Host: re-sending maze on client request.");
                     _nm.SendGameData(_pendingMazePayload);
                 }
                 break;
@@ -358,7 +463,9 @@ public partial class OnlineDungeonArena : Node3D
                 {
                     _swordPickedUp = true;
                     _localHasSword = false;
+                    ShowToast("You are hunted.", 4.0, new Color(1f, 0.4f, 0.3f));
                     StartCombatTimer(peerHasSword: true);
+                    GD.Print("[ARENA] Sword taken by opponent.");
                 }
                 break;
 
@@ -369,7 +476,7 @@ public partial class OnlineDungeonArena : Node3D
             case "die":
                 if (!_gameEnded)
                 {
-                    _matchGold += 100; // I killed the opponent
+                    _matchGold += 200; // I killed the opponent
                     EndMatch("Victory!");
                 }
                 break;
@@ -379,35 +486,15 @@ public partial class OnlineDungeonArena : Node3D
     void OnPeerDisconnected()
     {
         if (_gameEnded) return;
-        _localPlayer?.ReleaseMouse();
-
-        var canvas = new CanvasLayer();
-        AddChild(canvas);
-        var lbl = new Label
-        {
-            Text                = "Opponent disconnected. Returning to lobby…",
-            AnchorLeft          = 0.5f, AnchorRight = 0.5f,
-            AnchorTop           = 0.1f, AnchorBottom = 0.1f,
-            GrowHorizontal      = Control.GrowDirection.Both,
-            HorizontalAlignment = HorizontalAlignment.Center,
-        };
-        lbl.OffsetLeft = -300; lbl.OffsetRight = 300;
-        if (_font != null) lbl.AddThemeFontOverride("font", _font);
-        lbl.AddThemeFontSizeOverride("font_size", 20);
-        lbl.AddThemeColorOverride("font_color", new Color(1f, 0.4f, 0.4f));
-        canvas.AddChild(lbl);
-
         _gameEnded = true;
+        _combatTimer?.Stop();
+        FreezePlayers();
         _nm.Disconnect();
-
-        var t = new Timer { WaitTime = 3.0, OneShot = true };
-        t.Timeout += () =>
-        {
-            if (IsInstanceValid(this))
-                GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
-        };
-        AddChild(t);
-        t.Start();
+        // Whatever gold they earned up to this point still counts.
+        OnlineGameState.Gold += _matchGold;
+        PlayerProfile.Save();
+        GD.Print($"[ARENA] Peer disconnected (+{_matchGold} gold)");
+        ShowEndOverlay("Opponent left.");
     }
 
     // ── Game-end logic ────────────────────────────────────────────────────────
@@ -419,7 +506,9 @@ public partial class OnlineDungeonArena : Node3D
         _localHasSword = true;
         _matchGold    += 100; // sword pickup gold
         _nm.SendGameData("{\"t\":\"sword_taken\"}");
+        ShowToast("Sword claimed.", 4.0, new Color(0.3f, 1f, 0.5f));
         StartCombatTimer(peerHasSword: false);
+        GD.Print("[ARENA] Local sword pickup — combat timer started.");
     }
 
     void StartCombatTimer(bool peerHasSword)
@@ -436,7 +525,7 @@ public partial class OnlineDungeonArena : Node3D
         var canvas = new CanvasLayer { Name = "CombatHud" };
         AddChild(canvas);
 
-        // Countdown label centred at top
+        // Countdown label centred at top — the sword toast is handled separately by ShowToast.
         _combatTimerLabel = new Label
         {
             HorizontalAlignment = HorizontalAlignment.Center,
@@ -451,35 +540,14 @@ public partial class OnlineDungeonArena : Node3D
         _combatTimerLabel.AddThemeFontSizeOverride("font_size", 34);
         _combatTimerLabel.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.2f));
         canvas.AddChild(_combatTimerLabel);
-
-        // Brief sword notification
-        string note = peerHasSword ? "OPPONENT TOOK THE SWORD!" : "SWORD TAKEN! FIGHT!";
-        var notif = new Label
-        {
-            Text                = note,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            AnchorLeft          = 0.5f, AnchorRight  = 0.5f,
-            AnchorTop           = 0.10f,
-            GrowHorizontal      = Control.GrowDirection.Both,
-        };
-        notif.OffsetLeft  = -260f;
-        notif.OffsetRight =  260f;
-        if (_font != null) notif.AddThemeFontOverride("font", _font);
-        notif.AddThemeFontSizeOverride("font_size", 26);
-        notif.AddThemeColorOverride("font_color",
-            peerHasSword ? new Color(1f, 0.4f, 0.3f) : new Color(0.3f, 1f, 0.5f));
-        canvas.AddChild(notif);
-
-        GetTree().CreateTimer(3.0).Timeout += () =>
-        {
-            if (IsInstanceValid(notif)) notif.Visible = false;
-        };
     }
 
     void OnLocalPlayerDied()
     {
-        if (_gameEnded) return;
+        if (_gameEnded || _localPlayerDead) return;
+        _localPlayerDead = true;
         _nm.SendGameData("{\"t\":\"die\"}");
+        GD.Print("[ARENA] Local player died.");
         EndMatch("Defeated!");
     }
 
@@ -496,12 +564,24 @@ public partial class OnlineDungeonArena : Node3D
         if (_gameEnded) return;
         _gameEnded = true;
         _combatTimer?.Stop();
-        _localPlayer?.ReleaseMouse();
+        FreezePlayers();
         _nm.GameDataReceived -= OnGameData;
         _nm.Disconnect();
         OnlineGameState.Gold += _matchGold;
         PlayerProfile.Save();
+        GD.Print($"[ARENA] EndMatch: {result} (+{_matchGold} gold, total {OnlineGameState.Gold})");
         ShowEndOverlay(result);
+    }
+
+    void FreezePlayers()
+    {
+        if (_localPlayer != null && IsInstanceValid(_localPlayer))
+        {
+            _localPlayer.Frozen = true;
+            _localPlayer.ReleaseMouse();
+        }
+        if (_puppet != null && IsInstanceValid(_puppet))
+            _puppet.Frozen = true;
     }
 
     void ShowEndOverlay(string result)
@@ -525,10 +605,14 @@ public partial class OnlineDungeonArena : Node3D
 
         Color resultColor = result switch
         {
-            "Defeated!"  => new Color(1f, 0.3f, 0.3f),
-            "Victory!"   => new Color(0.3f, 1f, 0.5f),
-            _            => new Color(1f, 0.9f, 0.3f),
+            "Defeated!"     => new Color(1f, 0.3f, 0.3f),
+            "Victory!"      => new Color(0.3f, 1f, 0.5f),
+            "Opponent left." => new Color(0.85f, 0.85f, 0.85f),
+            _               => new Color(1f, 0.9f, 0.3f),
         };
+
+        // Make sure cursor stays usable while the overlay is up.
+        Input.MouseMode = Input.MouseModeEnum.Visible;
 
         var resultLbl = new Label
         {
@@ -540,19 +624,19 @@ public partial class OnlineDungeonArena : Node3D
         resultLbl.AddThemeColorOverride("font_color", resultColor);
         vbox.AddChild(resultLbl);
 
-        var goldLbl = new Label
+        var gainedLbl = new Label
         {
-            Text                = $"+{_matchGold} gold",
+            Text                = $"+{_matchGold} fame",
             HorizontalAlignment = HorizontalAlignment.Center,
         };
-        if (_font != null) goldLbl.AddThemeFontOverride("font", _font);
-        goldLbl.AddThemeFontSizeOverride("font_size", 30);
-        goldLbl.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.3f));
-        vbox.AddChild(goldLbl);
+        if (_font != null) gainedLbl.AddThemeFontOverride("font", _font);
+        gainedLbl.AddThemeFontSizeOverride("font_size", 30);
+        gainedLbl.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.3f));
+        vbox.AddChild(gainedLbl);
 
         var totalLbl = new Label
         {
-            Text                = $"Total: {OnlineGameState.Gold} gold",
+            Text                = $"Total fame: {OnlineGameState.Gold}",
             HorizontalAlignment = HorizontalAlignment.Center,
         };
         if (_font != null) totalLbl.AddThemeFontOverride("font", _font);
@@ -560,26 +644,22 @@ public partial class OnlineDungeonArena : Node3D
         totalLbl.AddThemeColorOverride("font_color", new Color(0.8f, 0.8f, 0.5f));
         vbox.AddChild(totalLbl);
 
-        var lobbyBtn = new Button
+        var exitBtn = new Button
         {
-            Text                = "Return to Lobby",
-            CustomMinimumSize   = new Vector2(220, 56),
+            Text                = "Exit to Menu",
+            CustomMinimumSize   = new Vector2(240, 56),
             SizeFlagsHorizontal = Control.SizeFlags.ShrinkCenter,
         };
-        if (_font != null) lobbyBtn.AddThemeFontOverride("font", _font);
-        lobbyBtn.AddThemeFontSizeOverride("font_size", 20);
-        lobbyBtn.Pressed += () =>
+        if (_font != null) exitBtn.AddThemeFontOverride("font", _font);
+        exitBtn.AddThemeFontSizeOverride("font_size", 20);
+        bool clicked = false;
+        exitBtn.Pressed += () =>
         {
+            if (clicked) return;
+            clicked = true;
             if (IsInstanceValid(this))
-                GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
+                GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
         };
-        vbox.AddChild(lobbyBtn);
-
-        // Auto-return after 8 seconds
-        GetTree().CreateTimer(8.0).Timeout += () =>
-        {
-            if (IsInstanceValid(this))
-                GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
-        };
+        vbox.AddChild(exitBtn);
     }
 }

@@ -112,7 +112,17 @@ wss.on('connection', ws => {
     // Clean up lobby membership
     if (lobby.has(ws._id)) {
       lobby.delete(ws._id);
-      // Notify any challenger whose target just left
+
+      // If this player was challenging someone, notify the target so their
+      // incoming-challenge dialog can dismiss cleanly.
+      if (pendingChallenges.has(ws._id)) {
+        const targetId = pendingChallenges.get(ws._id);
+        const target   = lobby.get(targetId);
+        if (target) send(target.ws, { type: 'challenge_cancelled', fromId: ws._id });
+        pendingChallenges.delete(ws._id);
+      }
+
+      // If this player was the target of a pending challenge, tell the challenger.
       for (const [cId, tId] of pendingChallenges) {
         if (tId === ws._id) {
           const challenger = lobby.get(cId);
@@ -120,7 +130,6 @@ wss.on('connection', ws => {
           pendingChallenges.delete(cId);
         }
       }
-      pendingChallenges.delete(ws._id);
       broadcastLobbyUpdate();
     }
 

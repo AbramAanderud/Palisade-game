@@ -18,9 +18,32 @@ using System.Text.Json;
 public partial class NetworkManager : Node
 {
     // ── Relay URL ─────────────────────────────────────────────────────────────
-    // Local testing:  "ws://localhost:3000"
-    // Production:     paste your Render URL here, e.g. "wss://palisade-game.onrender.com"
-    public const string RelayUrl = "wss://PASTE_YOUR_RENDER_URL_HERE";
+    // Debug build (running from editor) → localhost relay.
+    // Release build (exported .exe)     → Render production URL.
+    // CLI overrides:
+    //   --local              → ws://localhost:3000
+    //   --relay <url>        → arbitrary URL
+    // Update ProdRelayUrl after you deploy the relay to Render.
+    const string LocalRelayUrl = "ws://localhost:3000";
+    const string ProdRelayUrl  = "wss://palisade-relay.onrender.com";
+
+    static string? _cachedRelayUrl;
+    public static string RelayUrl
+    {
+        get
+        {
+            if (_cachedRelayUrl != null) return _cachedRelayUrl;
+
+            var args = OS.GetCmdlineArgs();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--local")                              { _cachedRelayUrl = LocalRelayUrl; return _cachedRelayUrl; }
+                if (args[i] == "--relay" && i + 1 < args.Length)       { _cachedRelayUrl = args[i + 1];  return _cachedRelayUrl; }
+            }
+            _cachedRelayUrl = OS.IsDebugBuild() ? LocalRelayUrl : ProdRelayUrl;
+            return _cachedRelayUrl;
+        }
+    }
 
     // ── Signals ───────────────────────────────────────────────────────────────
     [Signal] public delegate void RoomCreatedEventHandler(string code);
@@ -35,6 +58,7 @@ public partial class NetworkManager : Node
     [Signal] public delegate void LobbyUpdatedEventHandler(string playersJson);
     [Signal] public delegate void IncomingChallengeEventHandler(string fromId, string fromName);
     [Signal] public delegate void ChallengeDeclinedEventHandler();
+    [Signal] public delegate void ChallengeCancelledEventHandler(string fromId);
     [Signal] public delegate void MatchMadeEventHandler(bool isHost);
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -64,7 +88,15 @@ public partial class NetworkManager : Node
     public void SendGameData(string json)
     {
         if (_ws.GetReadyState() == WebSocketPeer.State.Open)
+        {
+            // Suppress 20 Hz position spam; log everything else (truncate maze).
+            if (!json.StartsWith("{\"t\":\"pos\""))
+            {
+                string snippet = json.Length > 100 ? json.Substring(0, 100) + "…" : json;
+                GD.Print($"[NET] send: {snippet}");
+            }
             _ws.SendText(json);
+        }
     }
 
     /// Close the WebSocket and reset state.
@@ -115,6 +147,7 @@ public partial class NetworkManager : Node
         if (!_wasOpen && _ws.GetReadyState() == WebSocketPeer.State.Open)
         {
             _wasOpen = true;
+            GD.Print("[NET] Socket open.");
             _pendingAction?.Invoke();
             _pendingAction = null;
         }
@@ -123,6 +156,7 @@ public partial class NetworkManager : Node
         if (_wasOpen && _ws.GetReadyState() == WebSocketPeer.State.Closed)
         {
             _wasOpen = false;
+            GD.Print("[NET] Socket closed unexpectedly.");
             EmitSignal(SignalName.ConnectionFailed, "disconnected");
             return;
         }
@@ -130,6 +164,7 @@ public partial class NetworkManager : Node
         // Also detect failure to open at all
         if (!_wasOpen && _ws.GetReadyState() == WebSocketPeer.State.Closing)
         {
+            GD.Print("[NET] Socket closing without opening — connect timeout.");
             EmitSignal(SignalName.ConnectionFailed, "timeout");
             return;
         }
@@ -149,9 +184,19 @@ public partial class NetworkManager : Node
     {
         // Close any existing connection first
         if (_ws.GetReadyState() != WebSocketPeer.State.Closed)
+        {
             _ws.Close();
+            // Don't carry stale _pendingAction onto the new socket — the caller
+            // that triggered this reconnect sets a fresh one below.
+        }
         _wasOpen = false;
 
+        // Mazes can serialize to 50–150 KB; default 64 KB inbound buffer will silently drop them.
+        _ws.InboundBufferSize  = 262144; // 256 KB
+        _ws.OutboundBufferSize = 262144;
+        _ws.MaxQueuedPackets   = 64;
+
+        GD.Print($"[NET] Connecting to {RelayUrl}");
         var err = _ws.ConnectToUrl(RelayUrl);
         if (err != Error.Ok)
         {
@@ -168,7 +213,14 @@ public partial class NetworkManager : Node
             using var doc = JsonDocument.Parse(raw);
             root = doc.RootElement.Clone();
         }
-        catch { return; }
+        catch { GD.PushWarning($"[NET] dropped malformed message ({raw.Length} bytes)"); return; }
+
+        // Suppress 20 Hz position chatter from logs; print everything else.
+        if (!raw.StartsWith("{\"t\":\"pos\""))
+        {
+            string snippet = raw.Length > 100 ? raw.Substring(0, 100) + "…" : raw;
+            GD.Print($"[NET] recv: {snippet}");
+        }
 
         // Messages without "type" are game data forwarded verbatim from the peer
         if (!root.TryGetProperty("type", out var typeProp))
@@ -222,6 +274,11 @@ public partial class NetworkManager : Node
             case "challenge_declined":
             case "challenge_failed":
                 EmitSignal(SignalName.ChallengeDeclined);
+                break;
+
+            case "challenge_cancelled":
+                EmitSignal(SignalName.ChallengeCancelled,
+                    root.TryGetProperty("fromId", out var fId) ? fId.GetString() ?? "" : "");
                 break;
 
             case "match_made":

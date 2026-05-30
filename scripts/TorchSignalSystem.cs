@@ -18,6 +18,9 @@ public partial class TorchSignalSystem : Node
     public float TriggerDelay = 20f;   // seconds before the first cell lights
     public float WaveInterval = 5.0f;  // seconds between consecutive cells on the path
 
+    /// Fires once, when the first cell of the path lights up.
+    public event System.Action? FirstCellLit;
+
     List<MazePiece> _path = new();
     Dictionary<(int, int, int), OmniLight3D> _torches = new();
     int   _nextIdx   = 0;
@@ -54,6 +57,7 @@ public partial class TorchSignalSystem : Node
             _triggered = true;
             _elapsed   = 0f;
             LightNextCell();
+            FirstCellLit?.Invoke();
             return;
         }
 

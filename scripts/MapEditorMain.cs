@@ -986,7 +986,11 @@ public partial class MapEditorMain : Node2D
             {
                 case Key.R:      OnRotate(); return;
                 case Key.V:      TogglePreview3D(); return;
-                case Key.Escape: Deselect(); return;
+                case Key.Escape:
+                    // Only consume Escape if we actually have something selected to deselect;
+                    // otherwise let PauseMenu open.
+                    if (_picked != null) { Deselect(); return; }
+                    break;
                 case Key.Delete: DeleteSelected(); return;
                 case Key.F11:
                     var mode = DisplayServer.WindowGetMode();
