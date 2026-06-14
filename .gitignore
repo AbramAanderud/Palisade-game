@@ -13,3 +13,6 @@ obj/
 
 # Local Obsidian AI transcript exports
 AI Chats/
+
+# Oversized GLB (exceeds GitHub 100MB limit) — keep on disk, out of git
+assets/all_dmc2_swords_remade.glb
