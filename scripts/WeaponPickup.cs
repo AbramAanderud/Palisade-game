@@ -8,9 +8,12 @@ using System;
 /// as a static prop, and the player gains middle-sword stats (full damage + lifesteal).
 public partial class WeaponPickup : Node3D
 {
-    const string SwordGlbPath = "res://assets/all_dmc2_swords_remade.glb";
-    const string ArenaMesh    = "plane_003_vendetta";   // the gothic skull-motif claymore
-    const float  MiddleScale  = 1.8f;   // visually bigger than the weaker sword
+    // Zweihander GLB is a dedicated two-handed greatsword asset — bigger and more distinct
+    // than anything in all_dmc2_swords_remade.glb. Falls back to the vendetta mesh if missing.
+    const string ZweihanderPath = "res://assets/zweihander.glb";
+    const string FallbackPath   = "res://assets/all_dmc2_swords_remade.glb";
+    const string FallbackMesh   = "plane_003_vendetta";
+    const float  MiddleScale    = 2.2f;   // zweihander is larger — scale up relative to starter
 
     float   _spin    = 0f;
     float   _bob     = 0f;
@@ -92,18 +95,38 @@ public partial class WeaponPickup : Node3D
 
     bool TryLoadSwordMesh()
     {
-        var packed = GD.Load<PackedScene>(SwordGlbPath);
-        if (packed == null) return false;
-        var tempRoot = packed.Instantiate<Node3D>();
-        var src = FindFirst<MeshInstance3D>(tempRoot, ArenaMesh)
-               ?? FindFirst<MeshInstance3D>(tempRoot);
-        if (src == null) { tempRoot.Free(); return false; }
+        // Try the dedicated zweihander GLB first; fall back to the vendetta mesh
+        MeshInstance3D? src      = null;
+        Node3D?         tempRoot = null;
+        bool            isZwei   = false;
 
+        var zweiPacked = GD.Load<PackedScene>(ZweihanderPath);
+        if (zweiPacked != null)
+        {
+            tempRoot = zweiPacked.Instantiate<Node3D>();
+            src      = FindFirst<MeshInstance3D>(tempRoot);
+            isZwei   = src != null;
+        }
+
+        if (src == null)
+        {
+            tempRoot?.Free();
+            var fallback = GD.Load<PackedScene>(FallbackPath);
+            if (fallback == null) return false;
+            tempRoot = fallback.Instantiate<Node3D>();
+            src = FindFirst<MeshInstance3D>(tempRoot, FallbackMesh)
+               ?? FindFirst<MeshInstance3D>(tempRoot);
+        }
+
+        if (src == null) { tempRoot?.Free(); return false; }
+
+        // Zweihander blade runs along X → roll +90° Z to stand upright (X→Y).
+        // DMC swords run along Z → pitch +90° X to stand upright (Z→Y).
         var inst = new MeshInstance3D
         {
             Name            = "SwordMesh",
             Mesh            = src.Mesh,
-            RotationDegrees = new(90f, 0f, 0f),
+            RotationDegrees = isZwei ? new(0f, 0f, 90f) : new(90f, 0f, 0f),
             Position        = new(0f, 0.5f, 0f),
         };
         // Scale to MiddleScale relative to its longest axis (~1.8m)
@@ -123,7 +146,7 @@ public partial class WeaponPickup : Node3D
         };
         inst.MaterialOverride = mat;
 
-        tempRoot.Free();
+        tempRoot?.Free();
         AddChild(inst);
         return true;
     }

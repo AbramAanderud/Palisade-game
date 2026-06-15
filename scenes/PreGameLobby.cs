@@ -20,6 +20,10 @@ public partial class PreGameLobby : Control
     bool _localReady   = false;
     bool _remoteReady  = false;
     bool _gameStarting = false;
+    bool _returning    = false;
+
+    Timer? _readyTimeoutTimer;
+    const double ReadyTimeoutSeconds = 60.0;
 
     const float BtnH = 52f;
 
@@ -50,6 +54,12 @@ public partial class PreGameLobby : Control
         _nm.SendGameData($"{{\"t\":\"intro\",\"name\":{safeName}}}");
         if (OnlineGameState.SelectedMazeSlot >= 0)
             _nm.SendGameData($"{{\"t\":\"maze\",\"slot\":{OnlineGameState.SelectedMazeSlot}}}");
+
+        // 60 s timeout — if both players don't ready up by then, bail back to lobby.
+        _readyTimeoutTimer = new Timer { WaitTime = ReadyTimeoutSeconds, OneShot = true };
+        _readyTimeoutTimer.Timeout += OnReadyTimeout;
+        AddChild(_readyTimeoutTimer);
+        _readyTimeoutTimer.Start();
     }
 
     public override void _ExitTree()
@@ -237,11 +247,35 @@ public partial class PreGameLobby : Control
     {
         if (!_localReady || !_remoteReady || _gameStarting) return;
         _gameStarting     = true;
+        _readyTimeoutTimer?.Stop();
         _statusLabel.Text = "Starting…";
         if (OnlineGameState.IsHost)
             _nm.SendGameData("{\"t\":\"start\"}");
         GetTree().CreateTimer(0.6).Timeout += () =>
             GetTree().ChangeSceneToFile("res://scenes/OnlineDungeonArena.tscn");
+    }
+
+    void OnReadyTimeout()
+    {
+        if (_gameStarting || _returning) return;
+        GD.Print("[LOBBY] Ready timeout — both players didn't ready in 60 s.");
+        ReturnToFindMatch("Took too long to start. Returning to lobby…");
+    }
+
+    void ReturnToFindMatch(string message)
+    {
+        if (_returning) return;
+        _returning = true;
+        _readyTimeoutTimer?.Stop();
+        _readyBtn.Disabled = true;
+        _mazeDropdown.Disabled = true;
+        _statusLabel.Text = message;
+        GetTree().CreateTimer(2.0).Timeout += () =>
+        {
+            if (!IsInstanceValid(this)) return;
+            _nm.Disconnect();
+            GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
+        };
     }
 
     // ── Network ───────────────────────────────────────────────────────────────
@@ -301,8 +335,7 @@ public partial class PreGameLobby : Control
 
     void OnDisconnected()
     {
-        _statusLabel.Text  = "Opponent disconnected.";
-        _readyBtn.Disabled = true;
+        ReturnToFindMatch("Opponent disconnected. Returning to lobby…");
     }
 
     void OnLeave()

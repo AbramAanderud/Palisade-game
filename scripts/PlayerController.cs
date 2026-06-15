@@ -1152,6 +1152,7 @@ public partial class PlayerController : CharacterBody3D
         _combat.DamageMultiplier = 1.0f;
         _combat.Lifesteal        = 0.10f;
         _aerialLungePow          = 1.0f;
+        SwapHeldSwordMesh(ZweihanderPath);
         TriggerOpponentWallhack();
     }
 
@@ -1226,8 +1227,9 @@ public partial class PlayerController : CharacterBody3D
     // animations, so no retargeting mismatch (armored_guard had rest-pose orientation issues).
     const string ModelPath    = "res://playerModels/animations/Universal Animation Library[Standard]/Unreal-Godot/UAL1_Standard.glb";
     const string FpArmsPath   = "res://playerModels/UAL1_FpArms.glb";
-    const string SwordGlbPath = "res://assets/all_dmc2_swords_remade.glb";
-    const string ArenaSword   = "plane_001_merciless";   // starting (weaker) sword
+    const string SwordGlbPath    = "res://assets/all_dmc2_swords_remade.glb";
+    const string ArenaSword      = "plane_001_merciless";   // starting (weaker) sword
+    const string ZweihanderPath  = "res://assets/zweihander.glb";  // middle sword
     const float  ModelScale   = 1.0f;
     const float  ModelYOff    = -0.9f;
 
@@ -1404,6 +1406,55 @@ public partial class PlayerController : CharacterBody3D
         m.SetSurfaceOverrideMaterial(0,
             new StandardMaterial3D { AlbedoColor = new(0.6f, 0.6f, 0.65f), Metallic = 0.9f, Roughness = 0.25f });
         return m;
+    }
+
+    // Swap both the FP inner mesh and the TP bone-attached mesh to a new GLB.
+    // Called by EquipMiddleSword() to make the held sword visually change on pickup.
+    void SwapHeldSwordMesh(string glbPath)
+    {
+        // Extract just the Mesh resource from the GLB (first MeshInstance3D found)
+        Mesh? newMesh = null;
+        var packed = GD.Load<PackedScene>(glbPath);
+        if (packed != null)
+        {
+            var tempRoot = packed.Instantiate<Node3D>();
+            var src      = FindFirst<MeshInstance3D>(tempRoot);
+            newMesh      = src?.Mesh;
+            tempRoot.Free();
+        }
+        if (newMesh == null)
+        {
+            GD.PrintErr($"[Player] SwapHeldSwordMesh: no mesh found in {glbPath}");
+            return;
+        }
+
+        // Zweihander blade runs along X; rotate 90° Y so it faces forward (-Z).
+        // Starter/DMC swords run along Z; existing 180° Y flip was correct for those.
+        bool isZwei = glbPath == ZweihanderPath;
+
+        // ── FP sword — replace inner "HeldWeaponMesh" child ──────────────────
+        if (_heldWeapon != null)
+        {
+            var fpInner = _heldWeapon.GetNodeOrNull<MeshInstance3D>("HeldWeaponMesh");
+            if (fpInner != null)
+            {
+                fpInner.Mesh = newMesh;
+                var aabb  = newMesh.GetAabb();
+                float maxD = Mathf.Max(aabb.Size.X, Mathf.Max(aabb.Size.Y, aabb.Size.Z));
+                fpInner.Scale           = maxD > 0.01f ? Vector3.One * (0.75f / maxD) : Vector3.One;
+                fpInner.RotationDegrees = isZwei ? new(0f, 90f, 0f) : new(0f, 180f, 0f);
+            }
+        }
+
+        // ── TP sword — swap Mesh on the bone-attached MeshInstance3D ─────────
+        if (_tpWeapon != null)
+        {
+            _tpWeapon.Mesh = newMesh;
+            var aabb  = newMesh.GetAabb();
+            float maxD = Mathf.Max(aabb.Size.X, Mathf.Max(aabb.Size.Y, aabb.Size.Z));
+            _tpWeapon.Scale           = maxD > 0.01f ? Vector3.One * (0.9f / maxD) : Vector3.One;
+            _tpWeapon.RotationDegrees = isZwei ? new(0f, 90f, -90f) : new(0f, 180f, -90f);
+        }
     }
 
     // Wrapper Node3D: animation lerps Position/Rotation on the wrapper, while the inner

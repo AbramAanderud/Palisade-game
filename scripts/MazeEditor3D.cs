@@ -53,7 +53,8 @@ public partial class MazeEditor3D : Control
     static readonly Color CDimWall = new(0.50f, 0.50f, 0.50f, 0.16f);
     static readonly Color CStart   = new(0.20f, 0.88f, 0.28f);
     static readonly Color CExit    = new(0.88f, 0.20f, 0.20f);
-    static readonly Color CStair   = new(0.88f, 0.62f, 0.12f);
+    static readonly Color CStair       = new(0.88f, 0.62f, 0.12f);   // orange — stair on another floor
+    static readonly Color CStairActive = new(0.25f, 0.70f, 1.0f);    // bright blue — stair on the floor you're on
     static readonly Color CSel     = new(1.00f, 0.80f, 0.15f);
     static readonly Color CText    = new(0.85f, 0.85f, 0.85f);
     static readonly Color CDim     = new(0.48f, 0.48f, 0.48f);
@@ -90,6 +91,15 @@ public partial class MazeEditor3D : Control
     int       _hoverCx = -1;
     int       _hoverCy = -1;
     readonly List<MeshInstance3D> _hoverBorder = new();
+
+    // Pulsing red error indicator on the conflicting piece (opening-mismatch validations)
+    MeshInstance3D?     _errorPulse;
+    StandardMaterial3D? _errorPulseMat;
+    float               _errorPulseTimer = 0f;
+    float               _errorPulsePhase = 0f;
+    int                 _errorPulseFloor = 0;
+    int                 _errorPulseCx    = -1;
+    int                 _errorPulseCy    = -1;
 
     // ── Nodes ──────────────────────────────────────────────────────────────────
     FontFile?            _font;
@@ -134,11 +144,18 @@ public partial class MazeEditor3D : Control
         SetupBackgroundSmoke();
         SetupThumbs();
         BuildFloorGrids();
-        LoadSlot(0);
+        // Restore the slot the user was last editing / playtesting so coming back
+        // from "Test Maze" doesn't kick them off whatever they were working on.
+        int startSlot = Mathf.Clamp(GameState.ActiveSlot, 0, MaxSlots - 1);
+        LoadSlot(startSlot);
     }
 
     // ── _Process ───────────────────────────────────────────────────────────────
-    public override void _Process(double _dt) => UpdateCamera();
+    public override void _Process(double _dt)
+    {
+        UpdateCamera();
+        UpdateErrorPulse((float)_dt);
+    }
 
     // ── Keyboard shortcuts ─────────────────────────────────────────────────────
     public override void _Input(InputEvent ev)
@@ -214,10 +231,16 @@ public partial class MazeEditor3D : Control
         title.AddThemeConstantOverride("outline_size", 5);
         lv.AddChild(title);
 
-        var nameHeader = Lbl("NAME", 14, CDim);
+        // NAME label and the maze-name input share a single row.
+        var nameRow = new HBoxContainer();
+        nameRow.AddThemeConstantOverride("separation", 10);
+        lv.AddChild(nameRow);
+
+        var nameHeader = Lbl("NAME:", 14, CDim);
         nameHeader.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 0.95f));
         nameHeader.AddThemeConstantOverride("outline_size", 4);
-        lv.AddChild(nameHeader);
+        nameHeader.SizeFlagsVertical = SizeFlags.ShrinkCenter;
+        nameRow.AddChild(nameHeader);
 
         _nameEdit = new LineEdit { PlaceholderText = "Maze name…", CustomMinimumSize = new Vector2(0, 40) };
         if (_font != null) _nameEdit.AddThemeFontOverride("font", _font);
@@ -226,8 +249,9 @@ public partial class MazeEditor3D : Control
             Flat(new Color(0.04f, 0.04f, 0.04f, 0.55f)));
         _nameEdit.AddThemeStyleboxOverride("focus",
             Flat(new Color(0.10f, 0.10f, 0.10f, 0.75f)));
+        _nameEdit.SizeFlagsHorizontal = SizeFlags.ExpandFill;
         _nameEdit.TextChanged += t => { _maze.Name = t; RefreshSlotButtons(); };
-        lv.AddChild(_nameEdit);
+        nameRow.AddChild(_nameEdit);
 
         var slotsHeader = Lbl("SAVE SLOTS", 14, CDim);
         slotsHeader.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 0.95f));
@@ -243,7 +267,7 @@ public partial class MazeEditor3D : Control
             lv.AddChild(_slotBtns[i]);
         }
 
-        var clearBtn = MakeFloatBtn("CLEAR MAP", 16, ClearCurrentMap, new Vector2(0, 48));
+        var clearBtn = MakeFloatBtn("CLEAR MAP", 16, ConfirmClearMap, new Vector2(0, 48));
         clearBtn.SizeFlagsHorizontal = SizeFlags.ExpandFill;
         lv.AddChild(clearBtn);
 
@@ -261,19 +285,20 @@ public partial class MazeEditor3D : Control
         saveBtn.OffsetBottom   = -24;
         AddChild(saveBtn);
 
-        // ── Bottom-right: Exit to main ─────────────────────────────────────────
-        var backBtn = MakeFloatBtn("EXIT TO MAIN", 18,
-            () => { SaveCurrentSlot(); GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn"); },
-            new Vector2(220, 56));
-        backBtn.AnchorLeft     = 1f; backBtn.AnchorRight  = 1f;
-        backBtn.AnchorTop      = 1f; backBtn.AnchorBottom = 1f;
-        backBtn.GrowHorizontal = GrowDirection.Begin;
-        backBtn.GrowVertical   = GrowDirection.Begin;
-        backBtn.OffsetLeft     = -(220 + 24);
-        backBtn.OffsetRight    = -24;
-        backBtn.OffsetTop      = -(56 + 24);
-        backBtn.OffsetBottom   = -24;
-        AddChild(backBtn);
+        // ── Bottom-right: PLAY TEST ────────────────────────────────────────────
+        // (← BACK in the top-left still routes to the main menu, so the previous
+        // bottom-right "EXIT TO MAIN" button is gone — this corner is the play-test action now.)
+        var playTestBtnBR = MakeFloatBtn("TEST MAZE", 20, OnEnterDungeon, new Vector2(200, 68));
+        playTestBtnBR.AnchorLeft     = 1f; playTestBtnBR.AnchorRight  = 1f;
+        playTestBtnBR.AnchorTop      = 1f; playTestBtnBR.AnchorBottom = 1f;
+        playTestBtnBR.GrowHorizontal = GrowDirection.Begin;
+        playTestBtnBR.GrowVertical   = GrowDirection.Begin;
+        playTestBtnBR.OffsetLeft     = -(200 + 24);
+        playTestBtnBR.OffsetRight    = -24;
+        playTestBtnBR.OffsetTop      = -(68 + 24);
+        playTestBtnBR.OffsetBottom   = -24;
+        playTestBtnBR.AddThemeColorOverride("font_color", new Color(0.85f, 1f, 0.7f));
+        AddChild(playTestBtnBR);
 
         // ── Top-left: ← BACK shortcut to main menu (mirrors EXIT TO MAIN but matches
         // the conventional location of a back affordance) ──────────────────────────
@@ -303,6 +328,7 @@ public partial class MazeEditor3D : Control
         bot.AnchorTop    = 1f; bot.AnchorBottom = 1f;
         bot.GrowVertical = GrowDirection.Begin;
         bot.OffsetLeft   = PanW;
+        bot.OffsetRight  = -(200 + 48);   // shift palette pieces left to clear room for TEST MAZE in the bottom-right corner
         bot.OffsetTop    = -PalBarH;
         bot.OffsetBottom = 0f;
         bot.AddThemeStyleboxOverride("panel", Flat(CPan));
@@ -317,24 +343,25 @@ public partial class MazeEditor3D : Control
         foreach (var pt in Palette)
             hbox.AddChild(BuildPaletteCell(pt));
 
-        // ── Floating control-hints strip above the palette bar ────────────────
+        // ── Floating "click a palette piece" prompt above the palette bar ─────
+        // Only the palette callout lives down here — every other shortcut is in the
+        // top-right keybind legend, since this hint physically points to the bar.
         var hintLbl = new Label
         {
-            Text                = "Left-click: pick up / place piece   •   R: rotate   •   Right-click: drop held piece or delete a placed one   •   Click a palette piece below to select",
+            Text                = "Click a palette piece below to select",
             HorizontalAlignment = HorizontalAlignment.Center,
-            AutowrapMode        = TextServer.AutowrapMode.WordSmart,
         };
         if (_font != null) hintLbl.AddThemeFontOverride("font", _font);
         hintLbl.AddThemeFontSizeOverride("font_size", 14);
-        hintLbl.AddThemeColorOverride("font_color",         new Color(0.55f, 0.55f, 0.55f));
-        hintLbl.AddThemeColorOverride("font_outline_color", new Color(0f, 0f, 0f, 0.85f));
+        hintLbl.AddThemeColorOverride("font_color",         new Color(0.62f, 0.62f, 0.62f));
+        hintLbl.AddThemeColorOverride("font_outline_color", new Color(0f, 0f, 0f, 0.95f));
         hintLbl.AddThemeConstantOverride("outline_size", 4);
         hintLbl.AnchorLeft     = 0f; hintLbl.AnchorRight  = 1f;
         hintLbl.AnchorTop      = 1f; hintLbl.AnchorBottom = 1f;
         hintLbl.GrowVertical   = GrowDirection.Begin;
         hintLbl.OffsetLeft     = PanW + 20;
         hintLbl.OffsetRight    = -20;
-        hintLbl.OffsetTop      = -(PalBarH + 32);
+        hintLbl.OffsetTop      = -(PalBarH + 28);
         hintLbl.OffsetBottom   = -(PalBarH + 4);
         hintLbl.MouseFilter    = MouseFilterEnum.Ignore;
         AddChild(hintLbl);
@@ -360,26 +387,16 @@ public partial class MazeEditor3D : Control
         _statusLbl.MouseFilter  = MouseFilterEnum.Ignore;
         AddChild(_statusLbl);
 
-        // ── Top-right: PLAY TEST (prominent action button) ─────────────────────
-        var playTestBtn = MakeFloatBtn("PLAY TEST", 20, OnEnterDungeon, new Vector2(200, 56));
-        playTestBtn.AnchorLeft     = 1f; playTestBtn.AnchorRight  = 1f;
-        playTestBtn.AnchorTop      = 0f; playTestBtn.AnchorBottom = 0f;
-        playTestBtn.GrowHorizontal = GrowDirection.Begin;
-        playTestBtn.OffsetLeft     = -(200 + 20);
-        playTestBtn.OffsetRight    = -20;
-        playTestBtn.OffsetTop      = 18;
-        playTestBtn.OffsetBottom   = 18 + 56;
-        playTestBtn.AddThemeColorOverride("font_color", new Color(0.85f, 1f, 0.7f));
-        AddChild(playTestBtn);
-
-        // ── Keybind legend below the PLAY TEST button ──────────────────────────
+        // ── Top-right keybind legend ─────────────────────────────────────────
+        // Single home for every editor control (mouse + keyboard). The bottom strip
+        // only carries the "click palette piece" prompt now.
         var keyLegend = new VBoxContainer();
         keyLegend.AnchorLeft     = 1f; keyLegend.AnchorRight  = 1f;
         keyLegend.AnchorTop      = 0f; keyLegend.AnchorBottom = 0f;
         keyLegend.GrowHorizontal = GrowDirection.Begin;
-        keyLegend.OffsetLeft     = -200;
+        keyLegend.OffsetLeft     = -230;
         keyLegend.OffsetRight    = -20;
-        keyLegend.OffsetTop      = 18 + 56 + 24;   // below the Play Test button
+        keyLegend.OffsetTop      = 18;
         keyLegend.AddThemeConstantOverride("separation", 4);
         keyLegend.MouseFilter    = MouseFilterEnum.Ignore;
         AddChild(keyLegend);
@@ -394,7 +411,6 @@ public partial class MazeEditor3D : Control
         legendBg.MouseFilter = MouseFilterEnum.Ignore;
         keyLegend.AddChild(legendBg);
 
-        // Each row: key glyph + action text
         void AddRow(string key, string action)
         {
             var row = new HBoxContainer();
@@ -405,7 +421,7 @@ public partial class MazeEditor3D : Control
             var keyLbl = new Label
             {
                 Text                = $"[{key}]",
-                CustomMinimumSize   = new Vector2(40, 0),
+                CustomMinimumSize   = new Vector2(80, 0),
                 HorizontalAlignment = HorizontalAlignment.Right,
             };
             if (_font != null) keyLbl.AddThemeFontOverride("font", _font);
@@ -419,11 +435,13 @@ public partial class MazeEditor3D : Control
             actLbl.AddThemeColorOverride("font_color", new Color(0.85f, 0.85f, 0.85f));
             row.AddChild(actLbl);
         }
-        AddRow("R",  "Rotate held piece");
-        AddRow("W",  "Floor up");
-        AddRow("S",  "Floor down");
-        AddRow("D",  "Delete held piece");
-        AddRow("Esc","Cancel hold");
+        AddRow("L-Click", "pick up / place");
+        AddRow("R-Click", "drop / delete");
+        AddRow("R",       "rotate");
+        AddRow("W",       "floor up");
+        AddRow("S",       "floor down");
+        AddRow("D",       "delete held");
+        AddRow("Esc",     "cancel hold");
 
         // ── Floating floor up/down controls on the right edge of the viewport ──
         const int FloorBtnSz  = 72;
@@ -866,11 +884,14 @@ public partial class MazeEditor3D : Control
     {
         // Inactive floors keep their natural color (green Start, red Exit, orange Stair, white Floor)
         // but render at lower alpha — easier to identify pieces on adjacent floors at a glance.
+        // Stairs flip to bright blue when they live on the floor the player is currently
+        // editing, so a busy column of orange stairs across many floors clearly highlights
+        // which one you're actively on.
         Color floorCol = type switch
         {
             PieceType.Start                             => CStart,
             PieceType.Exit                              => CExit,
-            PieceType.StairsUp or PieceType.StairsDown => CStair,
+            PieceType.StairsUp or PieceType.StairsDown => isActive ? CStairActive : CStair,
             _                                           => CFloor,
         };
 
@@ -898,6 +919,12 @@ public partial class MazeEditor3D : Control
         }
 
         Dir open = PieceDB.GetOpenings(type, rot);
+        // For stair pieces, suppress the arm floor on the CROSS side. The cross side is
+        // where the steps reach a different floor's Y, so a floor patch at the home Y
+        // sits OVER the descending/ascending steps and visually breaks the chain — most
+        // noticeable on StairsDown chains where it appears as a lip at home-floor level
+        // blocking the view of the next stair below.
+        Dir crossDir = PieceDB.IsStair(type) ? PieceDB.GetStairCrossDir(type, rot) : Dir.None;
 
         void ArmFloor(float ax, float az, float aw, float ad)
             => parent.AddChild(MakeMeshBox(
@@ -905,10 +932,10 @@ public partial class MazeEditor3D : Control
                    new Vector3(aw - 0.1f, FlrT, ad - 0.1f),
                    floorCol, flrA));
 
-        if ((open & Dir.N) != 0) ArmFloor(cx,              wz + ArmLen * 0.5f,      ArmW, ArmLen);
-        if ((open & Dir.S) != 0) ArmFloor(cx,              wz + CS - ArmLen * 0.5f, ArmW, ArmLen);
-        if ((open & Dir.E) != 0) ArmFloor(wx + CS - ArmLen * 0.5f, cz,              ArmLen, ArmW);
-        if ((open & Dir.W) != 0) ArmFloor(wx + ArmLen * 0.5f,      cz,              ArmLen, ArmW);
+        if ((open & Dir.N) != 0 && crossDir != Dir.N) ArmFloor(cx,              wz + ArmLen * 0.5f,      ArmW, ArmLen);
+        if ((open & Dir.S) != 0 && crossDir != Dir.S) ArmFloor(cx,              wz + CS - ArmLen * 0.5f, ArmW, ArmLen);
+        if ((open & Dir.E) != 0 && crossDir != Dir.E) ArmFloor(wx + CS - ArmLen * 0.5f, cz,              ArmLen, ArmW);
+        if ((open & Dir.W) != 0 && crossDir != Dir.W) ArmFloor(wx + ArmLen * 0.5f,      cz,              ArmLen, ArmW);
 
         if (type == PieceType.StairsUp || type == PieceType.StairsDown)
             BuildStairGeo(parent, type, rot, wx, wy, wz, isActive);
@@ -938,11 +965,10 @@ public partial class MazeEditor3D : Control
         float lx = wx + CS * 0.5f - fwdX * CS * 0.5f;
         float lz = wz + CS * 0.5f - fwdZ * CS * 0.5f;
 
-        // Always orange; inactive stairs just render translucent so they fade with the floor
-        // they sit on, matching the BuildPieceInto color treatment for the other piece types.
-        // Bumped from 0.40 — stairs on other floors are now distinctly visible, with stairs
-        // above getting more alpha than below since the camera looks through them.
-        Color col = CStair;
+        // Bright blue when this stair sits on the floor you're editing; orange otherwise.
+        // The blue-vs-orange split makes it obvious which stair in a stack is your active
+        // one when several stairs span multiple floors.
+        Color col = isActive ? CStairActive : CStair;
         float alpha;
         if (isActive) alpha = 0.95f;
         else
@@ -970,7 +996,7 @@ public partial class MazeEditor3D : Control
         parent.AddChild(MakeMeshBox(
             new Vector3(sx, (lowY + highY) * 0.5f, sz),
             new Vector3(0.9f, highY - lowY, 0.9f),
-            CStair, isActive ? 0.22f : 0.07f));
+            col, isActive ? 0.22f : 0.07f));
     }
 
     // ── Camera update ──────────────────────────────────────────────────────────
@@ -1498,6 +1524,30 @@ public partial class MazeEditor3D : Control
     }
 
     // ── Clear ──────────────────────────────────────────────────────────────────
+    // Shows a Yes/No confirmation dialog before wiping the current slot —
+    // clearing is destructive (loses every piece on every floor) so a single
+    // misclick shouldn't trash the user's maze.
+    void ConfirmClearMap()
+    {
+        var dialog = new ConfirmationDialog
+        {
+            Title         = "Clear Map",
+            DialogText    = "Clear every piece in this maze?\nThis cannot be undone.",
+            OkButtonText  = "Yes",
+            CancelButtonText = "No",
+        };
+        if (_font != null)
+        {
+            dialog.AddThemeFontOverride("font", _font);
+            dialog.AddThemeFontSizeOverride("font_size", 16);
+        }
+        AddChild(dialog);
+        dialog.Confirmed   += () => { ClearCurrentMap(); dialog.QueueFree(); };
+        dialog.Canceled    += () => dialog.QueueFree();
+        dialog.CloseRequested += () => dialog.QueueFree();
+        dialog.PopupCentered(new Vector2I(360, 160));
+    }
+
     void ClearCurrentMap()
     {
         _maze.Pieces.Clear();
@@ -1684,6 +1734,69 @@ public partial class MazeEditor3D : Control
                                              Type = PieceType.Exit,  Rotation = 0 });
     }
 
+    // ── Pulsing red error indicator ────────────────────────────────────────────
+    // When a validation rejects a placement because of an opening-mismatch with a
+    // specific neighbor piece, we flash a red glow over that neighbor's cell so the
+    // user can see exactly which piece is causing the conflict. The pulse fades
+    // out over ~3.5 seconds and re-activates each time a new mismatch is reported.
+    void FlagErrorCell(int x, int y, int floor)
+    {
+        if (_errorPulse == null)
+        {
+            _errorPulseMat = new StandardMaterial3D
+            {
+                AlbedoColor               = new Color(1.0f, 0.18f, 0.18f, 0.55f),
+                ShadingMode               = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                Transparency              = BaseMaterial3D.TransparencyEnum.Alpha,
+                EmissionEnabled           = true,
+                Emission                  = new Color(1.0f, 0.12f, 0.12f),
+                EmissionEnergyMultiplier  = 2.0f,
+            };
+            _errorPulse = new MeshInstance3D
+            {
+                Name             = "ErrorPulse",
+                Mesh             = new BoxMesh { Size = new Vector3(CS - 0.4f, 0.12f, CS - 0.4f) },
+                MaterialOverride = _errorPulseMat,
+            };
+            _world.AddChild(_errorPulse);
+        }
+        _errorPulseCx    = x;
+        _errorPulseCy    = y;
+        _errorPulseFloor = floor;
+        _errorPulseTimer = 3.5f;
+        _errorPulsePhase = 0f;
+        _errorPulse.Visible = true;
+    }
+
+    void UpdateErrorPulse(float dt)
+    {
+        if (_errorPulse == null || !_errorPulse.Visible) return;
+        _errorPulseTimer -= dt;
+        if (_errorPulseTimer <= 0f)
+        {
+            _errorPulse.Visible = false;
+            return;
+        }
+
+        // Pulse cycle (~3 Hz) + slight vertical bob — "glows red up and down"
+        _errorPulsePhase += dt * 6.0f;
+        float pulse01 = (Mathf.Sin(_errorPulsePhase) + 1f) * 0.5f;
+        // Final-second fade so it doesn't snap off
+        float life    = Mathf.Clamp(_errorPulseTimer / 1.2f, 0f, 1f);
+
+        if (_errorPulseMat != null)
+        {
+            _errorPulseMat.AlbedoColor              = new Color(1.0f, 0.18f, 0.18f, (0.35f + pulse01 * 0.5f) * life);
+            _errorPulseMat.EmissionEnergyMultiplier = (1.4f + pulse01 * 2.4f) * life;
+        }
+
+        float baseY = _errorPulseFloor * EdFH + FlrT + 0.25f;
+        _errorPulse.Position = new Vector3(
+            _errorPulseCx * CS + CS * 0.5f,
+            baseY + Mathf.Sin(_errorPulsePhase) * 0.35f,
+            _errorPulseCy * CS + CS * 0.5f);
+    }
+
     // ── Edge wall system ───────────────────────────────────────────────────────
     // Draws full-width translucent walls at every closed cell boundary on the current floor.
     void RebuildEdgeWalls()
@@ -1836,7 +1949,11 @@ public partial class MazeEditor3D : Control
 
             if (myHasOpen != nbrHasOpen)
             {
-                if (!silent) SetStatus($"Opening mismatch with {PieceDB.Labels[nbr.Type]} at ({nx},{ny}).");
+                if (!silent)
+                {
+                    SetStatus($"Opening mismatch with {PieceDB.Labels[nbr.Type]} at ({nx},{ny}).");
+                    FlagErrorCell(nx, ny, _floor);
+                }
                 return false;
             }
             if (myHasOpen) hasConnection = true;
@@ -1881,6 +1998,7 @@ public partial class MazeEditor3D : Control
             if (myHasOpen != nbrHasOpen)
             {
                 SetStatus($"Stair opening mismatch with {PieceDB.Labels[nbr.Type]} at ({nx},{ny}).");
+                FlagErrorCell(nx, ny, _floor);
                 return false;
             }
         }
@@ -1913,8 +2031,15 @@ public partial class MazeEditor3D : Control
             }
         }
 
+        // Stair-to-stair: a new stair placed AT the landing cell of an existing stair on
+        // an adjacent floor is a valid connection (the player can step from the existing
+        // stair's top onto the new stair's bottom at the cell boundary). This is what
+        // makes "chained" stairs going up or down multiple floors work — and it lets a
+        // StairsUp meet a StairsDown directly without an intermediate corridor.
+        bool stairLanding = HasStairLandingNeighbor(cx, cy, _floor, type, rot);
+
         int floorCount = _maze.Pieces.Count(p => p.Floor == _floor);
-        if (floorCount > 0 && !flatConnected && !crossConnected)
+        if (floorCount > 0 && !flatConnected && !crossConnected && !stairLanding)
         {
             SetStatus("Stair must connect to a neighbor opening (flat side) or a piece on the destination floor.");
             return false;
@@ -2028,6 +2153,35 @@ public partial class MazeEditor3D : Control
             Dir opp = PieceDB.Opposite(dir);
             if (PieceDB.HasSameFloorOpening(nb.Type, nb.Rotation, opp)) count++;
         }
+
+        // Also count connections through stair landings (matches the validation in
+        // HasStairLandingNeighbor). Without this the auto-rotation didn't know that a
+        // piece placed AT the top/bottom of a stair chain should orient itself to face
+        // back toward the stair — so corridors at chain endpoints stayed at fallback
+        // rotation and you'd have to spin them by hand.
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            int sf = s.Floor + PieceDB.StairFloorDelta(s.Type);
+            if (sf != floor) continue;
+            Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+            var (sdx, sdy) = DirToOffset(scross);
+            int landingX = s.X + sdx, landingY = s.Y + sdy;
+
+            // Case A: my cell IS the stair's landing — opening at back-to-stair direction connects.
+            if (landingX == x && landingY == y)
+            {
+                Dir backDir = PieceDB.Opposite(scross);
+                if ((openings & backDir) != 0) count++;
+            }
+            // Case B: a neighbor cell of mine is a stair landing — my opening points to it.
+            foreach (Dir dir in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+            {
+                if ((openings & dir) == 0) continue;
+                var (dx, dz) = DirToOffset(dir);
+                if (x + dx == landingX && y + dz == landingY) { count++; break; }
+            }
+        }
         return count;
     }
 
@@ -2075,6 +2229,23 @@ public partial class MazeEditor3D : Control
                 Dir opp = PieceDB.Opposite(crossDir);
                 if (PieceDB.HasSameFloorOpening(landing.Type, landing.Rotation, opp))
                     score += 1;
+            }
+
+            // Stair-on-stair link: if my flat side faces a stair's landing cell on this
+            // floor — meaning my flat opening connects directly to another stair's top —
+            // weight this rotation highly so chained stairs auto-orient correctly.
+            foreach (var s in _maze.Pieces)
+            {
+                if (!PieceDB.IsStair(s.Type)) continue;
+                int sf = s.Floor + PieceDB.StairFloorDelta(s.Type);
+                if (sf != floor) continue;
+                Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+                var (sdx, sdy) = DirToOffset(scross);
+                // My flat-side neighbor cell == that stair's landing cell?
+                if (s.X + sdx == nx && s.Y + sdy == ny) { score += 2; break; }
+                // Or my OWN cell IS that stair's landing and my flat faces back toward it?
+                if (s.X + sdx == x && s.Y + sdy == y &&
+                    PieceDB.Opposite(scross) == flatDir) { score += 2; break; }
             }
 
             if (!foundValid || score > bestScore)

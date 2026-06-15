@@ -60,6 +60,8 @@ public partial class OnlineDungeonArena : Node3D
 
     bool _softLightToastShown = false;
 
+    CanvasLayer? _surrenderDialog;
+
     // ── Ready ─────────────────────────────────────────────────────────────────
     public override void _Ready()
     {
@@ -85,7 +87,7 @@ public partial class OnlineDungeonArena : Node3D
         AddChild(canvas);
         var hint = new Label
         {
-            Text     = "ESC = release mouse   ESC again = title",
+            Text     = "ESC = surrender",
             Position = new Vector2(10, 10),
         };
         if (_font != null) hint.AddThemeFontOverride("font", _font);
@@ -113,12 +115,26 @@ public partial class OnlineDungeonArena : Node3D
 
     public override void _Input(InputEvent ev)
     {
-        if (ev.IsActionPressed("pause") && _localPlayer == null)
+        if (!ev.IsActionPressed("pause")) return;
+
+        // Loading screen — quick bail.
+        if (_localPlayer == null)
         {
             _nm.GameDataReceived -= OnGameData;
             _nm.Disconnect();
             GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
+            GetViewport().SetInputAsHandled();
+            return;
         }
+
+        if (_gameEnded) return;
+
+        // In-match: toggle the surrender dialog.
+        if (_surrenderDialog != null)
+            DismissSurrenderDialog();
+        else
+            ShowSurrenderDialog();
+        GetViewport().SetInputAsHandled();
     }
 
     // ── Host ──────────────────────────────────────────────────────────────────
@@ -300,6 +316,123 @@ public partial class OnlineDungeonArena : Node3D
         _softLightToastShown = true;
         ShowToast("The soft light guides you.", 4.0, new Color(0.55f, 0.75f, 1f));
         GD.Print("[ARENA] Soft light toast shown.");
+    }
+
+    // ── Surrender (ESC during match) ──────────────────────────────────────────
+
+    void ShowSurrenderDialog()
+    {
+        if (_gameEnded || _surrenderDialog != null) return;
+
+        // Freeze local player so they can't keep moving while deciding.
+        if (_localPlayer != null && IsInstanceValid(_localPlayer))
+        {
+            _localPlayer.Frozen = true;
+            _localPlayer.ReleaseMouse();
+        }
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+
+        _surrenderDialog = new CanvasLayer { Layer = 90 };
+        AddChild(_surrenderDialog);
+
+        var bg = new ColorRect
+        {
+            Color       = new Color(0f, 0f, 0f, 0.72f),
+            MouseFilter = Control.MouseFilterEnum.Stop,
+        };
+        bg.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        _surrenderDialog.AddChild(bg);
+
+        var vbox = new VBoxContainer();
+        vbox.AnchorLeft    = 0.5f; vbox.AnchorRight  = 0.5f;
+        vbox.AnchorTop     = 0.5f; vbox.AnchorBottom = 0.5f;
+        vbox.GrowHorizontal = Control.GrowDirection.Both;
+        vbox.GrowVertical   = Control.GrowDirection.Both;
+        vbox.OffsetLeft    = -240; vbox.OffsetRight  = 240;
+        vbox.OffsetTop     = -120; vbox.OffsetBottom = 120;
+        vbox.AddThemeConstantOverride("separation", 16);
+        _surrenderDialog.AddChild(vbox);
+
+        var title = new Label
+        {
+            Text                = "Surrender?",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (_font != null) title.AddThemeFontOverride("font", _font);
+        title.AddThemeFontSizeOverride("font_size", 44);
+        title.AddThemeColorOverride("font_color", new Color(1f, 0.4f, 0.4f));
+        vbox.AddChild(title);
+
+        var sub = new Label
+        {
+            Text                = "Leaving now counts as a loss.",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (_font != null) sub.AddThemeFontOverride("font", _font);
+        sub.AddThemeFontSizeOverride("font_size", 18);
+        sub.AddThemeColorOverride("font_color", new Color(0.85f, 0.85f, 0.85f));
+        vbox.AddChild(sub);
+
+        var btnRow = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.Center };
+        btnRow.AddThemeConstantOverride("separation", 24);
+        vbox.AddChild(btnRow);
+
+        var cancelBtn = new Button
+        {
+            Text              = "Keep Fighting",
+            CustomMinimumSize = new Vector2(200, 52),
+            FocusMode         = Control.FocusModeEnum.All,
+        };
+        if (_font != null) cancelBtn.AddThemeFontOverride("font", _font);
+        cancelBtn.AddThemeFontSizeOverride("font_size", 18);
+        cancelBtn.AddThemeColorOverride("font_color", new Color(0.6f, 0.95f, 0.6f));
+        cancelBtn.Pressed += DismissSurrenderDialog;
+        btnRow.AddChild(cancelBtn);
+
+        var confirmBtn = new Button
+        {
+            Text              = "Surrender",
+            CustomMinimumSize = new Vector2(200, 52),
+            FocusMode         = Control.FocusModeEnum.All,
+        };
+        if (_font != null) confirmBtn.AddThemeFontOverride("font", _font);
+        confirmBtn.AddThemeFontSizeOverride("font_size", 18);
+        confirmBtn.AddThemeColorOverride("font_color", new Color(1f, 0.45f, 0.45f));
+        bool confirmedClick = false;
+        confirmBtn.Pressed += () =>
+        {
+            if (confirmedClick) return;
+            confirmedClick = true;
+            ConfirmSurrender();
+        };
+        btnRow.AddChild(confirmBtn);
+
+        cancelBtn.GrabFocus();
+        GD.Print("[ARENA] Surrender dialog opened.");
+    }
+
+    void DismissSurrenderDialog()
+    {
+        if (_surrenderDialog == null) return;
+        _surrenderDialog.QueueFree();
+        _surrenderDialog = null;
+        if (_gameEnded) return;
+        // Resume play
+        if (_localPlayer != null && IsInstanceValid(_localPlayer))
+        {
+            _localPlayer.Frozen = false;
+            _localPlayer.MakeActive();   // re-capture mouse + re-assert camera
+        }
+        GD.Print("[ARENA] Surrender dialog dismissed.");
+    }
+
+    void ConfirmSurrender()
+    {
+        if (_gameEnded || _localPlayerDead) return;
+        _localPlayerDead = true;
+        _nm.SendGameData("{\"t\":\"die\"}");
+        GD.Print("[ARENA] Local surrendered — counts as a loss.");
+        EndMatch("Surrendered.");
     }
 
     // ── Geometry ──────────────────────────────────────────────────────────────
@@ -565,11 +698,17 @@ public partial class OnlineDungeonArena : Node3D
         _gameEnded = true;
         _combatTimer?.Stop();
         FreezePlayers();
+        // If the surrender confirmation was open, replace it with the end overlay.
+        if (_surrenderDialog != null)
+        {
+            _surrenderDialog.QueueFree();
+            _surrenderDialog = null;
+        }
         _nm.GameDataReceived -= OnGameData;
         _nm.Disconnect();
         OnlineGameState.Gold += _matchGold;
         PlayerProfile.Save();
-        GD.Print($"[ARENA] EndMatch: {result} (+{_matchGold} gold, total {OnlineGameState.Gold})");
+        GD.Print($"[ARENA] EndMatch: {result} (+{_matchGold} fame, total {OnlineGameState.Gold})");
         ShowEndOverlay(result);
     }
 
@@ -605,10 +744,11 @@ public partial class OnlineDungeonArena : Node3D
 
         Color resultColor = result switch
         {
-            "Defeated!"     => new Color(1f, 0.3f, 0.3f),
-            "Victory!"      => new Color(0.3f, 1f, 0.5f),
+            "Defeated!"      => new Color(1f, 0.3f, 0.3f),
+            "Surrendered."   => new Color(1f, 0.4f, 0.4f),
+            "Victory!"       => new Color(0.3f, 1f, 0.5f),
             "Opponent left." => new Color(0.85f, 0.85f, 0.85f),
-            _               => new Color(1f, 0.9f, 0.3f),
+            _                => new Color(1f, 0.9f, 0.3f),
         };
 
         // Make sure cursor stays usable while the overlay is up.
