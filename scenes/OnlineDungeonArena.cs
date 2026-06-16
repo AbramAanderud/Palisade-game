@@ -42,8 +42,12 @@ public partial class OnlineDungeonArena : Node3D
     float _offsetAY = 0f;
     float _offsetBY = 0f;
 
-    // Host stores maze payload so it can re-send on client's ready_for_maze request
-    string? _pendingMazePayload;
+    // Maze exchange: both players send their own maze and wait for the opponent's.
+    // Arena builds once both are in hand.
+    MazeData? _ownMaze;
+    MazeData? _opponentMaze;
+    string?   _ownMazePayload;      // serialized own maze, kept for re-send on request
+    bool      _arenaBuilt = false;
 
     // ── Game-end state ────────────────────────────────────────────────────────
     bool   _gameEnded      = false;
@@ -71,14 +75,10 @@ public partial class OnlineDungeonArena : Node3D
         _font = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
 
         BuildEnvironment();
+        SetupShared();
 
-        if (OnlineGameState.IsHost)
-            SetupHost();
-        else
-            SetupClient();
-
-        // Position broadcast at 20 Hz
-        var timer = new Timer { WaitTime = 0.05f, Autostart = true, Name = "BroadcastTimer" };
+        // Position broadcast at 30 Hz (was 20 Hz). 33 ms tick; ~3 KB/s/player.
+        var timer = new Timer { WaitTime = 0.033f, Autostart = true, Name = "BroadcastTimer" };
         timer.Timeout += BroadcastPosition;
         AddChild(timer);
 
@@ -137,55 +137,47 @@ public partial class OnlineDungeonArena : Node3D
         GetViewport().SetInputAsHandled();
     }
 
-    // ── Host ──────────────────────────────────────────────────────────────────
+    // ── Shared maze-exchange setup ────────────────────────────────────────────
+    // Each player sends their OWN maze and waits for the opponent's. The arena
+    // builds once both have arrived. Both screens then show identical geometry:
+    //   • MazeA (north / low z) = host's design
+    //   • MazeB (south / high z, flipped) = client's design
+    // Host spawns in MazeB and navigates north toward the center.
+    // Client spawns in MazeA and navigates south toward the center.
 
-    void SetupHost()
+    void SetupShared()
     {
         int slot = OnlineGameState.SelectedMazeSlot;
         var data = MazeSerializer.Load(slot);
 
         if (data == null || data.Pieces.Count == 0)
         {
-            GD.PushError("[OnlineDungeonArena] Host: missing maze data");
+            GD.PushError("[ARENA] Missing own maze data — returning to lobby.");
             _nm.Disconnect();
-            GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
+            GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
             return;
         }
 
-        var dataFlipped = DungeonArena.FlipMazeZ(data);
-        BuildArena(data, dataFlipped);
+        _ownMaze = data;
 
-        var startA = data.Pieces.FirstOrDefault(p => p.Type == PieceType.Start) ?? data.Pieces[0];
-        float ax = startA.X * CellSize + CellSize * 0.5f;
-        float az = startA.Y * CellSize + CellSize * 0.5f;
-        float ay = startA.Floor * DungeonBuilder.FloorHeight + 1f + _offsetAY;
-        float spawnYawA = DungeonArena.DirToYaw(PieceDB.GetOpenings(PieceType.Start, startA.Rotation));
-        _localPlayer = PlayerController.Spawn(this, new Vector3(ax, ay, az), spawnYawA);
-
-        var startB = dataFlipped.Pieces.FirstOrDefault(p => p.Type == PieceType.Start) ?? dataFlipped.Pieces[0];
-        float bx = startB.X * CellSize + CellSize * 0.5f + _offsetBX;
-        float bz = startB.Y * CellSize + CellSize * 0.5f + MazeBOffset;
-        float by = startB.Floor * DungeonBuilder.FloorHeight + 1f + _offsetBY;
-        _puppet = PlayerController.Spawn(this, new Vector3(bx, by, bz), 0f);
-        _puppet.IsRemotePuppet = true;
-        _puppet.EnableWorldBars();
-
-        _localPlayer.MakeActive();
-        WireHitRelay();
-        ShowToast("Find the sword.", 4.0, new Color(1f, 0.9f, 0.6f));
-
-        // Serialize maze BEFORE sending so a late ready_for_maze always finds a payload.
+        // Serialize own maze and stash for retry; immediately send to opponent.
         string mazeJson = JsonSerializer.Serialize(data);
         string escaped  = JsonSerializer.Serialize(mazeJson);
-        _pendingMazePayload = $"{{\"t\":\"maze\",\"json\":{escaped}}}";
-        _nm.SendGameData(_pendingMazePayload);
+        _ownMazePayload = $"{{\"t\":\"maze\",\"json\":{escaped}}}";
+        _nm.SendGameData(_ownMazePayload);
 
-        GD.Print($"[ARENA] Host ready — slot {slot}, maze payload {_pendingMazePayload.Length} chars");
+        ShowLoadingScreen();
+
+        // Retry: re-send our maze (in case it was dropped) and re-request opponent's.
+        _clientMazeRetryTimer = new Timer { WaitTime = 2.0, Autostart = true, Name = "MazeRetry" };
+        _clientMazeRetryTimer.Timeout += OnOpponentMazeRetry;
+        AddChild(_clientMazeRetryTimer);
+
+        GD.Print($"[ARENA] {(OnlineGameState.IsHost ? "Host" : "Client")} sent own maze (slot {slot}, " +
+                 $"{_ownMazePayload.Length} chars). Waiting for opponent's maze…");
     }
 
-    // ── Client ────────────────────────────────────────────────────────────────
-
-    void SetupClient()
+    void ShowLoadingScreen()
     {
         _loadingCanvas = new CanvasLayer { Name = "LoadingCanvas" };
 
@@ -195,7 +187,7 @@ public partial class OnlineDungeonArena : Node3D
 
         var lbl = new Label
         {
-            Text                = "Waiting for maze data…",
+            Text                = "Exchanging mazes…",
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment   = VerticalAlignment.Center,
         };
@@ -206,29 +198,20 @@ public partial class OnlineDungeonArena : Node3D
         _loadingCanvas.AddChild(lbl);
 
         AddChild(_loadingCanvas);
-
-        _nm.SendGameData("{\"t\":\"ready_for_maze\"}");
-
-        // Retry every 2 s in case the first request or the maze response was dropped.
-        _clientMazeRetryTimer = new Timer { WaitTime = 2.0, Autostart = true, Name = "MazeRetry" };
-        _clientMazeRetryTimer.Timeout += OnClientMazeRetry;
-        AddChild(_clientMazeRetryTimer);
-
-        GD.Print("[ARENA] Client waiting for maze…");
     }
 
-    void OnClientMazeRetry()
+    void OnOpponentMazeRetry()
     {
-        if (_localPlayer != null) return;       // already received and built
+        if (_arenaBuilt) return;
         _clientMazeRetries++;
         if (_clientMazeRetries > 15)            // ~30 s
         {
-            GD.PushError("[ARENA] Client: gave up waiting for maze after 30 s");
+            GD.PushError("[ARENA] Gave up waiting for opponent's maze after 30 s.");
             _clientMazeRetryTimer?.Stop();
             if (_loadingCanvas != null)
             {
                 foreach (var child in _loadingCanvas.GetChildren())
-                    if (child is Label l) l.Text = "Could not receive maze from host.\nReturning to lobby…";
+                    if (child is Label l) l.Text = "Could not receive opponent's maze.\nReturning to lobby…";
             }
             GetTree().CreateTimer(3.0).Timeout += () =>
             {
@@ -240,30 +223,53 @@ public partial class OnlineDungeonArena : Node3D
             };
             return;
         }
-        GD.Print($"[ARENA] Client re-requesting maze (attempt {_clientMazeRetries})");
+        GD.Print($"[ARENA] Re-requesting opponent's maze (attempt {_clientMazeRetries})");
+        // Resend our own maze too — opponent may have missed it on the first send.
+        if (_ownMazePayload != null) _nm.SendGameData(_ownMazePayload);
         _nm.SendGameData("{\"t\":\"ready_for_maze\"}");
     }
 
-    void FinishClientSetup(MazeData hostMaze)
+    void TryBuildArenaAndSpawn()
     {
+        if (_arenaBuilt) return;
+        if (_ownMaze == null || _opponentMaze == null) return;
+        _arenaBuilt = true;
+
+        _clientMazeRetryTimer?.Stop();
         _loadingCanvas?.QueueFree();
         _loadingCanvas = null;
 
-        var dataFlipped = DungeonArena.FlipMazeZ(hostMaze);
-        BuildArena(hostMaze, dataFlipped);
+        // North side = host's design, south side = client's design (flipped to face center).
+        var hostMaze   = OnlineGameState.IsHost ? _ownMaze     : _opponentMaze;
+        var clientMaze = OnlineGameState.IsHost ? _opponentMaze : _ownMaze;
+        var mazeBFlipped = DungeonArena.FlipMazeZ(clientMaze);
 
-        var startB = dataFlipped.Pieces.FirstOrDefault(p => p.Type == PieceType.Start) ?? dataFlipped.Pieces[0];
-        float bx = startB.X * CellSize + CellSize * 0.5f + _offsetBX;
-        float bz = startB.Y * CellSize + CellSize * 0.5f + MazeBOffset;
-        float by = startB.Floor * DungeonBuilder.FloorHeight + 1f + _offsetBY;
-        float spawnYawB = DungeonArena.DirToYaw(PieceDB.GetOpenings(PieceType.Start, startB.Rotation));
-        _localPlayer = PlayerController.Spawn(this, new Vector3(bx, by, bz), spawnYawB);
+        BuildArena(hostMaze, mazeBFlipped);
 
+        // Spawn positions for both mazes (computed here so we don't recompute later).
         var startA = hostMaze.Pieces.FirstOrDefault(p => p.Type == PieceType.Start) ?? hostMaze.Pieces[0];
         float ax = startA.X * CellSize + CellSize * 0.5f;
         float az = startA.Y * CellSize + CellSize * 0.5f;
         float ay = startA.Floor * DungeonBuilder.FloorHeight + 1f + _offsetAY;
-        _puppet = PlayerController.Spawn(this, new Vector3(ax, ay, az), 0f);
+        float yawA = DungeonArena.DirToYaw(PieceDB.GetOpenings(PieceType.Start, startA.Rotation));
+
+        var startB = mazeBFlipped.Pieces.FirstOrDefault(p => p.Type == PieceType.Start) ?? mazeBFlipped.Pieces[0];
+        float bx = startB.X * CellSize + CellSize * 0.5f + _offsetBX;
+        float bz = startB.Y * CellSize + CellSize * 0.5f + MazeBOffset;
+        float by = startB.Floor * DungeonBuilder.FloorHeight + 1f + _offsetBY;
+        float yawB = DungeonArena.DirToYaw(PieceDB.GetOpenings(PieceType.Start, startB.Rotation));
+
+        // Host plays in MazeB (client's maze flipped); client plays in MazeA (host's maze).
+        if (OnlineGameState.IsHost)
+        {
+            _localPlayer = PlayerController.Spawn(this, new Vector3(bx, by, bz), yawB);
+            _puppet      = PlayerController.Spawn(this, new Vector3(ax, ay, az), 0f);
+        }
+        else
+        {
+            _localPlayer = PlayerController.Spawn(this, new Vector3(ax, ay, az), yawA);
+            _puppet      = PlayerController.Spawn(this, new Vector3(bx, by, bz), 0f);
+        }
         _puppet.IsRemotePuppet = true;
         _puppet.EnableWorldBars();
 
@@ -271,7 +277,8 @@ public partial class OnlineDungeonArena : Node3D
         WireHitRelay();
         ShowToast("Find the sword.", 4.0, new Color(1f, 0.9f, 0.6f));
 
-        GD.Print("[ARENA] Client arena built and spawned.");
+        GD.Print($"[ARENA] Arena built. {(OnlineGameState.IsHost ? "Host" : "Client")} " +
+                 "navigating opponent's maze.");
     }
 
     /// Center-screen toast: fades in 0.3 s, holds `hold` seconds, fades out 0.7 s.
@@ -479,9 +486,10 @@ public partial class OnlineDungeonArena : Node3D
         AddChild(torchB);
         torchB.Init(dataFlipped, builderB);
 
-        // Both mazes use the same TriggerDelay (20 s) so subscribing to either is fine.
-        // Listen on the maze the local player actually plays in.
-        var localTorch = OnlineGameState.IsHost ? torchA : torchB;
+        // The local player navigates the opponent's maze:
+        //   • Host plays in MazeB (client's design, flipped) → listen on torchB
+        //   • Client plays in MazeA (host's design)          → listen on torchA
+        var localTorch = OnlineGameState.IsHost ? torchB : torchA;
         localTorch.FirstCellLit += OnSoftLightTriggered;
 
         var arena = new ArenaBuilder { Name = "Arena" };
@@ -536,20 +544,18 @@ public partial class OnlineDungeonArena : Node3D
         switch (tProp.GetString())
         {
             case "maze":
-                if (!OnlineGameState.IsHost && _localPlayer == null)
+                if (_opponentMaze != null) break;   // already have it
+                try
                 {
-                    try
-                    {
-                        string mazeJson = root.GetProperty("json").GetString()!;
-                        var data = JsonSerializer.Deserialize<MazeData>(mazeJson)!;
-                        _clientMazeRetryTimer?.Stop();
-                        GD.Print($"[ARENA] Client received maze ({mazeJson.Length} chars), building.");
-                        FinishClientSetup(data);
-                    }
-                    catch (Exception ex)
-                    {
-                        GD.PushError($"[ARENA] Client: bad maze JSON — {ex.Message}");
-                    }
+                    string mazeJson = root.GetProperty("json").GetString()!;
+                    var data = JsonSerializer.Deserialize<MazeData>(mazeJson)!;
+                    _opponentMaze = data;
+                    GD.Print($"[ARENA] Received opponent's maze ({mazeJson.Length} chars).");
+                    TryBuildArenaAndSpawn();
+                }
+                catch (Exception ex)
+                {
+                    GD.PushError($"[ARENA] Bad opponent maze JSON — {ex.Message}");
                 }
                 break;
 
@@ -584,10 +590,10 @@ public partial class OnlineDungeonArena : Node3D
                 break;
 
             case "ready_for_maze":
-                if (OnlineGameState.IsHost && _pendingMazePayload != null)
+                if (_ownMazePayload != null)
                 {
-                    GD.Print("[ARENA] Host: re-sending maze on client request.");
-                    _nm.SendGameData(_pendingMazePayload);
+                    GD.Print("[ARENA] Re-sending own maze on opponent's request.");
+                    _nm.SendGameData(_ownMazePayload);
                 }
                 break;
 

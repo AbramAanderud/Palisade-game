@@ -70,8 +70,7 @@ public partial class PauseMenu : CanvasLayer
         // "Main Menu" there. In gameplay scenes it leaves the match/playtest, so "Exit Game"
         // matches the player's mental model.
         var p = GetTree().CurrentScene?.SceneFilePath ?? "";
-        bool isGameplay = p.Contains("DungeonGame") || p.Contains("DungeonArena") ||
-                          p.Contains("TrainingArena");
+        bool isGameplay = p.Contains("DungeonArena") || p.Contains("TrainingArena");
         _exitBtn.Text = isGameplay ? "Exit Game" : "Main Menu";
 
         ShowMain();
@@ -212,19 +211,15 @@ public partial class PauseMenu : CanvasLayer
     void ShowConfirm()
     {
         var p = GetTree().CurrentScene?.SceneFilePath ?? "";
-        string editorLabel = GameState.EditorReturnScene.Contains("MazeEditor3D")
-            ? "Maze Editor"
-            : "Map Editor";   // legacy testing editor — kept but no longer in menu
 
         // OnlineDungeonArena must be checked BEFORE the more permissive "DungeonArena"
         // substring match, since the online scene path also contains "DungeonArena".
         bool isOnlineMatch = p.Contains("OnlineDungeonArena");
-        bool isPlayTest    = !isOnlineMatch &&
-                             (p.Contains("DungeonGame") || p.Contains("DungeonArena"));
+        bool isPlayTest    = !isOnlineMatch && p.Contains("DungeonArena");
         bool isTraining    = !isOnlineMatch && p.Contains("TrainingArena");
 
         _confirmLabel.Text = isOnlineMatch  ? "Forfeit and exit match?"
-                           : isPlayTest     ? $"Exit to {editorLabel}?"
+                           : isPlayTest     ? "Exit to Maze Editor?"
                            : isTraining     ? "Exit to Training?"
                            : "Exit to main menu?";
 
@@ -240,8 +235,7 @@ public partial class PauseMenu : CanvasLayer
         var path = GetTree().CurrentScene?.SceneFilePath ?? "";
 
         bool isOnlineMatch = path.Contains("OnlineDungeonArena");
-        bool isPlayTest    = !isOnlineMatch &&
-                             (path.Contains("DungeonGame") || path.Contains("DungeonArena"));
+        bool isPlayTest    = !isOnlineMatch && path.Contains("DungeonArena");
         bool isTraining    = !isOnlineMatch && path.Contains("TrainingArena");
 
         string dest = isOnlineMatch  ? "res://scenes/PlayGameScreen.tscn"

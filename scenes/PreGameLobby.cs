@@ -52,8 +52,7 @@ public partial class PreGameLobby : Control
         // Exchange identity and initial maze selection with the opponent
         string safeName = JsonSerializer.Serialize(OnlineGameState.PlayerName);
         _nm.SendGameData($"{{\"t\":\"intro\",\"name\":{safeName}}}");
-        if (OnlineGameState.SelectedMazeSlot >= 0)
-            _nm.SendGameData($"{{\"t\":\"maze\",\"slot\":{OnlineGameState.SelectedMazeSlot}}}");
+        SendLocalMazePick(OnlineGameState.SelectedMazeSlot);
 
         // 60 s timeout — if both players don't ready up by then, bail back to lobby.
         _readyTimeoutTimer = new Timer { WaitTime = ReadyTimeoutSeconds, OneShot = true };
@@ -226,8 +225,15 @@ public partial class PreGameLobby : Control
         int slot = _mazeDropdown.GetItemId(idx);
         OnlineGameState.SelectedMazeSlot = slot;
         _readyBtn.Disabled = (slot < 0);
-        if (slot >= 0)
-            _nm.SendGameData($"{{\"t\":\"maze\",\"slot\":{slot}}}");
+        SendLocalMazePick(slot);
+    }
+
+    void SendLocalMazePick(int slot)
+    {
+        if (slot < 0) return;
+        var local = MazeSerializer.Load(slot);
+        string safeName = JsonSerializer.Serialize(local?.Name ?? "Untitled");
+        _nm.SendGameData($"{{\"t\":\"maze\",\"slot\":{slot},\"name\":{safeName}}}");
     }
 
     void OnLocalReady()
@@ -308,11 +314,14 @@ public partial class PreGameLobby : Control
                 break;
 
             case "maze":
+                // Opponent sends their slot + maze name (we can't read their local file).
+                string remoteMazeName = root.TryGetProperty("name", out var nm)
+                    ? nm.GetString() ?? "Untitled"
+                    : "Untitled";
                 if (root.TryGetProperty("slot", out var sp) && sp.TryGetInt32(out int slot))
-                {
-                    var data = MazeSerializer.Exists(slot) ? MazeSerializer.Load(slot) : null;
-                    _remoteMazeLabel.Text = data?.Name != null ? $"{data.Name} (Slot {slot})" : $"Slot {slot}";
-                }
+                    _remoteMazeLabel.Text = $"{remoteMazeName} (Slot {slot})";
+                else
+                    _remoteMazeLabel.Text = remoteMazeName;
                 break;
 
             case "ready":

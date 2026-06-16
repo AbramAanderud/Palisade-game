@@ -16,9 +16,8 @@ public class MazeData
     public string          Name      { get; set; } = "Untitled";
     public int             GoldSpent { get; set; } = 0;
     public List<MazePiece> Pieces    { get; set; } = new();
-    /// True when saved from MazeEditor3D (the online editor).
-    /// False when saved from MapEditor (testing editor).
-    /// Defaults to true so existing saves appear in the Play Game lobby.
+    /// True when saved from MazeEditor3D (the canonical editor).
+    /// Defaults to true so the maze appears in the Play Game lobby's dropdown.
     public bool            IsOnline    { get; set; } = true;
 
     /// True when MazeValidator.IsGameReady(this) succeeds at save time.

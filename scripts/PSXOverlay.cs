@@ -1,10 +1,10 @@
 using Godot;
 
 /// Autoload singleton — drives PSX rendering only while inside gameplay scenes.
-/// In DungeonGame / DungeonArena:
+/// In DungeonArena / OnlineDungeonArena / TrainingArena:
 ///   • 3D renders at 480×270 (0.375 × 1280×720) and bilinear-upscales to full res
 ///   • Bayer dither grain overlay is shown
-/// In all other scenes (map editor, lobby, etc.) both effects are off.
+/// In all other scenes (maze editor, lobby, etc.) both effects are off.
 public partial class PSXOverlay : CanvasLayer
 {
     public static PSXOverlay? Instance { get; private set; }
@@ -43,9 +43,7 @@ public partial class PSXOverlay : CanvasLayer
     {
         var scene    = GetTree().CurrentScene;
         bool gameplay = scene != null &&
-                        (scene.SceneFilePath.Contains("DungeonGame") ||
-                         scene.SceneFilePath.Contains("DungeonArena") ||
-                         scene.SceneFilePath.Contains("OnlineDungeonArena"));
+                        scene.SceneFilePath.Contains("DungeonArena");
         bool want = gameplay && _userEnabled;
         if (want == _lastApplied) return;
         ApplyState(want);
@@ -55,9 +53,7 @@ public partial class PSXOverlay : CanvasLayer
     {
         var scene    = GetTree().CurrentScene;
         bool gameplay = scene != null &&
-                        (scene.SceneFilePath.Contains("DungeonGame") ||
-                         scene.SceneFilePath.Contains("DungeonArena") ||
-                         scene.SceneFilePath.Contains("OnlineDungeonArena"));
+                        scene.SceneFilePath.Contains("DungeonArena");
         ApplyState(gameplay && _userEnabled);
     }
 

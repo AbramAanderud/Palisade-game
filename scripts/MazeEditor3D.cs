@@ -53,8 +53,10 @@ public partial class MazeEditor3D : Control
     static readonly Color CDimWall = new(0.50f, 0.50f, 0.50f, 0.16f);
     static readonly Color CStart   = new(0.20f, 0.88f, 0.28f);
     static readonly Color CExit    = new(0.88f, 0.20f, 0.20f);
-    static readonly Color CStair       = new(0.88f, 0.62f, 0.12f);   // orange — stair on another floor
-    static readonly Color CStairActive = new(0.25f, 0.70f, 1.0f);    // bright blue — stair on the floor you're on
+    static readonly Color CStair           = new(0.88f, 0.62f, 0.12f);   // orange — stair on another floor
+    static readonly Color CStairActiveUp   = new(0.30f, 0.90f, 1.00f);   // cyan — active-floor stair going UP to the next floor
+    static readonly Color CStairActiveDown = new(0.55f, 0.30f, 0.92f);   // purple — active-floor stair going DOWN to the prev floor
+    static readonly Color CActive          = new(0.30f, 0.68f, 1.00f);   // mid-blue — any non-Start/Exit/stair piece on the floor you're on
     static readonly Color CSel     = new(1.00f, 0.80f, 0.15f);
     static readonly Color CText    = new(0.85f, 0.85f, 0.85f);
     static readonly Color CDim     = new(0.48f, 0.48f, 0.48f);
@@ -175,32 +177,10 @@ public partial class MazeEditor3D : Control
                 FloorDown();
                 GetViewport().SetInputAsHandled();
                 break;
-            case Key.D:
-                // Delete the held piece — Start/Exit return to origin, others are discarded.
-                if (_holding)
-                {
-                    AbandonHolding();
-                    GetViewport().SetInputAsHandled();
-                }
-                break;
-            case Key.Escape:
-                // Only consume Escape if it actually clears something here — otherwise
-                // let PauseMenu open as it does in every other scene.
-                if (_holding)
-                {
-                    CancelHolding();
-                    GetViewport().SetInputAsHandled();
-                }
-                else if (_selType.HasValue)
-                {
-                    _selType = null;
-                    RefreshPalette();
-                    SetStatus();
-                    RebuildBorderHints();
-                    RebuildPreviewGeo();
-                    GetViewport().SetInputAsHandled();
-                }
-                break;
+            // D and Escape were here — removed. Right-click now handles both
+            // "cancel a palette selection" and "delete a held piece" so there's a
+            // single gesture for cancellation. Escape falls through to PauseMenu
+            // (the autoload owns it across all editor/gameplay scenes).
         }
     }
 
@@ -440,8 +420,6 @@ public partial class MazeEditor3D : Control
         AddRow("R",       "rotate");
         AddRow("W",       "floor up");
         AddRow("S",       "floor down");
-        AddRow("D",       "delete held");
-        AddRow("Esc",     "cancel hold");
 
         // ── Floating floor up/down controls on the right edge of the viewport ──
         const int FloorBtnSz  = 72;
@@ -876,7 +854,16 @@ public partial class MazeEditor3D : Control
             _cellGeo[key] = geo;
         }
 
-        RebuildEdgeWalls();
+        // Edge walls (the translucent grey panels between cells) were removed —
+        // the pieces themselves now indicate the floor plan via their active blue tint,
+        // and the cleaner look matches a top-down floor plan instead of a wireframe.
+        ClearEdgeWalls();
+    }
+
+    void ClearEdgeWalls()
+    {
+        foreach (var mi in _edgeWalls) { if (IsInstanceValid(mi)) mi.QueueFree(); }
+        _edgeWalls.Clear();
     }
 
     void BuildPieceInto(Node3D parent, PieceType type, int rot,
@@ -887,12 +874,20 @@ public partial class MazeEditor3D : Control
         // Stairs flip to bright blue when they live on the floor the player is currently
         // editing, so a busy column of orange stairs across many floors clearly highlights
         // which one you're actively on.
+        // Start/Exit always render in their dedicated colors regardless of floor
+        // (the user explicitly wants those two to stay green/red and not turn blue).
+        // Every other piece type tints blue when it's on the floor you're editing.
+        // On the active floor, stairs go cyan (going up) or purple (going down) by direction
+        // — direction is determined by StairFloorDelta so it also covers the legacy Stairs piece.
         Color floorCol = type switch
         {
-            PieceType.Start                             => CStart,
-            PieceType.Exit                              => CExit,
-            PieceType.StairsUp or PieceType.StairsDown => isActive ? CStairActive : CStair,
-            _                                           => CFloor,
+            PieceType.Start  => CStart,
+            PieceType.Exit   => CExit,
+            _ when PieceDB.IsStair(type) =>
+                isActive
+                    ? (PieceDB.StairFloorDelta(type) > 0 ? CStairActiveUp : CStairActiveDown)
+                    : CStair,
+            _ => isActive ? CActive : CFloor,
         };
 
         float cx   = wx + CS * 0.5f;
@@ -965,10 +960,12 @@ public partial class MazeEditor3D : Control
         float lx = wx + CS * 0.5f - fwdX * CS * 0.5f;
         float lz = wz + CS * 0.5f - fwdZ * CS * 0.5f;
 
-        // Bright blue when this stair sits on the floor you're editing; orange otherwise.
-        // The blue-vs-orange split makes it obvious which stair in a stack is your active
-        // one when several stairs span multiple floors.
-        Color col = isActive ? CStairActive : CStair;
+        // On the active floor: cyan for stairs going UP to the next floor, purple for stairs
+        // going DOWN to the previous floor. Orange when this stair belongs to another floor.
+        // Direction by StairFloorDelta so the legacy Stairs piece (delta=+1) reads as cyan too.
+        Color col = isActive
+            ? (PieceDB.StairFloorDelta(type) > 0 ? CStairActiveUp : CStairActiveDown)
+            : CStair;
         float alpha;
         if (isActive) alpha = 0.95f;
         else
@@ -1034,15 +1031,26 @@ public partial class MazeEditor3D : Control
                     _rmb = _rmbDrag = false;
                     if (!wasDrag)
                     {
-                        // Right-click while holding a piece → abandon the hold
-                        // (Start/Exit return to origin, regular pieces are discarded).
+                        // Right-click is the unified cancel/delete gesture (Escape and D
+                        // were removed). Priority is:
+                        //   1. If a piece is being held (picked up off the grid) → discard it
+                        //   2. If a palette piece is selected (preview ghost showing) → clear the selection
+                        //   3. Otherwise, if the cursor is over a placed piece, delete that piece
+                        //      (Start/Exit are still permanent and refuse deletion).
                         if (_holding)
                         {
                             AbandonHolding();
                         }
+                        else if (_selType.HasValue)
+                        {
+                            _selType = null;
+                            RefreshPalette();
+                            RebuildBorderHints();
+                            RebuildPreviewGeo();
+                            SetStatus();
+                        }
                         else if (TryGetCell(mb.Position, out int cx, out int cy))
                         {
-                            // Short right-click = delete the piece at that cell (Start/Exit are permanent).
                             if (TryGetPlacedPiece(cx, cy, out var rp) &&
                                 (rp.Type == PieceType.Start || rp.Type == PieceType.Exit))
                             {
@@ -1051,7 +1059,7 @@ public partial class MazeEditor3D : Control
                             else
                             {
                                 RemovePiece(cx, cy);
-                                RebuildGeometry();   // also refreshes stair shadows
+                                RebuildGeometry();
                             }
                         }
                     }
@@ -1568,6 +1576,62 @@ public partial class MazeEditor3D : Control
         SetStatus(_maze.IsGameReady
             ? "Saved — maze is game-ready."
             : $"Saved — not game-ready: {readyErr}");
+
+        // Red pulse only fires now on save-failures (not during normal placement).
+        // It points at the first piece that's unreachable from Start so the user
+        // can see exactly where the path breaks.
+        if (!_maze.IsGameReady)
+        {
+            var broken = FindUnreachableProblemPiece();
+            if (broken != null) FlagErrorCell(broken.X, broken.Y, broken.Floor);
+        }
+    }
+
+    // Returns the first piece that BFS from Start cannot reach. Prefers the Exit when
+    // it's unreachable (most obvious "missing path"), then picks any other orphan piece.
+    // Returns null if everything is fine.
+    MazePiece? FindUnreachableProblemPiece()
+    {
+        var start = _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Start);
+        if (start == null) return _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit)
+                                ?? _maze.Pieces.FirstOrDefault();
+
+        var visited = new System.Collections.Generic.HashSet<(int, int, int)>
+            { (start.X, start.Y, start.Floor) };
+        var queue   = new System.Collections.Generic.Queue<MazePiece>();
+        queue.Enqueue(start);
+
+        var lookup = _maze.Pieces.ToDictionary(p => (p.X, p.Y, p.Floor));
+        Dir[]       all  = { Dir.N, Dir.E, Dir.S, Dir.W };
+        (int,int)[] dlt  = { (0,-1), (1,0), (0,1), (-1,0) };
+        Dir[]       opp  = { Dir.S, Dir.W, Dir.N, Dir.E };
+
+        while (queue.Count > 0)
+        {
+            var p   = queue.Dequeue();
+            Dir op  = PieceDB.GetOpenings(p.Type, p.Rotation);
+            for (int i = 0; i < 4; i++)
+            {
+                if ((op & all[i]) == 0) continue;
+                int nFloor = p.Floor;
+                if (PieceDB.IsStair(p.Type) &&
+                    all[i] == PieceDB.GetStairCrossDir(p.Type, p.Rotation))
+                    nFloor = p.Floor + PieceDB.StairFloorDelta(p.Type);
+                var key = (p.X + dlt[i].Item1, p.Y + dlt[i].Item2, nFloor);
+                if (visited.Contains(key)) continue;
+                if (!lookup.TryGetValue(key, out var nb)) continue;
+                if (PieceDB.IsStair(nb.Type) &&
+                    opp[i] == PieceDB.GetStairCrossDir(nb.Type, nb.Rotation)) continue;
+                if ((PieceDB.GetOpenings(nb.Type, nb.Rotation) & opp[i]) == 0) continue;
+                visited.Add(key);
+                queue.Enqueue(nb);
+            }
+        }
+
+        // Exit first — that's almost always the user-visible problem when a save fails.
+        var exit = _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+        if (exit != null && !visited.Contains((exit.X, exit.Y, exit.Floor))) return exit;
+        return _maze.Pieces.FirstOrDefault(p => !visited.Contains((p.X, p.Y, p.Floor)));
     }
 
     void LoadSlot(int s)
@@ -1797,69 +1861,12 @@ public partial class MazeEditor3D : Control
             _errorPulseCy * CS + CS * 0.5f);
     }
 
-    // ── Edge wall system ───────────────────────────────────────────────────────
-    // Draws full-width translucent walls at every closed cell boundary on the current floor.
-    void RebuildEdgeWalls()
-    {
-        foreach (var mi in _edgeWalls) { if (IsInstanceValid(mi)) mi.QueueFree(); }
-        _edgeWalls.Clear();
-
-        float wallMidY = _floor * EdFH + FlrT + WallH * 0.5f;
-        const float alpha = 0.38f;
-
-        var placed = new System.Collections.Generic.Dictionary<(int, int), MazePiece>();
-        foreach (var p in _maze.Pieces)
-            if (p.Floor == _floor)
-                placed[(p.X, p.Y)] = p;
-
-        static Dir OpenOf(MazePiece? p) => p == null ? Dir.None : PieceDB.GetOpenings(p.Type, p.Rotation);
-
-        // Horizontal edges: wall panel at z = cy*CS, running along X (N face of row cy / S face of row cy-1)
-        for (int cy = 0; cy <= GH; cy++)
-        for (int cx = 0; cx < GW;  cx++)
-        {
-            bool hasA = placed.TryGetValue((cx, cy - 1), out var above);
-            bool hasB = placed.TryGetValue((cx, cy),     out var below);
-            if (!hasA && !hasB) continue;
-
-            bool aOpen = hasA && (OpenOf(above) & Dir.S) != 0;
-            bool bOpen = hasB && (OpenOf(below) & Dir.N) != 0;
-
-            bool draw = hasA && hasB ? !(aOpen && bOpen)
-                      : hasA        ? !aOpen
-                                    : !bOpen;
-            if (!draw) continue;
-
-            var mi = MakeMeshBox(
-                new Vector3(cx * CS + CS * 0.5f, wallMidY, cy * CS),
-                new Vector3(CS - 0.04f, WallH, WallT), CWall, alpha);
-            _world.AddChild(mi);
-            _edgeWalls.Add(mi);
-        }
-
-        // Vertical edges: wall panel at x = cx*CS, running along Z (W face of col cx / E face of col cx-1)
-        for (int cx = 0; cx <= GW; cx++)
-        for (int cy = 0; cy < GH;  cy++)
-        {
-            bool hasL = placed.TryGetValue((cx - 1, cy), out var left);
-            bool hasR = placed.TryGetValue((cx,     cy), out var right);
-            if (!hasL && !hasR) continue;
-
-            bool lOpen = hasL && (OpenOf(left)  & Dir.E) != 0;
-            bool rOpen = hasR && (OpenOf(right) & Dir.W) != 0;
-
-            bool draw = hasL && hasR ? !(lOpen && rOpen)
-                      : hasL        ? !lOpen
-                                    : !rOpen;
-            if (!draw) continue;
-
-            var mi = MakeMeshBox(
-                new Vector3(cx * CS, wallMidY, cy * CS + CS * 0.5f),
-                new Vector3(WallT, WallH, CS - 0.04f), CWall, alpha);
-            _world.AddChild(mi);
-            _edgeWalls.Add(mi);
-        }
-    }
+    // RebuildEdgeWalls was removed — the edge-wall system used to draw translucent
+    // grey panels at every closed cell boundary on the current floor. The visual got
+    // noisy with stair chains and obscured the floor layout, so it's gone now;
+    // pieces communicate the floor plan via their blue active-color tint instead.
+    // ClearEdgeWalls() (above) is still called from RebuildGeometry to free any
+    // stragglers from an older slot save that might have created entries.
 
     // ── Border cell hints (for Exit/Start placement) ───────────────────────────
     void RebuildBorderHints()
@@ -1949,11 +1956,7 @@ public partial class MazeEditor3D : Control
 
             if (myHasOpen != nbrHasOpen)
             {
-                if (!silent)
-                {
-                    SetStatus($"Opening mismatch with {PieceDB.Labels[nbr.Type]} at ({nx},{ny}).");
-                    FlagErrorCell(nx, ny, _floor);
-                }
+                if (!silent) SetStatus($"Opening mismatch with {PieceDB.Labels[nbr.Type]} at ({nx},{ny}).");
                 return false;
             }
             if (myHasOpen) hasConnection = true;
@@ -1983,6 +1986,15 @@ public partial class MazeEditor3D : Control
         Dir crossDir = PieceDB.GetStairCrossDir(type, rot);
         int destFloor = _floor + PieceDB.StairFloorDelta(type);
 
+        // Reject if this stair would directly chain to (or stack against) a stair going
+        // the OTHER way. Same-direction chains form a clean ramp and are still allowed —
+        // it's only the Up↔Down V shape (or back-to-back overlap) that's rejected.
+        if (ConnectsToOppositeStair(cx, cy, type, rot, _floor))
+        {
+            SetStatus("Stairs up can't connect directly to stairs down. Same-direction chains are fine.");
+            return false;
+        }
+
         // Flat side opening mismatch check (same floor)
         foreach (Dir dir in new[] { Dir.N, Dir.S, Dir.E, Dir.W })
         {
@@ -1998,7 +2010,6 @@ public partial class MazeEditor3D : Control
             if (myHasOpen != nbrHasOpen)
             {
                 SetStatus($"Stair opening mismatch with {PieceDB.Labels[nbr.Type]} at ({nx},{ny}).");
-                FlagErrorCell(nx, ny, _floor);
                 return false;
             }
         }
@@ -2261,9 +2272,12 @@ public partial class MazeEditor3D : Control
 
     // True iff placing `type` at rotation `r` at (x,y,floor) wouldn't create an
     // opening mismatch with any placed same-floor neighbor (excluding the cross face,
-    // which connects to the OTHER floor and is checked separately).
+    // which connects to the OTHER floor and is checked separately). Also rejects
+    // rotations that would create a direct Up↔Down stair chain.
     bool IsStairRotationCompatible(PieceType type, int r, int x, int y, int floor)
     {
+        if (ConnectsToOppositeStair(x, y, type, r, floor)) return false;
+
         Dir crossDir = PieceDB.GetStairCrossDir(type, r);
         foreach (Dir dir in new[] { Dir.N, Dir.S, Dir.E, Dir.W })
         {
@@ -2278,6 +2292,68 @@ public partial class MazeEditor3D : Control
             if (myOpen != nbrOpen) return false;
         }
         return true;
+    }
+
+    // True iff placing this stair at (x,y) rotation `r` on `floor` would directly chain
+    // to (or geometrically overlap with) an existing stair going the OPPOSITE vertical
+    // direction (Up↔Down). Same-direction chains stay valid — they form a continuous
+    // ramp, which is the intended way to traverse multiple floors.
+    //
+    // Three rejected configurations:
+    //   A. My cell IS an opposite stair's cross-floor landing AND my flat opens back
+    //      toward it — its top meets my high end at the cell boundary (an "inverted V").
+    //   B. My cross-floor landing IS the cell of an opposite stair AND its flat opens
+    //      back toward me — symmetric of A from the other piece's perspective.
+    //   C. An opposite stair sits at MY XY on the adjacent floor whose Y range
+    //      overlaps mine — the two stair geometries would occupy the same 3D volume
+    //      (stacked back-to-back).
+    bool ConnectsToOppositeStair(int x, int y, PieceType type, int r, int floor)
+    {
+        if (!PieceDB.IsStair(type)) return false;
+        int myDelta = PieceDB.StairFloorDelta(type);
+        Dir myFlat  = PieceDB.GetStairFlatDir(type, r);
+        Dir myCross = PieceDB.GetStairCrossDir(type, r);
+
+        // Case A: my cell is an opposite stair's landing.
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            if (PieceDB.StairFloorDelta(s.Type) == myDelta) continue;   // same direction OK
+            int sDestFloor = s.Floor + PieceDB.StairFloorDelta(s.Type);
+            if (sDestFloor != floor) continue;
+            Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+            var (sdx, sdy) = DirToOffset(scross);
+            if (s.X + sdx == x && s.Y + sdy == y &&
+                myFlat == PieceDB.Opposite(scross))
+                return true;
+        }
+
+        // Case B: my landing is an opposite stair's cell.
+        int myDestFloor = floor + myDelta;
+        var (mdx, mdy)  = DirToOffset(myCross);
+        int landX = x + mdx, landY = y + mdy;
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            if (PieceDB.StairFloorDelta(s.Type) == myDelta) continue;
+            if (s.Floor != myDestFloor) continue;
+            if (s.X != landX || s.Y != landY) continue;
+            Dir sflat = PieceDB.GetStairFlatDir(s.Type, s.Rotation);
+            if (sflat == PieceDB.Opposite(myCross)) return true;
+        }
+
+        // Case C: opposite-direction stair stacked at my exact XY on the floor where
+        // our spans overlap. A StairsUp on floor F (span F→F+1) and a StairsDown on
+        // floor F+1 (span F→F+1) occupy the same Y range at the same cell.
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            if (PieceDB.StairFloorDelta(s.Type) == myDelta) continue;
+            if (s.X != x || s.Y != y) continue;
+            if (s.Floor == myDestFloor) return true;   // opposite stair sitting on my destination floor at same XY
+        }
+
+        return false;
     }
 
     static int PopCount(int n)
