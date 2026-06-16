@@ -16,3 +16,9 @@ AI Chats/
 
 # Oversized GLB (exceeds GitHub 100MB limit) — keep on disk, out of git
 assets/all_dmc2_swords_remade.glb
+
+# Build artifacts — exported binaries and node deps should never be committed
+build/
+*.exe
+*.pck
+server/node_modules/
