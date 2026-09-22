@@ -92,12 +92,20 @@ wss.on('connection', ws => {
         lobby.delete(challengerId);
         lobby.delete(ws._id);
         broadcastLobbyUpdate();
-        send(challenger.ws, { type: 'match_made', code, isHost: true });
-        send(ws,            { type: 'match_made', code, isHost: false });
+        // Each side gets the OTHER player's display name, so the game can say
+        // "You died to <name>" instead of an anonymous defeat.
+        send(challenger.ws, { type: 'match_made', code, isHost: true,  opponentName: ws._name });
+        send(ws,            { type: 'match_made', code, isHost: false, opponentName: challenger.ws._name });
         console.log(`Match: ${challenger.ws._name} vs ${ws._name} → room ${code}`);
       } else {
         send(challenger.ws, { type: 'challenge_declined' });
       }
+
+    } else if (msg.type === 'stats') {
+      // Population readout for the title screen. Deliberately does NOT add the
+      // asker to `lobby` — someone sitting on the main menu must not show up as
+      // challengeable to everyone in the matchmaking list.
+      send(ws, { type: 'stats', online: wss.clients.size, lobby: lobby.size });
 
     } else {
       // Forward game data to peer in room
