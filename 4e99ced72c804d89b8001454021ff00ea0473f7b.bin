@@ -1,0 +1,176 @@
+# BUILD.md
+
+# Palisade Build and Run Notes
+
+## Requirements
+
+- Godot 4.x with C#/.NET support
+- .NET SDK
+- Windows development environment
+- VS Code or Godot editor
+
+## Project Root
+
+All commands should be run from the project root.
+
+Do not `cd` inside scripts or subfolders when using `/godogen`.
+
+Project root:
+
+```txt
+C:\Users\Abe\Documents\palisade-godot
+```
+
+## Compile Gate and Headless Test Runs
+
+Discovered while implementing the Room/Pit piece types (`.superpowers/sdd/roompit-task-*-report.md`).
+
+The fast, reliable way to check the C# compiles is:
+
+```bash
+dotnet build Palisade.csproj -v q
+```
+
+This runs in a few seconds. The `.csproj` **must be named explicitly** —
+the repo root holds both `Palisade.csproj` and `palisade-godot.sln`, and an
+unqualified `dotnet build` resolves ambiguously.
+
+Two Godot invocations that look like reasonable alternatives are traps:
+
+- `godot --headless --path . --quit` can hang past 300 seconds and must not
+  be used as a compile gate. Use the `dotnet build` command above instead,
+  then only launch Godot (headless or not) once the build is already known
+  to be green.
+- `godot --headless --path . --write-movie ...` crashes this engine build
+  with a null texture dereference under the GL-compatibility renderer. For
+  scripted screenshot/video capture, run Godot **without** `--headless`,
+  writing a PNG sequence instead:
+
+  ```bash
+  "$GODOT_MONO" --path . --write-movie "screenshots/mydir/frame.png" --fixed-fps 1 --quit-after N
+  ```
+
+  Point `run/main_scene` in `project.godot` at the target test scene first
+  (back it up, `sed` the one line, restore it immediately after capture —
+  never leave `project.godot` pointed at a test scene or staged with that
+  change).
+
+A headless run against a scene whose C# hasn't been rebuilt will silently
+reuse the last compiled assembly rather than erroring — always run the
+`dotnet build` compile gate first, not a Godot run, when checking whether an
+edit actually compiles.
+
+## Exporting the Playtest Build (Windows)
+
+Discovered the hard way across the 2026-09-22 playtest rounds (see JOURNAL.md
+entries from that date).
+
+**The sequence — order matters:**
+
+1. **Close the Godot editor.** Running headless `--import`/`--export-release`
+   while the editor holds the project corrupts `.godot/imported/` (two
+   instances fight over the cache) and ships stale/missing assets. Check:
+   `Get-Process | Where-Object { $_.ProcessName -like "*odot*" }`
+2. Verify `run/main_scene` in project.godot is `res://scenes/TitleScreen.tscn`
+   — the export bakes whatever is there.
+3. Import, then export, with the mono binary:
+   ```powershell
+   & "C:\Godot_v4.6.2-stable_mono_win64\Godot_v4.6.2-stable_mono_win64.exe" --path . --headless --import
+   & "C:\Godot_v4.6.2-stable_mono_win64\Godot_v4.6.2-stable_mono_win64.exe" --path . --headless --export-release "Corners" "build/windows/Corners.exe"
+   ```
+4. Distribute the WHOLE folder — `Corners.exe` needs the sibling
+   `data_Palisade_windows_x86_64/`:
+   ```powershell
+   Compress-Archive -Path 'build\windows\Corners.exe','build\windows\data_Palisade_windows_x86_64' -DestinationPath 'build\Corners-Windows.zip' -Force
+   ```
+
+**Export-only failure class to remember:** exports pack IMPORTED artifacts,
+not source files. Any code that reads assets via `Image.Load`,
+`GltfDocument.AppendFromFile`, `System.IO`, or `GlobalizePath` works in the
+editor and silently fails in the exe — always go through
+`ResourceLoader`/`GD.Load` first (see PropLibrary.PropsAvailable and
+DungeonBuilder.LoadTexture for the pattern). A `.gdignore` over a directory
+keeps it out of exports entirely; `assets/glb/props_hires/` is deliberately
+ignored (661 MB raw AI meshes — the game reads `assets/glb/props/`).
+
+## Local Multiplayer Testing
+
+- `test-local.bat` — starts the local relay (node) + two windows (Alice/Bob)
+  against `ws://localhost:3000`, tiled side by side.
+- `test-online.bat` — two windows through the PRODUCTION Render relay: real
+  machine → Render → machine round trips for genuine latency feel.
+- Both use `--test-windowed` (960×540 windowed regardless of the saved
+  fullscreen preference, without overwriting it) plus `--position` to tile.
+- Exported-game logs land in
+  `%APPDATA%\Godot\app_userdata\Corners\logs\godot.log` — the first place to
+  look when a playtest misbehaves ("[Gun] HIT", "[ARENA] ...", rejected hit
+  claims, prop availability all print there).
+
+## Claude Chat Export to Obsidian
+
+This repo is also an Obsidian vault. Claude Code transcript archives can be exported locally with no API calls or LLM token cost:
+
+```powershell
+.\tools\export-claude-chats.ps1
+```
+
+If PowerShell script execution is disabled on the machine, use the per-command bypass form:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\export-claude-chats.ps1
+```
+
+By default the script reads transcript JSONL files from:
+
+```txt
+C:\Users\Abe\.claude\projects
+```
+
+and writes Markdown files to:
+
+```txt
+.\AI Chats\Claude Code
+```
+
+Useful options:
+
+```powershell
+.\tools\export-claude-chats.ps1 -DryRun
+.\tools\export-claude-chats.ps1 -ProjectFilter palisade
+.\tools\export-claude-chats.ps1 -Force
+.\tools\export-claude-chats.ps1 -OutputRoot "D:\Obsidian\AI Chats\Claude Code"
+```
+
+The exporter keeps `.export-manifest.json` in the output folder and skips unchanged transcripts unless `-Force` is passed.
+
+By default the exporter is Obsidian-friendly: it skips Claude thinking blocks, tool-use JSON, and tool results, and truncates very large individual messages. This prevents the vault from freezing on huge raw transcript dumps. For a full raw archive, export outside an Obsidian vault and pass:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\export-claude-chats.ps1 -IncludeThinking -IncludeToolResults -MaxEntryChars 0 -OutputRoot "C:\Users\Abe\Documents\Claude Raw Archive"
+```
+
+For Claude Code hook automation, use `tools/export-claude-hook.ps1`. It reads Claude hook JSON from stdin, extracts `transcript_path`, and exports only that session:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\export-claude-hook.ps1
+```
+
+This machine has a global Claude `SessionEnd` hook installed in:
+
+```txt
+C:\Users\Abe\.claude\settings.json
+```
+
+The hook runs the global exporter script from:
+
+```txt
+C:\Users\Abe\.claude\tools\export-claude-hook.ps1
+```
+
+It writes all project exports into the main personal Obsidian vault:
+
+```txt
+C:\Users\Abe\Documents\NoBrainer\AI Chats\Claude Code
+```
+
+Palisade can still keep project-local exports in `.\AI Chats\Claude Code` when running the exporter manually with `-OutputRoot`.
