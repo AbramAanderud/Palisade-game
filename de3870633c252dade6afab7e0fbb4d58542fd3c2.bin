@@ -1,0 +1,100 @@
+# Palisade — Build Memory
+
+## Visual Flair — Atmosphere + Props Layer (2026-06-16, torch system replaced 2026-07-21)
+
+Optional dungeon polish lives entirely in `scripts/VisualFlair.cs`, gated behind a
+**control panel** of static fields (master `VisualFlair.Enabled` + per-feature
+toggles/values read at build time). Wired in via two guarded one-liners only:
+- `DungeonBuilder.Build()` → `VisualFlair.Decorate(this, data.Pieces, TorchByCell)`
+- `OnlineDungeonArena.BuildEnvironment()` → `VisualFlair.ApplyEnvironment(env)`
+
+To revert: set `Enabled = false` (runtime), or delete the file + those two calls.
+
+What it does today: exponential depth fog + glow/bloom + exposure grade; layered-sine
+flicker via the self-contained `TorchFlicker` node on whatever light `TorchByCell`
+holds per cell; tames the raw 3.5-energy Start(green)/Exit(red) landmark glows to
+~2.0/1.6; fakes god-ray beams at Start/Exit with an additive cone + spotlight (**true
+volumetric fog/SSAO are NOT available in GL Compatibility** — must fake); plus
+hanging banners (disabled, `Banners=false`) + floor rubble.
+
+**Torch system replaced 2026-07-21 (Polish Pass Task 2 — playtest: "old torches
+still there, remove them, sconces bigger/correctly mounted"):** the old procedural
+wall-mounted torch (an ambient `OmniLight3D` from `DungeonBuilder.AddTorches`,
+relocated onto a wall by `VisualFlair`'s `WallTorches` flag and paired with a
+tiny iron-bracket + emissive-flame-cone mesh via the now-DELETED `AddTorchBracket`)
+is gone. GLB sconces (`PieceVariants.AddSconces`, `torch_a`/`torch_b`, scaled to
+~1.1m) are now the primary visible torch prop AND the primary light source:
+- `AddSconces` places one sconce on every closed wall of every non-stair piece,
+  rolls a light 1-in-2 per wall (`Fnv(..., salt: 17) % 2`), and — when lit —
+  registers the sconce's own `FlameLight` child (energy 3.0/range 14) directly
+  into `DungeonBuilder.TorchByCell` (now threaded through `PieceVariants.Apply`).
+- `DungeonBuilder.AddTorches` runs *after* `PieceVariants.Apply` and only adds a
+  dim fallback ambient light (2.4/13, no mesh) for a cell that ends up with
+  **no** lit sconce — e.g. a 4-way `Cross` piece (no closed wall to mount one on)
+  or an unlucky run of unlit rolls — so no cell is ever pitch dark and no cell
+  ever double-lights (fallback and sconce-light are mutually exclusive per cell).
+  Stair cells and Start/Exit landmarks are untouched — always get their own light,
+  same as before.
+- `VisualFlair.Decorate`'s regular-corridor branch now ONLY calls
+  `flicker?.Register(light, FlickerAmount)` on whatever's in `TorchByCell` — no
+  repositioning, no bracket mesh. `WallTorches`/`TorchShadows`/`ShadowEvery`/
+  `TorchEnergy`/`TorchRange` fields and `AddTorchBracket`/`WallMount`/`IronMat`/
+  `FlameMat` are all deleted (dead once the bracket mesh was removed).
+- `TorchSignalSystem` (the Exit→Start BFS reveal, reads `builder.TorchByCell`)
+  needed **zero** changes — it only ever needed *a* light per cell, and still
+  gets one from either a sconce or the fallback.
+- Known minor: if a piece has 2 lit sconces (e.g. a straight corridor with both
+  closed walls rolling lit), only the later-registered one gets flicker/gets
+  tweened blue by `TorchSignalSystem` — the other stays static. Same trade-off
+  the always-lit mid-corridor candelabra already had pre-existing (it was never
+  wired into `TorchByCell`/flicker either). Not fixed — matches existing pattern.
+
+Preview harness: `test/TestVisualFlair.cs` (+ `.tscn`) builds a sample corridor and
+flies an eye-level camera through it. Pass `-- flairoff` to capture a before/after
+from one build. The old `shadowsoff` arg was retired with `TorchShadows`.
+
+---
+
+## Stair Physics — Final Solution (2026-05-07)
+
+**Pattern**: Visual steps, invisible ramp collision. Industry standard (Source Engine, Unreal, Unity).
+
+- `DungeonBuilder.cs` stair branch: `AddMeshVisual` for `floorST` (treads) and `riserST` (risers) — no collision. `AddStairRamp` adds the physics ramp.
+- `PlayerController.cs`: `FloorMaxAngle` must exceed the ramp angle. Formula: `atan(FloorHeight / CellSize)` degrees. Currently `FloorHeight=18, CellSize=10` → ~61°, `FloorMaxAngle=68°`.
+- **If `FloorHeight` or `CellSize` change, update `FloorMaxAngle` to stay ≥5° above `atan(FloorHeight/CellSize)`.**
+- `FloorSnapLength = 1.5f`, `TryStepUp` kept for non-stair obstacles (harmless on ramp — `TestMove` never fires on a slope).
+- Root cause of old bugs: per-tread collision let the capsule step off tread edges → brief airborne → horizontal momentum arced the player. No amount of snap tuning fixed this reliably.
+
+---
+
+## Player Setup (2026-04-20)
+
+### Rascal.glb inspection
+- Located at `res://playerModels/rascal-cat/Rascal.glb`
+- Contents: 1 mesh, 0 skins, 0 animations — static mesh only
+- No AnimationPlayer available; procedural motion path is active
+
+### Working configuration
+- `ModelScale = 3.0f` — correct visual size, readable against 2m reference objects
+- `ModelYOff = -0.05f` — feet flush at capsule base
+- `model.RotationDegrees = new Vector3(0f, 180f, 0f)` — correct front-facing orientation
+- FP mode: model hidden, eye height 1.45m, FOV 90°, near 0.05m (no self-clip)
+- TP mode: `TpDistance = 4.0f`, `TpElevation = 1.8f` — model fills frame well
+
+### PlayerAnimator
+- `scripts/PlayerAnimator.cs` — procedural motion: walk bob (9 Hz), run bob (14 Hz), slide tilt (0.35 rad), wall-run lean (0.25 rad Z)
+- All 12 AnimState slots stubbed; `AnimNames` dict ready for real clip names once a rigged GLB is provided
+- `_ap` auto-discovery will activate when rigged GLB is dropped in — no code change needed
+
+### Capture workflow (Windows)
+- Binary: `C:/Godot_v4.6.2-stable_mono_win64/Godot_v4.6.2-stable_mono_win64.exe`
+- Must set `project.godot run/main_scene` to test .tscn before capture, restore after
+- Test harness pattern: `partial class TestXMain : Node3D` (not SceneTree)
+- `--fixed-fps 10 --quit-after N` for physics-based tests
+
+### Verified in-engine
+- ✅ Model appears at correct scale
+- ✅ First-person default, no self-clipping
+- ✅ Third-person toggle on `3` shows Rascal model
+- ✅ Procedural animator connected and printing confirmation at startup
+- ✅ Physics: player falls and lands on floor correctly
