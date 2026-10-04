@@ -1,4 +1,0 @@
-[gd_scene format=3 uid="uid://d1rax8pcbytmy"]
-[ext_resource type="Script" path="res://test/TierCheck.cs" id="1_s"]
-[node name="TierCheck" type="Node3D"]
-script = ExtResource("1_s")

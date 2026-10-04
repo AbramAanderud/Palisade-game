@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://dg8rx8gwdipbo"]
-
-[ext_resource type="Script" path="res://test/TestGunRange.cs" id="1_s"]
-
-[node name="TestGunRange" type="Node3D"]
-script = ExtResource("1_s")

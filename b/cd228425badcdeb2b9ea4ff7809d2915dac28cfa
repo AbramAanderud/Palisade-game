@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://testcombatlock1"]
-
-[ext_resource type="Script" path="res://test/TestCombatLock.cs" id="1_s"]
-
-[node name="TestCombatLock" type="Node"]
-script = ExtResource("1_s")

@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://testpitdividercollisiontscn1"]
-
-[ext_resource type="Script" path="res://test/TestPitDividerCollision.cs" id="1_s"]
-
-[node name="TestPitDividerCollision" type="Node3D"]
-script = ExtResource("1_s")

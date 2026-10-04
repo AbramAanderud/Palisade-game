@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://cydn7jpx01u4s"]
-
-[ext_resource type="Script" path="res://test/TestVisualFlair.cs" id="1_v"]
-
-[node name="TestVisualFlair" type="Node3D"]
-script = ExtResource("1_v")

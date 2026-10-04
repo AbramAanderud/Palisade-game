@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://ctitledrag1"]
-
-[ext_resource type="Script" path="res://test/TestTitleDrag.cs" id="1_tdg"]
-
-[node name="TestTitleDrag" type="Node"]
-script = ExtResource("1_tdg")

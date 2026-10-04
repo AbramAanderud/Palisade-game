@@ -1,8 +1,0 @@
-[gd_scene format=3]
-
-[ext_resource type="Script" path="res://test/TestFfaLobbyFlow.cs" id="1_f"]
-
-[node name="TestFfaLobbyFlowScene" type="Node"]
-
-[node name="Driver" type="Node" parent="."]
-script = ExtResource("1_f")

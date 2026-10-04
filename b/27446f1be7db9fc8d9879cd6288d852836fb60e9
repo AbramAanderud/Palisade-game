@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://tpropload1"]
-
-[ext_resource type="Script" path="res://test/TestPropLoad.cs" id="1"]
-
-[node name="TestPropLoad" type="Node3D"]
-script = ExtResource("1")

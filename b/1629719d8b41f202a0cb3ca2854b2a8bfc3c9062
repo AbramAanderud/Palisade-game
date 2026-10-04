@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://tphysprop01"]
-
-[ext_resource type="Script" path="res://test/TestPhysicsProps.cs" id="1"]
-
-[node name="TestPhysicsProps" type="Node3D"]
-script = ExtResource("1")

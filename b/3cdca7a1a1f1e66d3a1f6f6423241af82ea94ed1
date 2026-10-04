@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://bs4bu0ig1ymvi"]
-
-[ext_resource type="Script" path="res://test/TestTeleportPairs.cs" id="1_s"]
-
-[node name="TestTeleportPairs" type="Node"]
-script = ExtResource("1_s")

@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://testpickuppromptscn1"]
-
-[ext_resource type="Script" path="res://test/TestPickupPrompt.cs" id="1_s"]
-
-[node name="TestPickupPrompt" type="Node3D"]
-script = ExtResource("1_s")

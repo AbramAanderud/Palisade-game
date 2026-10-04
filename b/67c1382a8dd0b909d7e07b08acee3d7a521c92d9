@@ -1,6 +1,0 @@
-[gd_scene format=3 uid="uid://bfa5fqawt50jg"]
-
-[ext_resource type="Script" path="res://test/TestPickupReach.cs" id="1_s"]
-
-[node name="TestPickupReach" type="Node3D"]
-script = ExtResource("1_s")
