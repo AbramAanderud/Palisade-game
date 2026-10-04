@@ -1,0 +1,91 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// scripts/FfaLightGate.cs — per-maze/hallway light gating for the FFA plus
+/// layout. GL Compatibility chokes well before thousands of simultaneous omni
+/// lights (Task 7's perf capture: 4179 omnis → 28.7 ms / 35 fps at the arena
+/// centre). The 108 m arena walls and each maze's vaulted ceiling mean a maze's
+/// lights only ever matter while the viewer can actually see into it, so this
+/// toggles OmniLight3D.Visible on/off per seat's maze and hallway subtree.
+/// Built for test/FfaLocalArena.cs (Phase 1, no networking); the online FFA
+/// scene reuses it unchanged in Phase 5 — same Attach signature, viewer lambda
+/// swapped for whatever supplies the local player's camera there.
+public partial class FfaLightGate : Node
+{
+    PlusLayoutResult _layout = null!;
+    Vector3 _origin;
+    Func<Vector3?> _viewer = null!;
+    List<OmniLight3D>[] _mazeLights = Array.Empty<List<OmniLight3D>>();
+    List<OmniLight3D>[] _hallLights = Array.Empty<List<OmniLight3D>>();
+    float _timer;
+
+    // Last evaluated zone: -1 = arena, 0..n-1 = that seat's maze/hall, or
+    // NoViewer when the viewer lambda returned null (everything left on).
+    // Starts at Unset so the very first Evaluate() (from Attach) always applies,
+    // even though its computed zone could otherwise coincide with any sentinel.
+    public const int NoViewer = -2;
+    const int Unset = int.MinValue;
+    public int CurrentSeat { get; private set; } = Unset;
+
+    /// Attaches a gate as a child of `parent`, collects each maze/hall root's
+    /// OmniLight3D descendants once, and evaluates immediately so the scene
+    /// never shows a frame with the wrong lights on.
+    public static FfaLightGate Attach(Node parent, PlusLayoutResult layout, Vector3 origin,
+                                       IReadOnlyList<Node> mazeRoots, IReadOnlyList<Node?> hallRoots,
+                                       Func<Vector3?> viewer)
+    {
+        var gate = new FfaLightGate { Name = "FfaLightGate" };
+        parent.AddChild(gate);
+        gate.Init(layout, origin, mazeRoots, hallRoots, viewer);
+        return gate;
+    }
+
+    void Init(PlusLayoutResult layout, Vector3 origin, IReadOnlyList<Node> mazeRoots,
+              IReadOnlyList<Node?> hallRoots, Func<Vector3?> viewer)
+    {
+        _layout = layout;
+        _origin = origin;
+        _viewer = viewer;
+        _mazeLights = mazeRoots.Select(Lights).ToArray();
+        _hallLights = hallRoots.Select(Lights).ToArray();
+        Evaluate();
+    }
+
+    static List<OmniLight3D> Lights(Node? root) =>
+        root == null
+            ? new List<OmniLight3D>()
+            : root.FindChildren("*", "OmniLight3D", true, false).Cast<OmniLight3D>().ToList();
+
+    public override void _Process(double delta)
+    {
+        _timer -= (float)delta;
+        if (_timer > 0f) return;
+        _timer = 0.1f;
+        Evaluate();
+    }
+
+    /// Re-evaluates which seat's lights should be on right now. Idempotent and
+    /// cheap to call repeatedly: bails out immediately if the zone hasn't
+    /// changed, and even when it has, only touches lights whose Visible state
+    /// actually needs to flip — no per-frame churn either way.
+    public void Evaluate()
+    {
+        var p = _viewer();
+        int seat = p.HasValue ? _layout.SeatAt(p.Value - _origin) : NoViewer;
+        if (seat == CurrentSeat) return;
+        CurrentSeat = seat;
+
+        for (int i = 0; i < _mazeLights.Length; i++)
+            SetVisible(_mazeLights[i], seat == NoViewer || seat == i);
+        for (int i = 0; i < _hallLights.Length; i++)
+            SetVisible(_hallLights[i], seat == NoViewer || seat == -1 || seat == i);
+    }
+
+    static void SetVisible(List<OmniLight3D> lights, bool visible)
+    {
+        foreach (var l in lights)
+            if (l.Visible != visible) l.Visible = visible;
+    }
+}

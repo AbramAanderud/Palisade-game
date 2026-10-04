@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://dw6c3myscvcry"]
+
+[ext_resource type="Script" path="res://test/TestGunSlots.cs" id="1_s"]
+
+[node name="TestGunSlots" type="Node"]
+script = ExtResource("1_s")

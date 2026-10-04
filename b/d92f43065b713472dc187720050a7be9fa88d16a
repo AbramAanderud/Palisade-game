@@ -1,0 +1,1587 @@
+# FFA Phase 1: Local Plus Layout — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build a local-only (no networking) 3/4-maze "plus" layout. The arena gets N/E/S/W doors, the maze data is rotated, and hallway length is set per match. The output is overhead screenshots plus a light/perf capture for the owner to review before any multiplayer work starts.
+
+**Architecture:** Three pure units carry the logic:
+- `MazeRotation` rotates maze data by quarter turns.
+- `MazeFootprint` records the occupied columns and vertical spans, relative to the Exit floor.
+- `PlusLayout` assigns seats to doors, computes offsets and hallway length, and answers the seat-zone query.
+
+`ArenaBuilder` takes a list of door angles, with the old N/S bool API kept as a wrapper. Hallways are rows of `Straight` pieces built by the existing `DungeonBuilder`, using a new opt-in `DeadEndOpen` mask. A dev scene `test/FfaLocalArena` assembles everything.
+
+**Tech Stack:** Godot 4.6.2 mono, C#, headless test scenes (`test/*.tscn` + `GetTree().Quit(code)`).
+
+Spec: `docs/superpowers/specs/2026-09-28-ffa-4p-design.md`
+
+## Global Constraints
+
+- Work ONLY in the worktree `C:\Users\Abe\Documents\corners-ffa` (branch `feat/ffa-4p`). Never `cd`; use `git -C ../corners-ffa` and absolute or `--path` arguments.
+- **1v1 must keep working**: `DungeonArena`, `OnlineDungeonArena`, `FlipMazeZ`, and `ArenaBuilder.Build(centre, openNorth, openSouth)` behave exactly as before.
+- Do not touch stair physics (`AddStairRamp`, `FloorMaxAngle`).
+- Compile gate: `dotnet build Palisade.csproj -v q` (run inside the worktree via `--project`, see Task 0).
+- Headless runs: `/c/Godot_v4.6.2-stable_mono_win64/Godot_v4.6.2-stable_mono_win64_console.exe --path <worktree> --headless res://test/X.tscn`.
+- Windowed runs go on the monitor NOT running League: pass `--screen N`.
+- Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- Grid facts: `CellSize=10`, `FloorHeight=18`, 10×10 grid. Exit locked to row 9 (any column, any floor −3..3); Start at row 0, floor 0. `Dir`: N = −Y, E = +X; `PieceDB` rotations are clockwise quarter turns.
+- Arena facts: `Radius=30`, `Sides=32`, `Apothem≈29.856`. Angle convention: `(sin a, 0, −cos a)`, so 0 = north and π/2 = east. Door faces are N=0, E=8, S=16, W=24.
+
+Shorthand used below: `W=/c/Users/Abe/Documents/corners-ffa`, `G=/c/Godot_v4.6.2-stable_mono_win64/Godot_v4.6.2-stable_mono_win64_console.exe`.
+
+---
+
+### Task 0: Worktree setup and regression baseline
+
+**Files:** none (environment only)
+
+- [ ] **Step 1: Import assets into the worktree's own `.godot` cache.** A fresh worktree has no `.godot/`.
+
+```bash
+"$G" --path "$W" --headless --import
+```
+Expected: exits 0 (may take several minutes).
+
+- [ ] **Step 2: Compile gate**
+
+```bash
+dotnet build "$W/Palisade.csproj" -v q
+```
+Expected: `Build succeeded` with 0 errors.
+
+- [ ] **Step 3: Run the regression baseline and record the results in the task report.**
+
+```bash
+for t in TestGateSync ArenaConnTest TestShelfWallRun TestArenaEscape TestArenaProtrusion TestDefaultMaze; do
+  echo "== $t"; "$G" --path "$W" --headless res://test/$t.tscn 2>&1 | grep -E "PASS|FAIL|ALL" | tail -3; echo "exit=$?"; done
+```
+Expected: every suite reports no FAIL. Record any pre-existing failures so they are not blamed on this work. (`TestOnlineFlow` and `TestMazePick` need the relay or a throwaway account; they are run in the Phase 2 gate.)
+
+---
+
+### Task 1: MazeRotation — rotate maze data by quarter turns
+
+**Files:**
+- Create: `scripts/MazeRotation.cs`
+- Test: `test/TestMazeRotation.cs`, `test/TestMazeRotation.tscn`
+
+**Interfaces:**
+- Produces: `MazeRotation.Rotate(MazeData src, int quarterTurns) → MazeData` (new instance), `MazeRotation.RotateCell(int x, int y, int quarterTurns) → (int x, int y)`, `MazeRotation.RotateDir(Dir d, int quarterTurns) → Dir`, `const int Grid = 10`.
+
+- [ ] **Step 1: Write the failing test** `test/TestMazeRotation.cs`
+
+```csharp
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// test/TestMazeRotation.cs — MazeRotation turns maze DATA clockwise.
+/// Proves: 4 turns = identity; every same-floor connection and every stair's
+/// cross/flat direction survives a turn; Exit (c,9) lands on the expected edge.
+public partial class TestMazeRotation : Node
+{
+    int _fail;
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    static string Key(MazePiece p) => $"{p.Type}@{p.X},{p.Y},{p.Floor}r{((p.Rotation % 4) + 4) % 4}L{p.LinkId}G{p.RoomGroup}";
+
+    // Same-floor adjacency: both cells single-cell pieces with facing openings.
+    static HashSet<string> Links(MazeData m)
+    {
+        var at = m.Pieces.Where(p => !PieceDB.IsMultiCell(p.Type))
+                         .GroupBy(p => (p.X, p.Y, p.Floor))
+                         .ToDictionary(g => g.Key, g => g.First());
+        var links = new HashSet<string>();
+        foreach (var p in at.Values)
+            foreach (var d in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+            {
+                var (dx, dy) = PieceDB.Delta(d);
+                if (!at.TryGetValue((p.X + dx, p.Y + dy, p.Floor), out var q)) continue;
+                if (PieceDB.HasSameFloorOpening(p.Type, p.Rotation, d) &&
+                    PieceDB.HasSameFloorOpening(q.Type, q.Rotation, PieceDB.Opposite(d)))
+                    links.Add($"{p.X},{p.Y},{p.Floor}>{d}");
+            }
+        return links;
+    }
+
+    public override void _Ready()
+    {
+        var src = DefaultMaze.Build();
+        src.Pieces.Add(new MazePiece { Type = PieceType.StairsDown, X = 0, Y = 0, Floor = 2, Rotation = 1 });
+        src.Pieces.Add(new MazePiece { Type = PieceType.LHall, X = 9, Y = 0, Floor = 2, Rotation = 3, RoomGroup = 7 });
+
+        // 4 turns = identity
+        var r4 = MazeRotation.Rotate(MazeRotation.Rotate(MazeRotation.Rotate(MazeRotation.Rotate(src, 1), 1), 1), 1);
+        Check(src.Pieces.Select(Key).OrderBy(s => s).SequenceEqual(r4.Pieces.Select(Key).OrderBy(s => s)),
+              "four quarter turns reproduce the original pieces exactly");
+        Check(MazeRotation.Rotate(src, 4).Pieces.Select(Key).SequenceEqual(src.Pieces.Select(Key)),
+              "Rotate(src,4) is identity");
+        Check(!ReferenceEquals(MazeRotation.Rotate(src, 0), src), "Rotate returns a new instance");
+
+        for (int k = 1; k <= 3; k++)
+        {
+            var rot = MazeRotation.Rotate(src, k);
+            // Every source link maps to a link in the rotated maze
+            var expected = new HashSet<string>();
+            foreach (var l in Links(src))
+            {
+                var parts = l.Split('>'); var xyz = parts[0].Split(',');
+                var (x, y) = MazeRotation.RotateCell(int.Parse(xyz[0]), int.Parse(xyz[1]), k);
+                var d = MazeRotation.RotateDir(System.Enum.Parse<Dir>(parts[1]), k);
+                expected.Add($"{x},{y},{xyz[2]}>{d}");
+            }
+            Check(expected.SetEquals(Links(rot)), $"k={k}: same-floor connections preserved ({expected.Count})");
+
+            // Stairs: cross dir rotates with the grid
+            bool stairsOk = true;
+            for (int i = 0; i < src.Pieces.Count; i++)
+            {
+                var a = src.Pieces[i]; var b = rot.Pieces[i];
+                if (!PieceDB.IsStair(a.Type)) continue;
+                stairsOk &= PieceDB.GetStairCrossDir(b.Type, b.Rotation) ==
+                            MazeRotation.RotateDir(PieceDB.GetStairCrossDir(a.Type, a.Rotation), k);
+            }
+            Check(stairsOk, $"k={k}: every stair's cross-floor face rotates with the grid");
+        }
+
+        // Exit column c on row 9 lands on the expected edge
+        Check(MazeRotation.RotateCell(3, 9, 1) == (0, 3), "k=1: Exit (3,9) → west edge (0,3)");
+        Check(MazeRotation.RotateCell(3, 9, 2) == (6, 0), "k=2: Exit (3,9) → north edge (6,0)");
+        Check(MazeRotation.RotateCell(3, 9, 3) == (9, 6), "k=3: Exit (3,9) → east edge (9,6)");
+        Check(MazeRotation.RotateDir(Dir.S, 1) == Dir.W && MazeRotation.RotateDir(Dir.S, 2) == Dir.N &&
+              MazeRotation.RotateDir(Dir.S, 3) == Dir.E, "arena-side Dir.S rotates S→W→N→E");
+
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}
+```
+
+`test/TestMazeRotation.tscn`:
+```
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://test/TestMazeRotation.cs" id="1"]
+
+[node name="TestMazeRotation" type="Node"]
+script = ExtResource("1")
+```
+
+- [ ] **Step 2: Build and confirm it fails.** `dotnet build "$W/Palisade.csproj" -v q` should FAIL with `CS0103: The name 'MazeRotation' does not exist`.
+
+- [ ] **Step 3: Implement** `scripts/MazeRotation.cs`
+
+```csharp
+/// res://scripts/MazeRotation.cs — rotate a maze's DATA by clockwise quarter turns.
+///
+/// Every piece's openings, stair directions and footprints are defined as
+/// "base shape at rotation 0, turned clockwise once per rotation step"
+/// (PieceDB.RotateCW: N→E→S→W, with N = −Y and E = +X). Turning the whole
+/// 10×10 grid clockwise is therefore exact for EVERY piece type:
+/// (x, y) → (Grid−1−y, x) and rotation + 1. No per-type table is needed —
+/// unlike DungeonArena.FlipMazeZ, which is a MIRROR and so has to remap
+/// chiral pieces one by one. Used by the FFA plus layout for the E/S/W mazes.
+public static class MazeRotation
+{
+    public const int Grid = 10;
+
+    static int Norm(int k) => ((k % 4) + 4) % 4;
+
+    public static (int x, int y) RotateCell(int x, int y, int quarterTurns)
+    {
+        for (int i = 0; i < Norm(quarterTurns); i++) (x, y) = (Grid - 1 - y, x);
+        return (x, y);
+    }
+
+    public static Dir RotateDir(Dir d, int quarterTurns)
+    {
+        for (int i = 0; i < Norm(quarterTurns); i++)
+        {
+            Dir r = Dir.None;
+            if ((d & Dir.N) != 0) r |= Dir.E;
+            if ((d & Dir.E) != 0) r |= Dir.S;
+            if ((d & Dir.S) != 0) r |= Dir.W;
+            if ((d & Dir.W) != 0) r |= Dir.N;
+            d = r;
+        }
+        return d;
+    }
+
+    public static MazeData Rotate(MazeData src, int quarterTurns)
+    {
+        int k = Norm(quarterTurns);
+        var dst = new MazeData
+        {
+            Name = src.Name, GoldSpent = src.GoldSpent,
+            IsOnline = src.IsOnline, IsGameReady = src.IsGameReady,
+        };
+        foreach (var p in src.Pieces)
+        {
+            var (x, y) = RotateCell(p.X, p.Y, k);
+            dst.Pieces.Add(new MazePiece
+            {
+                Type = p.Type, X = x, Y = y, Floor = p.Floor,
+                Rotation  = Norm(p.Rotation + k),
+                LinkId    = p.LinkId,      // teleport pairs survive (see FlipMazeZ's note)
+                RoomGroup = p.RoomGroup,
+            });
+        }
+        return dst;
+    }
+}
+```
+
+Note: identity with `k = 0` normalises `Rotation` into 0..3. The test's `Key` normalises too, so an out-of-range source rotation still compares equal.
+
+- [ ] **Step 4: Run.** `dotnet build "$W/Palisade.csproj" -v q && "$G" --path "$W" --headless res://test/TestMazeRotation.tscn`. Expected: every line PASS, `ALL PASS`, exit 0.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git -C "$W" add scripts/MazeRotation.cs test/TestMazeRotation.cs test/TestMazeRotation.tscn
+git -C "$W" commit -m "feat(ffa): MazeRotation — exact clockwise quarter-turns of maze data
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 2: MazeFootprint — occupied columns and measured geometry margin
+
+**Files:**
+- Create: `scripts/MazeFootprint.cs`
+- Create: `test/FfaFixtures.cs` (shared fixture mazes, used again in Tasks 3, 5, 6)
+- Test: `test/TestMazeFootprint.cs`, `test/TestMazeFootprint.tscn`
+
+**Interfaces:**
+- Consumes: `MazeRotation.RotateCell`.
+- Produces:
+  - `MazeFootprint.From(MazeData) → MazeFootprint`
+  - `MazeFootprint.Rotated(int quarterTurns) → MazeFootprint`
+  - `Dictionary<(int x,int y),(int lo,int hi)> Columns` — floors relative to the Exit floor
+  - `int ExitX, ExitY, ExitFloor` (ExitFloor is absolute)
+  - `const float Margin`
+  - `static Aabb ColumnBox(int x, int y, int lo, int hi)` — local grid frame; y = 0 is the arena floor
+- Produces: `FfaFixtures.Slab(int exitCol, int exitFloor = 0, int slabFloor = 0) → MazeData`, `FfaFixtures.Tall(int exitCol) → MazeData`.
+
+- [ ] **Step 1: Write fixtures** `test/FfaFixtures.cs`
+
+```csharp
+using System.Collections.Generic;
+
+/// test/FfaFixtures.cs — deterministic mazes for FFA layout tests and captures.
+/// Slab: every cell of `slabFloor` is a Room tile, so the footprint is the full
+/// 100×100 m square — the worst case for hallway sizing. Start sits at (4,0)
+/// on floor 0 and Exit at (exitCol, 9) on exitFloor, as the editor enforces.
+public static class FfaFixtures
+{
+    public static MazeData Slab(int exitCol, int exitFloor = 0, int slabFloor = 0)
+    {
+        var m = new MazeData { Name = $"Slab c{exitCol} f{slabFloor}", IsOnline = false };
+        m.Pieces.Add(new MazePiece { Type = PieceType.Start, X = 4, Y = 0, Floor = 0, Rotation = 0 });
+        m.Pieces.Add(new MazePiece { Type = PieceType.Exit, X = exitCol, Y = 9, Floor = exitFloor, Rotation = 0 });
+        for (int y = 0; y < 10; y++)
+            for (int x = 0; x < 10; x++)
+            {
+                if (slabFloor == 0 && x == 4 && y == 0) continue;
+                if (slabFloor == exitFloor && x == exitCol && y == 9) continue;
+                m.Pieces.Add(new MazePiece { Type = PieceType.Room, X = x, Y = y, Floor = slabFloor, RoomGroup = 1 });
+            }
+        return m;
+    }
+
+    /// Seven stacked corridor floors (−3..3) — a light-heavy stress maze.
+    /// Each floor is a full grid of Cross pieces (every wall face has sconces), and floors
+    /// are joined by a StairsUp at (0, y) per floor. Walkability is not the point; it
+    /// maximises the omni count for the perf capture.
+    public static MazeData Tall(int exitCol)
+    {
+        var m = new MazeData { Name = $"Tall c{exitCol}", IsOnline = false };
+        m.Pieces.Add(new MazePiece { Type = PieceType.Start, X = 4, Y = 0, Floor = 0 });
+        m.Pieces.Add(new MazePiece { Type = PieceType.Exit, X = exitCol, Y = 9, Floor = 0 });
+        for (int f = -3; f <= 3; f++)
+            for (int y = 0; y < 10; y++)
+                for (int x = 0; x < 10; x++)
+                {
+                    if (f == 0 && ((x == 4 && y == 0) || (x == exitCol && y == 9))) continue;
+                    var type = (x == 0 && y == f + 3 && f < 3) ? PieceType.StairsUp : PieceType.Straight;
+                    m.Pieces.Add(new MazePiece { Type = type, X = x, Y = y, Floor = f, Rotation = (x + y) % 2 });
+                }
+        return m;
+    }
+}
+```
+
+- [ ] **Step 2: Write the failing test** `test/TestMazeFootprint.cs`. It checks the column logic, then BUILDS real geometry and measures the worst protrusion past the predicted column boxes. That measurement is where `Margin` comes from.
+
+```csharp
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// test/TestMazeFootprint.cs
+/// 1. Column spans: FloorSpan (pits, trapdoors) and stair overhang are included,
+///    relative to the Exit floor.
+/// 2. Margin guard: builds real DungeonBuilder geometry for several fixtures and
+///    asserts every mesh vertex / collision point lies within MazeFootprint.Margin
+///    of some predicted column box. Prints the worst offender so the constant is
+///    MEASURED, not guessed. If geometry is ever added that overhangs further,
+///    this test fails and the FFA hallway sizing must be revisited.
+public partial class TestMazeFootprint : Node
+{
+    int _fail;
+    void Check(bool ok, string label) { GD.Print((ok ? "PASS  " : "FAIL  ") + label); if (!ok) _fail++; }
+
+    public override void _Ready()
+    {
+        // ── 1. Column logic ──────────────────────────────────────────────────
+        var m = FfaFixtures.Slab(exitCol: 2, exitFloor: 1, slabFloor: 1);
+        // Clear the slab where the extra pieces go — MazeLookup rejects two pieces on one cell.
+        m.Pieces.RemoveAll(p => p.Type == PieceType.Room &&
+            ((System.Math.Abs(p.X - 5) <= 1 && System.Math.Abs(p.Y - 5) <= 1) || (p.X == 8 && p.Y == 2) || (p.X == 1 && p.Y == 1)));
+        m.Pieces.Add(new MazePiece { Type = PieceType.Pit,        X = 5, Y = 5, Floor = 1 });
+        m.Pieces.Add(new MazePiece { Type = PieceType.StairsDown, X = 8, Y = 2, Floor = 1 });
+        m.Pieces.Add(new MazePiece { Type = PieceType.StairsUp,   X = 1, Y = 1, Floor = 1 });
+        var fp = MazeFootprint.From(m);
+        Check(fp.ExitX == 2 && fp.ExitY == 9 && fp.ExitFloor == 1, "exit located");
+        Check(fp.Columns[(4, 0)] == (-1, 0), "Start on floor 0 is relative floor −1 (exit floor 1); slab adds 0");
+        Check(fp.Columns[(5, 5)].lo == -1 && fp.Columns[(5, 5)].hi == 1, "pit spans 3 floors");
+        Check(fp.Columns[(4, 4)].lo == -1 && fp.Columns[(6, 6)].hi == 1, "pit 3x3 footprint included");
+        Check(fp.Columns[(8, 2)].lo == -1, "StairsDown reaches one floor below");
+        Check(fp.Columns[(1, 1)].hi == 1, "StairsUp reaches one floor above");
+        var r1 = fp.Rotated(1);
+        Check(r1.ExitX == 0 && r1.ExitY == 2 && r1.Columns[(9, 4)] == fp.Columns[(4, 0)],
+              "Rotated(1) moves exit and columns with MazeRotation.RotateCell");
+
+        // ── 2. Margin guard on real geometry ────────────────────────────────
+        var fixtures = new List<MazeData> { DefaultMaze.Build(), FfaFixtures.Slab(0), FfaFixtures.Tall(9), m };
+        float worst = 0f; string worstWhere = "";
+        foreach (var maze in fixtures)
+        {
+            var f = MazeFootprint.From(maze);
+            var b = new DungeonBuilder { Name = "Probe" };
+            AddChild(b);
+            b.Build(maze, new Vector3(0f, -f.ExitFloor * DungeonBuilder.FloorHeight, 0f), Dir.S);
+            foreach (var (p, where) in GeometryPoints(b))
+            {
+                float e = Excess(f, p);
+                if (e > worst) { worst = e; worstWhere = $"{maze.Name}: {where} at {p}"; }
+            }
+            b.Free();
+        }
+        GD.Print($"[Footprint] worst protrusion past column boxes = {worst:F2} m ({worstWhere})");
+        Check(worst <= MazeFootprint.Margin, $"all geometry within Margin={MazeFootprint.Margin} m");
+
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+
+    // Distance outside the nearest column box (0 when inside one), checking the
+    // point's own column and its 8 neighbours — boxes are 10 m, margins are small.
+    static float Excess(MazeFootprint f, Vector3 p)
+    {
+        int cx = Mathf.FloorToInt(p.X / DungeonBuilder.CellSize);
+        int cy = Mathf.FloorToInt(p.Z / DungeonBuilder.CellSize);
+        float best = float.MaxValue;
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                if (!f.Columns.TryGetValue((cx + dx, cy + dy), out var span)) continue;
+                var box = MazeFootprint.ColumnBox(cx + dx, cy + dy, span.lo, span.hi);
+                var q = p.Clamp(box.Position, box.End);
+                float d = Mathf.Max(Mathf.Abs(p.X - q.X), Mathf.Max(Mathf.Abs(p.Y - q.Y), Mathf.Abs(p.Z - q.Z)));
+                best = Mathf.Min(best, d);
+            }
+        return best;
+    }
+
+    static IEnumerable<(Vector3, string)> GeometryPoints(Node root)
+    {
+        foreach (var n in root.FindChildren("*", "", true, false))
+        {
+            if (n is MeshInstance3D mi && mi.Mesh != null)
+            {
+                var xf = mi.GlobalTransform;
+                for (int s = 0; s < mi.Mesh.GetSurfaceCount(); s++)
+                {
+                    var arr = mi.Mesh.SurfaceGetArrays(s);
+                    foreach (var v in arr[(int)Mesh.ArrayType.Vertex].AsVector3Array())
+                        yield return (xf * v, mi.GetPath());
+                }
+            }
+            else if (n is MultiMeshInstance3D mmi && mmi.Multimesh?.Mesh != null)
+            {
+                var aabb = mmi.Multimesh.Mesh.GetAabb();
+                for (int i = 0; i < mmi.Multimesh.InstanceCount; i++)
+                {
+                    var xf = mmi.GlobalTransform * mmi.Multimesh.GetInstanceTransform(i);
+                    for (int c = 0; c < 8; c++) yield return (xf * aabb.GetEndpoint(c), mmi.GetPath());
+                }
+            }
+            else if (n is CollisionShape3D cs && cs.Shape != null)
+            {
+                var xf = cs.GlobalTransform;
+                if (cs.Shape is ConcavePolygonShape3D cc)
+                    foreach (var v in cc.GetFaces()) yield return (xf * v, cs.GetPath());
+                else
+                {
+                    var aabb = cs.Shape.GetDebugMesh().GetAabb();
+                    for (int c = 0; c < 8; c++) yield return (xf * aabb.GetEndpoint(c), cs.GetPath());
+                }
+            }
+        }
+    }
+}
+```
+
+(`.tscn` has the same four-line shape as Task 1, with node/script name `TestMazeFootprint`.)
+
+- [ ] **Step 3: Build and confirm it fails** (`MazeFootprint` missing).
+
+- [ ] **Step 4: Implement** `scripts/MazeFootprint.cs`
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// res://scripts/MazeFootprint.cs — which grid columns a maze occupies and the
+/// vertical span of each, in floors RELATIVE TO THE EXIT FLOOR. The arena floor
+/// is relative floor 0, because every maze is shifted so its Exit meets it.
+///
+/// Spans include PieceDB.FloorSpan (pit = 3 floors, trapdoor = self + below),
+/// StairsDown's geometry one floor below its anchor (DungeonBuilder builds it from
+/// yBase − FloorHeight), and Stairs/StairsUp rising into the floor above.
+///
+/// Margin: how far built geometry can stick out past a column's box (wall
+/// thickness, props, collision slabs). MEASURED by test/TestMazeFootprint,
+/// which fails if geometry ever overhangs further.
+public sealed class MazeFootprint
+{
+    public const float Margin = 1.0f;   // set from TestMazeFootprint's printed worst case, rounded up to 0.5 m
+
+    public readonly Dictionary<(int x, int y), (int lo, int hi)> Columns = new();
+    public int ExitX { get; private set; } = 4;
+    public int ExitY { get; private set; } = 9;
+    public int ExitFloor { get; private set; }
+
+    public static MazeFootprint From(MazeData m)
+    {
+        var fp = new MazeFootprint();
+        var exit = m.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+        if (exit != null) { fp.ExitX = exit.X; fp.ExitY = exit.Y; fp.ExitFloor = exit.Floor; }
+        foreach (var p in m.Pieces)
+        {
+            int lo = p.Floor, hi = p.Floor;
+            foreach (int f in PieceDB.FloorSpan(p.Type)) { lo = Math.Min(lo, p.Floor + f); hi = Math.Max(hi, p.Floor + f); }
+            if (p.Type == PieceType.StairsDown) lo = Math.Min(lo, p.Floor - 1);
+            if (p.Type == PieceType.Stairs || p.Type == PieceType.StairsUp) hi = Math.Max(hi, p.Floor + 1);
+            foreach (var (dx, dy) in PieceDB.Footprint(p.Type))
+                fp.Add(p.X + dx, p.Y + dy, lo - fp.ExitFloor, hi - fp.ExitFloor);
+        }
+        return fp;
+    }
+
+    void Add(int x, int y, int lo, int hi)
+    {
+        if (Columns.TryGetValue((x, y), out var s)) Columns[(x, y)] = (Math.Min(s.lo, lo), Math.Max(s.hi, hi));
+        else Columns[(x, y)] = (lo, hi);
+    }
+
+    public MazeFootprint Rotated(int quarterTurns)
+    {
+        var r = new MazeFootprint { ExitFloor = ExitFloor };
+        (r.ExitX, r.ExitY) = MazeRotation.RotateCell(ExitX, ExitY, quarterTurns);
+        foreach (var kv in Columns)
+        {
+            var (x, y) = MazeRotation.RotateCell(kv.Key.x, kv.Key.y, quarterTurns);
+            r.Columns[(x, y)] = kv.Value;
+        }
+        return r;
+    }
+
+    /// Box of one column in the maze's local grid frame (x = X·Cell, z = Y·Cell),
+    /// with y measured from the arena floor (relative floor 0 → y 0..FloorHeight).
+    public static Aabb ColumnBox(int x, int y, int lo, int hi)
+    {
+        float c = DungeonBuilder.CellSize, fh = DungeonBuilder.FloorHeight;
+        return new Aabb(new Vector3(x * c, lo * fh, y * c), new Vector3(c, (hi - lo + 1) * fh, c));
+    }
+}
+```
+
+- [ ] **Step 5: Run and SET THE MARGIN.** Run the test. If `worst` exceeds 1.0, set `Margin` to `worst` rounded up to the next 0.5 m and rerun. If the offender is clearly a non-structural outlier (e.g. a physics prop spawned loose), note it in the report instead of inflating the margin. Expected final state: `ALL PASS`.
+
+- [ ] **Step 6: Commit** (`scripts/MazeFootprint.cs test/FfaFixtures.cs test/TestMazeFootprint.*`) with message `feat(ffa): MazeFootprint with measured geometry margin`.
+
+---
+
+### Task 3: PlusLayout — seats, offsets, per-match hallway length, seat zones
+
+**Files:**
+- Create: `scripts/PlusLayout.cs`
+- Test: `test/TestPlusLayout.cs`, `test/TestPlusLayout.tscn`
+
+**Interfaces:**
+- Consumes: `MazeFootprint` (Task 2), `MazeRotation`, `ArenaBuilder.Apothem`.
+- Produces:
+  - `enum Door { N = 0, E = 1, S = 2, W = 3 }` — the value doubles as the quarter-turn count.
+  - `class SeatPlacement { Door Door; int QuarterTurns; Vector3 Offset; float DoorAngle; Dir ExitOpenDir; Vector3 HallStart; Vector3 HallEnd; MazeFootprint Rotated; }`
+  - `class PlusLayoutResult { int HallCells; float HallLength; SeatPlacement[] Seats; int SeatAt(Vector3 p); float[] DoorAngles; }`
+  - `static PlusLayoutResult PlusLayout.Compute(IReadOnlyList<MazeFootprint> seats, float apothem, float margin = MazeFootprint.Margin)`
+  - `static Door[] PlusLayout.DoorsFor(int seatCount)`
+  - `static bool PlusLayout.Collides(PlusLayoutResult r, float margin)` — public so the test can prove minimality.
+  - All positions use an arena-centred frame (arena centre = origin); the scene adds its own world origin.
+
+- [ ] **Step 1: Write the failing test** `test/TestPlusLayout.cs`
+
+The expected values were derived by hand from reach = `10c+5` / `95−10c` after rotation. Worst: N col 0 reaches E 95 and E col 9 reaches N 95. Clearance 95 + 1 + 1 (margin on both mazes) − 29.856 = 67.1 m, which rounds up to 7 cells. Every case also checks minimality: `Collides` is false at L and true at L − 1 cell.
+
+```csharp
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// test/TestPlusLayout.cs — per-match hallway sizing and the seat-zone query.
+public partial class TestPlusLayout : Node
+{
+    int _fail;
+    void Check(bool ok, string label) { GD.Print((ok ? "PASS  " : "FAIL  ") + label); if (!ok) _fail++; }
+
+    static List<MazeFootprint> Fps(params MazeData[] ms) => ms.Select(MazeFootprint.From).ToList();
+
+    void Case(string name, List<MazeFootprint> fps, int expectCells)
+    {
+        var r = PlusLayout.Compute(fps, ArenaBuilder.Apothem, margin: 1f);
+        Check(r.HallCells == expectCells, $"{name}: hall = {r.HallCells} cells (expected {expectCells})");
+        Check(!PlusLayout.Collides(r, 1f), $"{name}: no collision at chosen length");
+        if (r.HallCells > 0)
+        {
+            var shorter = PlusLayout.WithHall(r, r.HallCells - 1);
+            Check(PlusLayout.Collides(shorter, 1f), $"{name}: one cell shorter DOES collide (minimal)");
+        }
+        // Exit cell centre sits on its door axis at apothem + L + half a cell.
+        foreach (var s in r.Seats)
+        {
+            var u = PlusLayout.DoorDir(s.Door);
+            var exitCentre = s.Offset + new Vector3((s.Rotated.ExitX + 0.5f) * 10f, 0f, (s.Rotated.ExitY + 0.5f) * 10f);
+            var want = u * (ArenaBuilder.Apothem + r.HallLength + 5f);
+            Check(new Vector2(exitCentre.X - want.X, exitCentre.Z - want.Z).Length() < 0.01f,
+                  $"{name}: seat {s.Door} exit centred on its door axis");
+        }
+    }
+
+    public override void _Ready()
+    {
+        Check(PlusLayout.DoorsFor(2).SequenceEqual(new[] { Door.N, Door.S }), "2 seats → N,S");
+        Check(PlusLayout.DoorsFor(3).SequenceEqual(new[] { Door.N, Door.E, Door.W }), "3 seats → N,E,W");
+        Check(PlusLayout.DoorsFor(4).SequenceEqual(new[] { Door.N, Door.E, Door.S, Door.W }), "4 seats → N,E,S,W");
+
+        var S = (System.Func<int, MazeData>)(c => FfaFixtures.Slab(c));
+        Case("worst 0/9/0/9",          Fps(S(0), S(9), S(0), S(9)), 7);
+        Case("all col 0 (C4-symmetric)", Fps(S(0), S(0), S(0), S(0)), 0);
+        Case("central all 4",          Fps(S(4), S(4), S(4), S(4)), 2);
+        Case("central 4/5/4/5",        Fps(S(4), S(5), S(4), S(5)), 3);
+        Case("mixed 0/4/9/5",          Fps(S(0), S(4), S(9), S(5)), 3);
+        Case("T worst 0/9/9",          Fps(S(0), S(9), S(9)), 7);
+        Case("T central 4/4/4",        Fps(S(4), S(4), S(4)), 2);
+        Case("2 seats forced 0",       Fps(S(0), S(9)), 0);
+        // Vertical separation: E/W slabs two floors up clear N/S entirely…
+        Case("worst but E/W two floors up", Fps(S(0), FfaFixtures.Slab(9, 0, 2), S(0), FfaFixtures.Slab(9, 0, 2)), 0);
+        // …but ONE floor up still touches (ceiling vault meets floor) → full hall.
+        Case("worst but E/W one floor up",  Fps(S(0), FfaFixtures.Slab(9, 0, 1), S(0), FfaFixtures.Slab(9, 0, 1)), 7);
+
+        // Seat zones
+        var z = PlusLayout.Compute(Fps(S(0), S(9), S(0), S(9)), ArenaBuilder.Apothem, 1f);
+        Check(z.SeatAt(new Vector3(0f, 1f, 0f)) == -1, "arena centre → -1");
+        for (int i = 0; i < 4; i++)
+        {
+            var s = z.Seats[i]; var u = PlusLayout.DoorDir(s.Door);
+            Check(z.SeatAt(u * (ArenaBuilder.Apothem + z.HallLength * 0.5f) + Vector3.Up) == i, $"seat {i} hallway midpoint → {i}");
+            Check(z.SeatAt(u * (ArenaBuilder.Apothem + z.HallLength + 50f) + Vector3.Up) == i, $"seat {i} maze interior → {i}");
+        }
+        Check(z.SeatAt(new Vector3(0f, 500f, 0f)) == -1, "far above → -1");
+
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}
+```
+
+(`.tscn`: the standard four lines, name `TestPlusLayout`.)
+
+- [ ] **Step 2: Build and confirm it fails** (`PlusLayout`/`Door` missing).
+
+- [ ] **Step 3: Implement** `scripts/PlusLayout.cs`
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+public enum Door { N = 0, E = 1, S = 2, W = 3 }
+
+public sealed class SeatPlacement
+{
+    public Door    Door;
+    public int     QuarterTurns;   // MazeRotation.Rotate(data, QuarterTurns) before building
+    public Vector3 Offset;         // DungeonBuilder world offset of the ROTATED maze (arena-centred frame)
+    public float   DoorAngle;      // ArenaBuilder convention: 0 = north, clockwise
+    public Dir     ExitOpenDir;    // DungeonBuilder.Build exitOpenDir (the face toward the arena)
+    public Vector3 HallStart;      // on the door axis at the arena wall (y = 0)
+    public Vector3 HallEnd;        // on the door axis at the maze Exit face (y = 0)
+    public MazeFootprint Rotated = null!;
+}
+
+public sealed class PlusLayoutResult
+{
+    public int             HallCells;
+    public float           HallLength => HallCells * DungeonBuilder.CellSize;
+    public SeatPlacement[] Seats = Array.Empty<SeatPlacement>();
+    public float[]         DoorAngles => Seats.Select(s => s.DoorAngle).ToArray();
+
+    /// Which seat's maze or hallway contains p (arena-centred frame), or −1 for
+    /// the arena / anywhere else. Exact per-column test, so irregular mazes whose
+    /// bounding boxes overlap never get confused.
+    public int SeatAt(Vector3 p)
+    {
+        for (int i = 0; i < Seats.Length; i++)
+        {
+            var s = Seats[i];
+            if (HallCells > 0 && PlusLayout.HallBox(s, HallLength).HasPoint(p)) return i;
+            int gx = Mathf.FloorToInt((p.X - s.Offset.X) / DungeonBuilder.CellSize);
+            int gy = Mathf.FloorToInt((p.Z - s.Offset.Z) / DungeonBuilder.CellSize);
+            if (s.Rotated.Columns.TryGetValue((gx, gy), out var span) &&
+                MazeFootprint.ColumnBox(gx, gy, span.lo, span.hi).Grow(0.01f).HasPoint(
+                    new Vector3(p.X - s.Offset.X, p.Y, p.Z - s.Offset.Z)))
+                return i;
+        }
+        return -1;
+    }
+}
+
+/// res://scripts/PlusLayout.cs — the FFA "plus sign": one maze per arena door.
+///
+/// Seat i gets door DoorsFor(n)[i]. Its maze data is turned by (int)Door
+/// quarter turns (the Exit's arena side, Dir.S in the editor frame, rotates to
+/// face the arena). The maze is placed so its Exit cell sits on the door axis
+/// with its arena-side face at apothem + L.
+///
+/// L (the same for every hallway, so travel is fair) is the SHORTEST whole-cell
+/// length at which no two mazes' occupied columns overlap in 3D, with each
+/// maze's columns grown by `margin`. Mazes on non-overlapping floors can
+/// therefore sit closer. L is forced to 0 for 2 seats (1v1 geometry is unchanged).
+public static class PlusLayout
+{
+    public const int MaxHallCells = 10;   // worst case is 7; the hallway lookup stays inside a 10-cell strip
+
+    public static Door[] DoorsFor(int seats) => seats switch
+    {
+        2 => new[] { Door.N, Door.S },
+        3 => new[] { Door.N, Door.E, Door.W },
+        4 => new[] { Door.N, Door.E, Door.S, Door.W },
+        _ => throw new ArgumentOutOfRangeException(nameof(seats), "FFA supports 2–4 seats"),
+    };
+
+    public static Vector3 DoorDir(Door d) => d switch
+    {
+        Door.N => new Vector3(0f, 0f, -1f),
+        Door.E => new Vector3(1f, 0f, 0f),
+        Door.S => new Vector3(0f, 0f, 1f),
+        _      => new Vector3(-1f, 0f, 0f),
+    };
+
+    public static float DoorAngle(Door d) => (int)d * Mathf.Pi * 0.5f;
+
+    static Dir TowardArena(Door d) => d switch { Door.N => Dir.S, Door.E => Dir.W, Door.S => Dir.N, _ => Dir.E };
+
+    public static PlusLayoutResult Compute(IReadOnlyList<MazeFootprint> seats, float apothem,
+                                           float margin = MazeFootprint.Margin)
+    {
+        var doors = DoorsFor(seats.Count);
+        var rotated = seats.Select((fp, i) => fp.Rotated((int)doors[i])).ToArray();
+        var r = Place(rotated, doors, apothem, 0);
+        if (seats.Count == 2) return r;
+        for (int c = 0; c <= MaxHallCells; c++)
+        {
+            r = Place(rotated, doors, apothem, c);
+            if (!Collides(r, margin)) return r;
+        }
+        throw new InvalidOperationException($"No hallway ≤ {MaxHallCells} cells separates these mazes");
+    }
+
+    public static PlusLayoutResult WithHall(PlusLayoutResult r, int cells) =>
+        Place(r.Seats.Select(s => s.Rotated).ToArray(), r.Seats.Select(s => s.Door).ToArray(), _apothem, cells);
+
+    static float _apothem = ArenaBuilder.Apothem;
+
+    static PlusLayoutResult Place(MazeFootprint[] rotated, Door[] doors, float apothem, int cells)
+    {
+        _apothem = apothem;
+        float cs = DungeonBuilder.CellSize, hall = cells * cs;
+        var seats = new SeatPlacement[rotated.Length];
+        for (int i = 0; i < rotated.Length; i++)
+        {
+            var fp = rotated[i]; var d = doors[i]; var u = DoorDir(d);
+            var exitCentre = new Vector3((fp.ExitX + 0.5f) * cs, 0f, (fp.ExitY + 0.5f) * cs);
+            var faceLocal  = exitCentre - u * (cs * 0.5f);   // face toward the arena (−u side)
+            var off        = u * (apothem + hall) - faceLocal;
+            off.Y = -fp.ExitFloor * DungeonBuilder.FloorHeight;
+            seats[i] = new SeatPlacement
+            {
+                Door = d, QuarterTurns = (int)d, Offset = off, DoorAngle = DoorAngle(d),
+                ExitOpenDir = TowardArena(d), Rotated = fp,
+                HallStart = u * apothem, HallEnd = u * (apothem + hall),
+            };
+        }
+        return new PlusLayoutResult { HallCells = cells, Seats = seats };
+    }
+
+    internal static Aabb HallBox(SeatPlacement s, float hall)
+    {
+        float hw = DungeonBuilder.CellSize * 0.5f;
+        var a = s.HallStart; var b = s.HallEnd;
+        var min = new Vector3(Mathf.Min(a.X, b.X), 0f, Mathf.Min(a.Z, b.Z));
+        var max = new Vector3(Mathf.Max(a.X, b.X), DungeonBuilder.FloorHeight, Mathf.Max(a.Z, b.Z));
+        bool alongZ = s.Door == Door.N || s.Door == Door.S;
+        if (alongZ) { min.X -= hw; max.X += hw; } else { min.Z -= hw; max.Z += hw; }
+        return new Aabb(min, max - min);
+    }
+
+    // World (arena-centred) boxes of a seat's columns, grown by margin, plus its hallway.
+    static List<Aabb> Boxes(SeatPlacement s, float hall, float margin)
+    {
+        var list = new List<Aabb>(s.Rotated.Columns.Count + 1);
+        var flat = new Vector3(s.Offset.X, 0f, s.Offset.Z);   // column boxes are already relative to the arena floor
+        foreach (var kv in s.Rotated.Columns)
+        {
+            var b = MazeFootprint.ColumnBox(kv.Key.x, kv.Key.y, kv.Value.lo, kv.Value.hi);
+            list.Add(new Aabb(b.Position + flat, b.Size).Grow(margin));
+        }
+        if (hall > 0f) list.Add(HallBox(s, hall).Grow(margin));
+        return list;
+    }
+
+    static bool Overlap(Aabb a, Aabb b) =>
+        a.Position.X < b.End.X && b.Position.X < a.End.X &&
+        a.Position.Y < b.End.Y && b.Position.Y < a.End.Y &&
+        a.Position.Z < b.End.Z && b.Position.Z < a.End.Z;
+
+    public static bool Collides(PlusLayoutResult r, float margin)
+    {
+        var boxes = r.Seats.Select(s => Boxes(s, r.HallLength, margin)).ToArray();
+        for (int i = 0; i < boxes.Length; i++)
+            for (int j = i + 1; j < boxes.Length; j++)
+                foreach (var a in boxes[i])
+                    foreach (var b in boxes[j])
+                        if (Overlap(a, b)) return true;
+        return false;
+    }
+}
+```
+
+Implementer note: `_apothem` exists only so `WithHall` (test helper) can reuse the last apothem. If you prefer, store `Apothem` on `PlusLayoutResult` instead and drop the static. That's cleaner and fine as long as the test still compiles.
+
+- [ ] **Step 4: Run.** Expect `ALL PASS`. If an expected cell count differs, recompute the reach by hand (see Step 1) BEFORE changing the code or the test. Report any disagreement.
+
+- [ ] **Step 5: Commit** `feat(ffa): PlusLayout — per-match hallway sizing and seat zones`.
+
+---
+
+### Task 4: ArenaBuilder door-angle list (golden-guarded)
+
+**Files:**
+- Modify: `scripts/ArenaBuilder.cs` (Build :288 and wall loop :305-331, arches :336-337, `AddWallSkirt` :636-718, `AddDoorwaySkirt` :720, `DoorwayBay` :809, `AddBookshelfRing` :819/848, `AddShelfCollision` :1044/1108/1139-1140, `AddSecondTier` :1161/1210, curtain call :400-404, `Quad` :1589)
+- Test: `test/TestArenaDoors.cs`, `test/TestArenaDoors.tscn`, `test/golden/arena_doors.txt`
+
+**Interfaces:**
+- Produces: `ArenaBuilder.Build(Vector3 centre, IReadOnlyList<float> doorAngles)`. The old `Build(Vector3 centre, bool openNorth = true, bool openSouth = true)` stays and forwards to the new overload.
+
+- [ ] **Step 1: Write the fingerprint test (record + compare modes)** `test/TestArenaDoors.cs`
+
+```csharp
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Godot;
+
+/// test/TestArenaDoors.cs
+/// Golden: a fingerprint of today's N/S arena (every mesh triangle with its
+/// winding, every collision shape's world AABB, every light position) is recorded
+/// BEFORE the door-angle refactor with `-- record`, and compared after. 1v1's
+/// arena must stay identical. New: with doors at N/E/S/W, a ray from the centre
+/// passes through each doorway and hits the wall at 45°.
+public partial class TestArenaDoors : Node
+{
+    const string GoldenPath = "res://test/golden/arena_doors.txt";
+    int _fail;
+    void Check(bool ok, string label) { GD.Print((ok ? "PASS  " : "FAIL  ") + label); if (!ok) _fail++; }
+
+    static string R(Vector3 v) => $"{v.X:F2},{v.Y:F2},{v.Z:F2}";
+
+    static string Fingerprint(ArenaBuilder a)
+    {
+        var lines = new List<string>();
+        var inv = a.GlobalTransform.AffineInverse();
+        foreach (var n in a.FindChildren("*", "", true, false))
+        {
+            if (n is MeshInstance3D mi && mi.Mesh != null)
+            {
+                var xf = inv * mi.GlobalTransform;
+                for (int s = 0; s < mi.Mesh.GetSurfaceCount(); s++)
+                {
+                    var arr = mi.Mesh.SurfaceGetArrays(s);
+                    var v = arr[(int)Mesh.ArrayType.Vertex].AsVector3Array();
+                    var idx = arr[(int)Mesh.ArrayType.Index].VariantType == Variant.Type.Nil
+                        ? Enumerable.Range(0, v.Length).ToArray()
+                        : arr[(int)Mesh.ArrayType.Index].AsInt32Array();
+                    for (int t = 0; t + 2 < idx.Length; t += 3)
+                    {
+                        var tri = new[] { R(xf * v[idx[t]]), R(xf * v[idx[t + 1]]), R(xf * v[idx[t + 2]]) };
+                        int m = 0;   // canonical cyclic start (keeps winding)
+                        for (int k = 1; k < 3; k++) if (string.CompareOrdinal(tri[k], tri[m]) < 0) m = k;
+                        lines.Add($"T|{tri[m]}|{tri[(m + 1) % 3]}|{tri[(m + 2) % 3]}");
+                    }
+                }
+            }
+            else if (n is MultiMeshInstance3D mm && mm.Multimesh != null)
+                for (int i = 0; i < mm.Multimesh.InstanceCount; i++)
+                    lines.Add($"M|{R((inv * mm.GlobalTransform * mm.Multimesh.GetInstanceTransform(i)).Origin)}");
+            else if (n is CollisionShape3D cs && cs.Shape != null)
+            {
+                var box = (inv * cs.GlobalTransform) * cs.Shape.GetDebugMesh().GetAabb();
+                lines.Add($"C|{cs.Shape.GetType().Name}|{R(box.Position)}|{R(box.Size)}");
+            }
+            else if (n is OmniLight3D l)
+                lines.Add($"L|{R((inv * l.GlobalTransform).Origin)}");
+        }
+        lines.Sort(string.CompareOrdinal);
+        return string.Join("\n", lines);
+    }
+
+    ArenaBuilder Make(System.Action<ArenaBuilder> build)
+    {
+        var a = new ArenaBuilder { Name = "Arena", GrassInnerRadius = AltarBuilder.BaseRadius };
+        AddChild(a);
+        build(a);
+        return a;
+    }
+
+    public override async void _Ready()
+    {
+        bool record = OS.GetCmdlineUserArgs().Contains("record");
+        var cases = new (string name, System.Action<ArenaBuilder> build)[]
+        {
+            ("NS",    a => a.Build(Vector3.Zero, openNorth: true,  openSouth: true)),
+            ("Nonly", a => a.Build(Vector3.Zero, openNorth: true,  openSouth: false)),
+        };
+        var sb = new StringBuilder();
+        foreach (var (name, build) in cases)
+        {
+            var a = Make(build);
+            sb.Append($"### {name}\n{Fingerprint(a)}\n");
+            a.Free();
+        }
+        if (record)
+        {
+            using var f = FileAccess.Open(GoldenPath, FileAccess.ModeFlags.Write);
+            f.StoreString(sb.ToString());
+            GD.Print($"RECORDED {GoldenPath}");
+            GetTree().Quit(0);
+            return;
+        }
+        var golden = FileAccess.GetFileAsString(GoldenPath);
+        bool same = golden == sb.ToString();
+        if (!same)
+        {
+            using var f = FileAccess.Open("user://arena_doors_actual.txt", FileAccess.ModeFlags.Write);
+            f.StoreString(sb.ToString());
+            GD.Print("diff against " + ProjectSettings.GlobalizePath("user://arena_doors_actual.txt"));
+        }
+        Check(same, "N/S and N-only arenas identical to the pre-refactor golden");
+
+        // Four doors: rays through each doorway, blocked at 45°
+        var four = Make(a => a.Build(Vector3.Zero, new float[] { 0f, Mathf.Pi / 2, Mathf.Pi, 3 * Mathf.Pi / 2 }));
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        var space = four.GetWorld3D().DirectSpaceState;
+        foreach (var (label, ang) in new[] { ("N", 0f), ("E", Mathf.Pi / 2), ("S", Mathf.Pi), ("W", 3 * Mathf.Pi / 2) })
+        {
+            foreach (float y in new[] { 1f, 5f })
+            {
+                var to = new Vector3(Mathf.Sin(ang), 0f, -Mathf.Cos(ang)) * 40f + Vector3.Up * y;
+                var hit = space.IntersectRay(PhysicsRayQueryParameters3D.Create(Vector3.Up * y, to));
+                Check(hit.Count == 0, $"door {label}: ray at y={y} passes through the doorway");
+            }
+        }
+        foreach (float deg in new[] { 45f, 135f, 225f, 315f })
+        {
+            float ang = Mathf.DegToRad(deg);
+            var to = new Vector3(Mathf.Sin(ang), 0f, -Mathf.Cos(ang)) * 40f + Vector3.Up;
+            var hit = space.IntersectRay(PhysicsRayQueryParameters3D.Create(Vector3.Up, to));
+            Check(hit.Count > 0, $"wall at {deg}° blocks");
+        }
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}
+```
+
+(`.tscn`: the standard four lines, name `TestArenaDoors`.)
+
+- [ ] **Step 2: Record the golden ON UNMODIFIED CODE.** Temporarily comment out the four-door block (the new overload doesn't exist yet): wrap everything from `// Four doors` to before the final print in `#if ARENA_DOORS_NEW ... #endif`. Then:
+
+```bash
+mkdir -p "$W/test/golden"
+dotnet build "$W/Palisade.csproj" -v q && "$G" --path "$W" --headless res://test/TestArenaDoors.tscn -- record
+"$G" --path "$W" --headless res://test/TestArenaDoors.tscn
+```
+Expected: `RECORDED`, then the compare run prints `PASS  N/S and N-only arenas identical…` (proves the fingerprint is deterministic). If the compare run FAILS on unmodified code, some subtree is randomised per run (likely `GrassField` blades or randomly scattered decor). Skip that subtree by name in `Fingerprint` (`if (n.GetPath().ToString().Contains("/Grass")) continue;`), note it in the file header, and re-record. Commit the golden alone:
+
+```bash
+git -C "$W" add test/TestArenaDoors.cs test/TestArenaDoors.tscn test/golden/arena_doors.txt
+git -C "$W" commit -m "test(arena): golden fingerprint of the N/S arena before door-angle refactor
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+- [ ] **Step 3: Refactor ArenaBuilder.** Remove the `#if ARENA_DOORS_NEW`/`#endif` from the test. In `scripts/ArenaBuilder.cs`:
+
+(a) Add the helpers near `FaceHalf`:
+
+```csharp
+    // ── Door angles ──────────────────────────────────────────────────────────
+    // Doorways are a list of angles (0 = north, clockwise, the same convention as
+    // the polygon: (sin a, 0, −cos a)). 1v1 uses {0, π}; FFA adds π/2 and 3π/2,
+    // which land exactly on faces 8 and 24. NearDoor is the ONE test every
+    // doorway exception goes through.
+    static bool NearDoor(float angle, float halfWidth, IReadOnlyList<float> doors)
+    {
+        foreach (float d in doors)
+        {
+            float diff = Mathf.Abs(Mathf.Wrap(angle - d + Mathf.Pi, 0f, Mathf.Tau) - Mathf.Pi);
+            if (diff < halfWidth) return true;
+        }
+        return false;
+    }
+
+    static bool IsAngle(float a, float target) =>
+        Mathf.Abs(Mathf.Wrap(a - target + Mathf.Pi, 0f, Mathf.Tau) - Mathf.Pi) < 1e-3f;
+
+    // Rotation taking north-built geometry to door angle `a`; exact for quarter turns
+    // so rotated vertices carry no float noise.
+    static Basis DoorBasis(float a)
+    {
+        foreach (int q in new[] { 0, 1, 2, 3 })
+            if (IsAngle(a, q * Mathf.Pi * 0.5f))
+            {
+                float c = q == 0 ? 1 : q == 2 ? -1 : 0, s = q == 1 ? 1 : q == 3 ? -1 : 0;
+                // x' = c·x − s·z ; z' = s·x + c·z   (north (0,0,−1) → east (1,0,0) at q = 1)
+                return new Basis(new Vector3(c, 0, s), Vector3.Up, new Vector3(-s, 0, c));
+            }
+        return new Basis(Vector3.Up, -a);
+    }
+
+    static string DoorLabel(float a) =>
+        IsAngle(a, 0) ? "N" : IsAngle(a, Mathf.Pi * 0.5f) ? "E" : IsAngle(a, Mathf.Pi) ? "S" :
+        IsAngle(a, Mathf.Pi * 1.5f) ? "W" : $"{Mathf.RadToDeg(a):F0}";
+
+    // When set, Quad rotates its vertices first — lets the north doorway builders
+    // emit an E/W doorway unchanged. Only ever set inside a try/finally below.
+    static Basis? _quadXform;
+```
+
+In `Quad`, apply the transform first:
+
+```csharp
+    static void Quad(SurfaceTool st, Vector3 a, Vector3 b, Vector3 c, Vector3 d)
+    {
+        if (_quadXform is Basis x) { a = x * a; b = x * b; c = x * c; d = x * d; }
+        st.SetUV(UV(a)); st.AddVertex(a); st.SetUV(UV(b)); st.AddVertex(b);
+        st.SetUV(UV(c)); st.AddVertex(c); st.SetUV(UV(a)); st.AddVertex(a);
+        st.SetUV(UV(c)); st.AddVertex(c); st.SetUV(UV(d)); st.AddVertex(d);
+    }
+```
+
+Check that `AddVertPanel` routes through `Quad` (it does, :581-587) and that nothing else writes arch vertices directly.
+
+(b) Public API:
+
+```csharp
+    public void Build(Vector3 centre, bool openNorth = true, bool openSouth = true)
+    {
+        var doors = new List<float>();
+        if (openNorth) doors.Add(0f);
+        if (openSouth) doors.Add(Mathf.Pi);
+        Build(centre, doors);
+    }
+
+    public void Build(Vector3 centre, IReadOnlyList<float> doorAngles)
+    {
+        Position = centre;
+        var doors = doorAngles;
+        // … body of the old Build, with the edits below …
+```
+
+(c) Wall loop (:308-320): replace `isNorth/isSouth` and the `if` with
+
+```csharp
+            if (NearDoor(midAngle, openHalfAngle, doors))
+                continue;   // leave wall segment open — arch geometry added separately
+```
+
+(d) Arches (:336-337):
+
+```csharp
+        foreach (float d in doors) AddArchDoorway(wallST, domeST, d);
+```
+
+with a new overload next to the existing `AddArchDoorway(…, bool northFacing)` (the bool version stays untouched):
+
+```csharp
+    void AddArchDoorway(SurfaceTool wallST, SurfaceTool domeST, float angle)
+    {
+        if (IsAngle(angle, 0f))       { AddArchDoorway(wallST, domeST, northFacing: true);  return; }
+        if (IsAngle(angle, Mathf.Pi)) { AddArchDoorway(wallST, domeST, northFacing: false); return; }
+        _quadXform = DoorBasis(angle);
+        try { AddArchDoorway(wallST, domeST, northFacing: true); }
+        finally { _quadXform = null; }
+    }
+```
+
+(e) `AddWallSkirt(Vector3[] outer, float openHalfAngle, IReadOnlyList<float> doors)`:
+- `IsDoorwayFace` body becomes `return NearDoor(2f * Mathf.Pi * idx / Sides, openHalfAngle, doors);` (keep the idx wrap line).
+- The `shelfNorth/shelfSouth/hasShelf` block becomes `bool hasShelf = !NearDoor(midAngleSkirt, openHalfAngle * 1.7f, doors);`
+- The jamb calls become `foreach (float d in doors) AddDoorwaySkirt(skirt, d);` with this overload beside the untouched bool version:
+
+```csharp
+    void AddDoorwaySkirt(StaticBody3D skirt, float angle)
+    {
+        if (IsAngle(angle, 0f))       { AddDoorwaySkirt(skirt, northFacing: true);  return; }
+        if (IsAngle(angle, Mathf.Pi)) { AddDoorwaySkirt(skirt, northFacing: false); return; }
+        var r = DoorBasis(angle); string lbl = DoorLabel(angle);
+        float hw = OpeningW * 0.5f, zFace = -Apothem;
+        float wallEdge = Mathf.Sqrt(Mathf.Max(0f, Radius * Radius - zFace * zFace));
+        float len = Mathf.Abs(wallEdge - hw) + 0.15f;
+        Vector3 tangent = r * Vector3.Right, inward = r * new Vector3(0f, 0f, 1f);
+        AddSkirtBox(skirt, r * new Vector3(-(hw + wallEdge) * 0.5f, 0f, zFace), tangent, inward, len, $"SkirtJamb{lbl}L");
+        AddSkirtBox(skirt, r * new Vector3( (hw + wallEdge) * 0.5f, 0f, zFace), tangent, inward, len, $"SkirtJamb{lbl}R");
+    }
+```
+
+(f) `DoorwayBay(int i, float openHalfAngle, IReadOnlyList<float> doors, int tier)`:
+
+```csharp
+        if (tier != 0) return false;
+        float mid = 2f * Mathf.Pi * i / Sides - FaceHalf + Mathf.Pi / Sides;
+        return NearDoor(mid, openHalfAngle * 1.7f, doors);
+```
+
+(g) Change the `bool openNorth, bool openSouth` parameter pairs to `IReadOnlyList<float> doors` in `AddBookshelfRing`, `AddShelfCollision` and `AddSecondTier`, plus every `DoorwayBay(...)` call inside them (:848, :1108, :1139, :1140, :1210) and the three call sites in the tier loop (:382-384).
+
+(h) Curtains (disabled): `foreach (float d in doors) { if (IsAngle(d, 0f)) AddCurtain(northFacing: true); else if (IsAngle(d, Mathf.Pi)) AddCurtain(northFacing: false); }`
+
+Add `using System.Collections.Generic;` if missing. Grep afterwards: `grep -n "openNorth\|openSouth" scripts/ArenaBuilder.cs` should show only the bool `Build` wrapper.
+
+- [ ] **Step 4: Run.** Build, then run `TestArenaDoors` (expect `ALL PASS`, golden identical). Then run `TestArenaEscape`, `TestArenaProtrusion`, `TestShelfWallRun`, `ArenaConnTest` and expect them unchanged from the Task 0 baseline. If the golden differs, diff `user://arena_doors_actual.txt` against the golden. A difference is a real regression: fix the refactor, never re-record.
+
+- [ ] **Step 5: Commit** `feat(arena): doorways from a list of angles; N/S output unchanged (golden)`.
+
+---
+
+### Task 5: Hallways — `DeadEndOpen` + `HallwayBuilder`
+
+**Files:**
+- Modify: `scripts/DungeonBuilder.cs` (:120 fields; dead-end caps :681-684)
+- Create: `scripts/HallwayBuilder.cs`
+- Test: `test/TestHallway.cs`, `test/TestHallway.tscn`
+
+**Interfaces:**
+- Consumes: `SeatPlacement`, `PlusLayoutResult` (Task 3).
+- Produces:
+  - `DungeonBuilder.DeadEndOpen` (Dir mask, default `Dir.None`)
+  - `HallwayBuilder.Build(Node parent, SeatPlacement seat, int cells, Vector3 origin, string name) → DungeonBuilder?` — returns null when cells = 0.
+
+- [ ] **Step 1: Write the failing test** `test/TestHallway.cs`
+
+```csharp
+using System.Linq;
+using Godot;
+
+/// test/TestHallway.cs — hallways built from Straight pieces: continuous floor along
+/// the whole axis, no cap walls at either end, side walls 3 m off the axis.
+/// Also proves DeadEndOpen defaults to None (ordinary mazes still cap dead ends).
+public partial class TestHallway : Node
+{
+    int _fail;
+    void Check(bool ok, string label) { GD.Print((ok ? "PASS  " : "FAIL  ") + label); if (!ok) _fail++; }
+
+    public override async void _Ready()
+    {
+        Check(new DungeonBuilder().DeadEndOpen == Dir.None, "DeadEndOpen defaults to None");
+
+        var fps = new[] { FfaFixtures.Slab(0), FfaFixtures.Slab(9), FfaFixtures.Slab(0), FfaFixtures.Slab(9) }
+                  .Select(MazeFootprint.From).ToList();
+        var layout = PlusLayout.Compute(fps, ArenaBuilder.Apothem);
+        Check(layout.HallCells > 0, $"worst case has a hallway ({layout.HallCells} cells)");
+        var origin = new Vector3(500f, 0f, 500f);   // non-zero origin catches offset bugs
+        foreach (var s in layout.Seats)
+            HallwayBuilder.Build(this, s, layout.HallCells, origin, $"Hall{s.Door}");
+        Check(HallwayBuilder.Build(this, layout.Seats[0], 0, origin, "None") == null, "0 cells → no hallway");
+
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        var space = GetViewport().World3D.DirectSpaceState;
+
+        foreach (var s in layout.Seats)
+        {
+            var a = origin + s.HallStart; var b = origin + s.HallEnd;
+            var u = (b - a).Normalized();
+            var side = new Vector3(-u.Z, 0f, u.X);
+            bool floorOk = true;
+            for (float t = 0.5f; t < layout.HallLength; t += 1f)
+            {
+                var p = a + u * t;
+                var hit = space.IntersectRay(PhysicsRayQueryParameters3D.Create(p + Vector3.Up * 5f, p + Vector3.Down * 2f));
+                floorOk &= hit.Count > 0 && Mathf.Abs(((Vector3)hit["position"]).Y - origin.Y) < 0.3f;
+            }
+            Check(floorOk, $"hall {s.Door}: floor under every metre of the axis");
+            var through = space.IntersectRay(PhysicsRayQueryParameters3D.Create(a - u * 0.5f + Vector3.Up * 2f, b + u * 0.5f + Vector3.Up * 2f));
+            Check(through.Count == 0, $"hall {s.Door}: no cap wall at either end");
+            var mid = (a + b) * 0.5f + Vector3.Up * 2f;
+            var wall = space.IntersectRay(PhysicsRayQueryParameters3D.Create(mid, mid + side * 8f));
+            Check(wall.Count > 0 && Mathf.Abs(((Vector3)wall["position"] - mid).Length() - 3f) < 0.3f,
+                  $"hall {s.Door}: side wall 3 m off the axis");
+        }
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}
+```
+
+(`.tscn`: the standard four lines, name `TestHallway`.)
+
+- [ ] **Step 2: Build and confirm it fails** (`DeadEndOpen`/`HallwayBuilder` missing).
+
+- [ ] **Step 3: Implement.** In `DungeonBuilder.cs` next to `_exitOpenDir` (:120):
+
+```csharp
+    /// Faces whose dead-end caps are left OPEN. Default None = every unconnected
+    /// arm is sealed, exactly as before. HallwayBuilder sets its axis here so a
+    /// row of Straight pieces stays open at both ends (maze Exit on one side,
+    /// arena arch on the other).
+    public Dir DeadEndOpen { get; set; } = Dir.None;
+```
+
+Change the four dead-end lines (:681-684) to add `&& (DeadEndOpen & Dir.X) == 0`:
+
+```csharp
+        if (hasN && !IsConnected(Dir.N, piece, lookup) && !exitN && (DeadEndOpen & Dir.N) == 0) CapWallNS(wallST, cx-hw, cx+hw, z0, y0, yTop, +1);
+        if (hasS && !IsConnected(Dir.S, piece, lookup) && !exitS && (DeadEndOpen & Dir.S) == 0) CapWallNS(wallST, cx-hw, cx+hw, z1, y0, yTop, -1);
+        if (hasE && !IsConnected(Dir.E, piece, lookup) && !exitE && (DeadEndOpen & Dir.E) == 0) CapWallEW(wallST, cz-hw, cz+hw, x1, y0, yTop, -1);
+        if (hasW && !IsConnected(Dir.W, piece, lookup) && !exitW && (DeadEndOpen & Dir.W) == 0) CapWallEW(wallST, cz-hw, cz+hw, x0, y0, yTop, +1);
+```
+
+`scripts/HallwayBuilder.cs`:
+
+```csharp
+using Godot;
+
+/// res://scripts/HallwayBuilder.cs — the FFA bonus hallway between a maze's Exit
+/// and its arena door. It's a row of ordinary Straight pieces built by DungeonBuilder,
+/// so it matches the corridor look, collision, sconces and torches exactly. The
+/// only special case is DeadEndOpen along the axis, so neither end is capped.
+public static class HallwayBuilder
+{
+    public static DungeonBuilder? Build(Node parent, SeatPlacement seat, int cells, Vector3 origin, string name)
+    {
+        if (cells <= 0) return null;
+        float cs = DungeonBuilder.CellSize;
+        bool alongZ = seat.Door == Door.N || seat.Door == Door.S;
+        var data = new MazeData { Name = name, IsOnline = false };
+        for (int i = 0; i < cells; i++)
+            data.Pieces.Add(new MazePiece
+            {
+                Type = PieceType.Straight, Floor = 0,
+                X = alongZ ? 0 : i, Y = alongZ ? i : 0,
+                Rotation = alongZ ? 0 : 1,   // rot 0 = N|S, rot 1 = E|W
+            });
+        var a = seat.HallStart; var b = seat.HallEnd;
+        var local = alongZ
+            ? new Vector3(-cs * 0.5f, 0f, Mathf.Min(a.Z, b.Z))
+            : new Vector3(Mathf.Min(a.X, b.X), 0f, -cs * 0.5f);
+        var builder = new DungeonBuilder
+        {
+            Name = name,
+            DeadEndOpen = alongZ ? (Dir.N | Dir.S) : (Dir.E | Dir.W),
+        };
+        parent.AddChild(builder);
+        builder.Build(data, origin + local, Dir.None);
+        return builder;
+    }
+}
+```
+
+- [ ] **Step 4: Run** `TestHallway` (expect `ALL PASS`). Re-run `TestGateSync`, `ArenaConnTest` and `TestDefaultMaze` to confirm the default-`None` path is unchanged.
+
+- [ ] **Step 5: Commit** `feat(ffa): hallway builder from Straight pieces; opt-in DeadEndOpen`.
+
+---
+
+### Task 6: `test/FfaLocalArena` — offline 3/4-maze scene
+
+**Files:**
+- Create: `test/FfaLocalArena.cs`, `test/FfaLocalArena.tscn`
+
+**Interfaces:**
+- Consumes: everything above; `DungeonArena.DirToYaw`, `PlayerController.Spawn`, `TorchSignalSystem.Init`, `AltarBuilder`, `WeaponPickup.Spawn`, `MazeSerializer.Load/Exists`, `GunCombat.RollStarter`.
+- Produces: the public static config `FfaLocalArena.Fixture` (string), `FfaLocalArena.Slots` (int[]?), `FfaLocalArena.SpawnSeat` (int, −1 = arena), `FfaLocalArena.WithPlayer` (bool). Instance: `Layout` (PlusLayoutResult), `Mazes` (DungeonBuilder[]), `Origin` (Vector3). Cmdline user args override the statics: `fixture=worst|central|mixed|t3|vsep|tall|heaviest`, `slots=1,2,3,4`, `spawn=arena|0..3`, `noplayer`.
+
+Fixture table (seat order N, E, S, W; `t3` = N, E, W):
+
+| fixture | mazes |
+|---|---|
+| worst | Slab(0), Slab(9), Slab(0), Slab(9) |
+| central | Slab(4), Slab(5), Slab(4), Slab(5) |
+| mixed | Slab(0), Slab(4), Slab(9), Slab(5) |
+| t3 | Slab(0), Slab(9), Slab(9) |
+| vsep | Slab(0), Slab(9,0,2), Slab(0), Slab(9,0,2) |
+| tall | Tall(0), Tall(9), Tall(0), Tall(9) |
+| heaviest | the 4 existing save slots with the most pieces (`MazeSerializer.Exists`, slots 0..9) |
+
+- [ ] **Step 1: Implement** `test/FfaLocalArena.cs`
+
+```csharp
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// test/FfaLocalArena.cs — Phase 1 dev scene: the FFA plus layout with NO
+/// networking. Arena at the origin, one rotated maze per door, per-match
+/// hallways, n−1 pickups on the altar, optional player. Used by TestFfaCapture
+/// for overhead screenshots and the light/perf census.
+public partial class FfaLocalArena : Node3D
+{
+    public static string Fixture = "worst";
+    public static int[]? Slots;
+    public static int SpawnSeat = -1;
+    public static bool WithPlayer = true;
+
+    public PlusLayoutResult Layout = null!;
+    public DungeonBuilder[] Mazes = System.Array.Empty<DungeonBuilder>();
+    public Vector3 Origin = Vector3.Zero;
+    Label? _zone;
+    PlayerController? _player;
+    float _zoneTimer;
+
+    static void ReadArgs()
+    {
+        foreach (var a in OS.GetCmdlineUserArgs())
+        {
+            var kv = a.Split('=', 2);
+            switch (kv[0])
+            {
+                case "fixture": Fixture = kv[1]; break;
+                case "slots":   Slots = kv[1].Split(',').Select(int.Parse).ToArray(); Fixture = "slots"; break;
+                case "spawn":   SpawnSeat = kv[1] == "arena" ? -1 : int.Parse(kv[1]); break;
+                case "noplayer": WithPlayer = false; break;
+            }
+        }
+    }
+
+    public static List<MazeData> LoadMazes(string fixture, int[]? slots)
+    {
+        MazeData S(int c, int ef = 0, int sf = 0) => FfaFixtures.Slab(c, ef, sf);
+        switch (fixture)
+        {
+            case "central": return new() { S(4), S(5), S(4), S(5) };
+            case "mixed":   return new() { S(0), S(4), S(9), S(5) };
+            case "t3":      return new() { S(0), S(9), S(9) };
+            case "vsep":    return new() { S(0), S(9, 0, 2), S(0), S(9, 0, 2) };
+            case "tall":    return new() { FfaFixtures.Tall(0), FfaFixtures.Tall(9), FfaFixtures.Tall(0), FfaFixtures.Tall(9) };
+            case "slots":   return slots!.Select(s => MazeSerializer.Load(s)!).ToList();
+            case "heaviest":
+                return Enumerable.Range(0, 10).Where(MazeSerializer.Exists)
+                    .Select(s => MazeSerializer.Load(s)).Where(m => m != null && m.Pieces.Count > 0)
+                    .OrderByDescending(m => m!.Pieces.Count).Take(4).Select(m => m!).ToList();
+            default:        return new() { S(0), S(9), S(0), S(9) };
+        }
+    }
+
+    public override void _Ready()
+    {
+        ReadArgs();
+        var mazes = LoadMazes(Fixture, Slots);
+        if (mazes.Count < 3) { GD.PushError($"[FFA] need 3–4 mazes, got {mazes.Count}"); return; }
+
+        var worldEnv = new WorldEnvironment();
+        var env = new Godot.Environment
+        {
+            BackgroundMode = Godot.Environment.BGMode.Color, BackgroundColor = Colors.Black,
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor = new Color(0.10f, 0.07f, 0.04f), AmbientLightEnergy = 0.25f,
+            TonemapMode = Godot.Environment.ToneMapper.Filmic, TonemapExposure = 1.3f,
+        };
+        worldEnv.Environment = env;
+        AddChild(worldEnv);
+
+        Layout = PlusLayout.Compute(mazes.Select(MazeFootprint.From).ToList(), ArenaBuilder.Apothem);
+        Mazes = new DungeonBuilder[mazes.Count];
+        for (int i = 0; i < mazes.Count; i++)
+        {
+            var s = Layout.Seats[i];
+            var data = MazeRotation.Rotate(mazes[i], s.QuarterTurns);
+            var b = new DungeonBuilder { Name = $"Maze{s.Door}" };
+            AddChild(b);
+            b.Build(data, Origin + s.Offset, s.ExitOpenDir);
+            Mazes[i] = b;
+            var torch = new TorchSignalSystem { Name = $"TorchSignal{s.Door}" };
+            AddChild(torch);
+            torch.Init(data, b);
+            HallwayBuilder.Build(this, s, Layout.HallCells, Origin, $"Hall{s.Door}");
+        }
+
+        var arena = new ArenaBuilder { Name = "Arena", GrassInnerRadius = AltarBuilder.BaseRadius };
+        AddChild(arena);
+        arena.Build(Origin, Layout.DoorAngles);
+
+        var altar = new AltarBuilder { Name = "Altar" };
+        AddChild(altar);
+        altar.Build(Origin);
+        int pickups = mazes.Count - 1;
+        for (int i = 0; i < pickups; i++)
+        {
+            float a = Mathf.Tau * i / pickups;
+            var p = WeaponPickup.Spawn(this, Origin + AltarBuilder.WeaponAnchor +
+                                       new Vector3(Mathf.Sin(a), 0f, -Mathf.Cos(a)) * AltarBuilder.TopRadius * 0.55f);
+            p.ClaimAttempted += () => p.ConfirmPickup();
+        }
+
+        GD.Print($"[FFA] fixture={Fixture} seats={mazes.Count} hall={Layout.HallCells} cells ({Layout.HallLength} m) " +
+                 string.Join(" ", Layout.Seats.Select((s, i) =>
+                     $"{s.Door}:'{mazes[i].Name}' exit=({s.Rotated.ExitX},{s.Rotated.ExitY}) f{s.Rotated.ExitFloor}")));
+
+        if (!WithPlayer) return;
+        Vector3 pos = Origin + new Vector3(0f, 1f, AltarBuilder.BaseRadius + 3f);
+        float yaw = 0f;
+        if (SpawnSeat >= 0 && SpawnSeat < mazes.Count)
+        {
+            var s = Layout.Seats[SpawnSeat];
+            var start = MazeRotation.Rotate(mazes[SpawnSeat], s.QuarterTurns).Pieces.First(p => p.Type == PieceType.Start);
+            pos = Origin + s.Offset + new Vector3((start.X + 0.5f) * 10f, start.Floor * DungeonBuilder.FloorHeight + 1f, (start.Y + 0.5f) * 10f);
+            yaw = DungeonArena.DirToYaw(PieceDB.GetOpenings(PieceType.Start, start.Rotation));
+        }
+        _player = PlayerController.Spawn(this, pos, yaw);
+        _player.EquipStarterGun(GunCombat.RollStarter((int)(GD.Randi() % (uint)GunCombat.StarterPool.Length)));
+        var hud = new CanvasLayer();
+        AddChild(hud);
+        _zone = new Label { Position = new Vector2(16, 16) };
+        hud.AddChild(_zone);
+    }
+
+    public override void _Process(double delta)
+    {
+        if (_player == null || _zone == null) return;
+        _zoneTimer -= (float)delta;
+        if (_zoneTimer > 0f) return;
+        _zoneTimer = 0.2f;
+        int seat = Layout.SeatAt(_player.GlobalPosition - Origin);
+        _zone.Text = seat < 0 ? "Zone: arena" : $"Zone: {Layout.Seats[seat].Door} maze/hall";
+    }
+}
+```
+
+`test/FfaLocalArena.tscn`:
+```
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://test/FfaLocalArena.cs" id="1"]
+
+[node name="FfaLocalArena" type="Node3D"]
+script = ExtResource("1")
+```
+
+- [ ] **Step 2: Build, then smoke-run headless for each fixture** (quits via a timeout wrapper, since the scene doesn't self-quit; `--quit-after 120` frames):
+
+```bash
+for f in worst central mixed t3 vsep; do
+  "$G" --path "$W" --headless --quit-after 120 res://test/FfaLocalArena.tscn -- fixture=$f noplayer 2>&1 | grep -E "\[FFA\]|ERROR|Exception"; done
+```
+Expected, one `[FFA]` line each with no errors: worst → `hall=7`, central → `hall=3`, mixed → `hall=3`, t3 → `hall=7`, vsep → `hall=0`. (The margin measured in Task 2 may shift a boundary by one cell; if it does, confirm it matches `TestPlusLayout` at that margin.)
+
+- [ ] **Step 3: Commit** `feat(ffa): FfaLocalArena offline plus-layout dev scene`.
+
+---
+
+### Task 7: Captures — overhead layouts, join walk-throughs, light/perf census
+
+**Files:**
+- Create: `test/TestFfaCapture.cs`, `test/TestFfaCapture.tscn`
+
+**Interfaces:**
+- Consumes: `FfaLocalArena` statics and instance fields (Task 6).
+- Produces: PNGs in `screenshots/ffa/` (gitignored) and a printed census.
+
+- [ ] **Step 1: Implement** `test/TestFfaCapture.cs`. It instantiates `FfaLocalArena` with `WithPlayer=false`, adds its own camera, and saves frames. Modes (cmdline): `mode=overhead fixture=X` or `mode=perf fixture=X`.
+
+```csharp
+using System.Linq;
+using Godot;
+
+/// test/TestFfaCapture.cs — Phase 1 review artefacts. Windowed only (renders).
+///   mode=overhead : orthographic top-down of the whole plus + a low-angle 3/4 view
+///                   + one shot per hallway looking arena→maze and maze→arena.
+///   mode=perf     : light census, then frame-time sampling (vsync off) from the
+///                   arena centre, inside the N maze, and mid N hallway.
+public partial class TestFfaCapture : Node3D
+{
+    string _mode = "overhead", _fixture = "worst", _dir = "screenshots/ffa";
+
+    public override async void _Ready()
+    {
+        foreach (var a in OS.GetCmdlineUserArgs())
+        {
+            var kv = a.Split('=', 2);
+            if (kv[0] == "mode") _mode = kv[1];
+            if (kv[0] == "fixture") _fixture = kv[1];
+        }
+        DirAccess.MakeDirRecursiveAbsolute(ProjectSettings.GlobalizePath($"res://{_dir}"));
+        FfaLocalArena.Fixture = _fixture; FfaLocalArena.WithPlayer = false;
+        var arena = GD.Load<PackedScene>("res://test/FfaLocalArena.tscn").Instantiate<FfaLocalArena>();
+        AddChild(arena);
+        var cam = new Camera3D { Current = true, Far = 4000f };
+        AddChild(cam);
+        await Frames(10);
+        var L = arena.Layout;
+        float reach = ArenaBuilder.Apothem + L.HallLength + 100f;
+
+        if (_mode == "overhead")
+        {
+            // Lift ambient so layout reads in a top-down shot (review artefact only).
+            var env = arena.GetChildren().OfType<WorldEnvironment>().First().Environment;
+            env.AmbientLightEnergy = 3f;
+            cam.Projection = Camera3D.ProjectionType.Orthogonal;
+            cam.Size = reach * 2f + 20f;
+            cam.Position = new Vector3(0f, 600f, 0f);
+            cam.RotationDegrees = new Vector3(-90f, 0f, 0f);
+            await Shot($"{_fixture}_overhead");
+            cam.Projection = Camera3D.ProjectionType.Perspective; cam.Fov = 60f;
+            cam.Position = new Vector3(reach * 0.9f, reach * 0.8f, reach * 0.9f);
+            cam.LookAt(Vector3.Zero, Vector3.Up);
+            await Shot($"{_fixture}_threequarter");
+            env.AmbientLightEnergy = 0.25f;
+            foreach (var s in L.Seats)
+            {
+                var u = PlusLayout.DoorDir(s.Door);
+                cam.Position = s.HallStart - u * 4f + Vector3.Up * 2f;
+                cam.LookAt(s.HallEnd + u * 10f + Vector3.Up * 2f, Vector3.Up);
+                await Shot($"{_fixture}_{s.Door}_arena_to_maze");
+                cam.Position = s.HallEnd + u * 4f + Vector3.Up * 2f;
+                cam.LookAt(s.HallStart - u * 10f + Vector3.Up * 2f, Vector3.Up);
+                await Shot($"{_fixture}_{s.Door}_maze_to_arena");
+            }
+        }
+        else
+        {
+            var lights = GetTree().Root.FindChildren("*", "OmniLight3D", true, false).Cast<OmniLight3D>().ToList();
+            GD.Print($"[PERF] fixture={_fixture} total omni lights = {lights.Count}");
+            foreach (var g in lights.GroupBy(l => TopName(l, arena)).OrderByDescending(g => g.Count()))
+                GD.Print($"[PERF]   {g.Key}: {g.Count()}");
+            DisplayServer.WindowSetVsyncMode(DisplayServer.VSyncMode.Disabled);
+            var n = L.Seats[0]; var un = PlusLayout.DoorDir(n.Door);
+            var spots = new (string, Vector3, Vector3)[]
+            {
+                ("arena centre",  new Vector3(0f, 2f, 8f),                         n.HallStart + Vector3.Up * 2f),
+                ("mid N hallway", (n.HallStart + n.HallEnd) * 0.5f + Vector3.Up * 2f, n.HallEnd + un * 20f + Vector3.Up * 2f),
+                ("inside N maze", n.HallEnd + un * 25f + Vector3.Up * 2f,          n.HallEnd + un * 60f + Vector3.Up * 2f),
+            };
+            foreach (var (label, pos, look) in spots)
+            {
+                cam.Position = pos; cam.LookAt(look, Vector3.Up);
+                await Frames(60);
+                ulong t0 = Time.GetTicksUsec(); await Frames(240); ulong t1 = Time.GetTicksUsec();
+                double ms = (t1 - t0) / 240.0 / 1000.0;
+                int inRange = lights.Count(l => l.Visible && l.GlobalPosition.DistanceTo(pos) < l.OmniRange + 20f);
+                GD.Print($"[PERF] {label}: {ms:F2} ms/frame ({1000 / ms:F0} fps), omnis within range+20 m = {inRange}");
+                await Shot($"{_fixture}_perf_{label.Replace(' ', '_')}");
+            }
+        }
+        GetTree().Quit(0);
+    }
+
+    static string TopName(Node n, Node root)
+    {
+        while (n.GetParent() != root && n.GetParent() != null) n = n.GetParent();
+        return n.Name;
+    }
+
+    async System.Threading.Tasks.Task Frames(int k)
+    {
+        for (int i = 0; i < k; i++) await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+    }
+
+    async System.Threading.Tasks.Task Shot(string name)
+    {
+        await Frames(4);
+        var img = GetViewport().GetTexture().GetImage();
+        img.SavePng(ProjectSettings.GlobalizePath($"res://{_dir}/{name}.png"));
+        GD.Print($"[SHOT] {_dir}/{name}.png");
+    }
+}
+```
+
+(`.tscn`: root `Node3D` named `TestFfaCapture`, script `res://test/TestFfaCapture.cs`.)
+
+- [ ] **Step 2: Choose the screen.** Run PowerShell `Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens | Select DeviceName,Primary,Bounds` and check which screen League is on (`Get-Process League* | Select MainWindowTitle`). Use `--screen N` for the other one.
+
+- [ ] **Step 3: Overhead captures** (windowed, console wrapper):
+
+```bash
+for f in worst central mixed t3 vsep; do
+  "$G" --path "$W" --screen N --resolution 1600x1600 res://test/TestFfaCapture.tscn -- mode=overhead fixture=$f 2>&1 | grep -E "\[SHOT\]|\[FFA\]|ERROR"; done
+```
+Then Read each `screenshots/ffa/*_overhead.png` and `*_threequarter.png`, and every join shot. Verify:
+- no two mazes overlap;
+- all hallways are the same length;
+- every hallway meets both the arena arch and the maze Exit with no cap wall or gap;
+- the E/W arena doorways are open and the shelves end cleanly at them.
+
+- [ ] **Step 4: Perf captures** on `tall` and `heaviest` (and `worst` as a light baseline):
+
+```bash
+for f in worst tall heaviest; do
+  "$G" --path "$W" --screen N --resolution 1600x900 res://test/TestFfaCapture.tscn -- mode=perf fixture=$f 2>&1 | grep -E "\[PERF\]|\[FFA\]|ERROR"; done
+```
+Record the census and ms/frame in the task report. Compare against a 1v1 reference: run `TestArenaPerf` from Task 0's scene list, or the offline `DungeonArena` with the same heaviest slot.
+
+- [ ] **Step 5: Decide on light gating.** Trigger: any spot below 60 fps where the 1v1 reference is at or above 60, OR the arena-centre shot shows the lit-floor/black-ceiling symptom. In that case, add a follow-up task, `FfaLightGate` (per-maze `Visible` toggling of each maze's `OmniLight3D`s driven by `SeatAt` of the local camera: own maze + own hallway + arena on; others off), then re-run Step 4. Otherwise record "no gating needed" with the numbers.
+
+- [ ] **Step 6: Commit** `test(ffa): overhead/join captures and light-perf census harness`.
+
+---
+
+### Task 8: Phase 1 checkpoint
+
+**Files:**
+- Modify: `JOURNAL.md` (new top entry), `BUILD.md` (new test and capture commands)
+
+- [ ] **Step 1: Full regression gate.** Run every suite from Task 0 plus `TestMazeRotation`, `TestMazeFootprint`, `TestPlusLayout`, `TestArenaDoors` and `TestHallway`. All should be green, or unchanged from the baseline.
+
+- [ ] **Step 2: JOURNAL entry** `## 2026-09-28 — FFA Phase 1: local plus layout`. Cover:
+  - the measured `Margin`;
+  - hallway cells per fixture;
+  - the census and frame times;
+  - the gating decision;
+  - that 1v1 is untouched (golden).
+
+  BUILD.md: add the headless test list and the capture commands from Task 7.
+
+- [ ] **Step 3: Commit** `docs(ffa): phase 1 journal + build notes`.
+
+- [ ] **Step 4: STOP.** Send the owner the overhead PNGs (worst, central, mixed, t3, vsep), the join shots, and the perf table. **No Phase 2 work until the owner approves.**

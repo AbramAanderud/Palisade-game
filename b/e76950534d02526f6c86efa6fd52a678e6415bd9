@@ -1,0 +1,116 @@
+using System.Linq;
+using Godot;
+
+/// test/TestFfaCapture.cs — Phase 1 review artefacts. Windowed only (renders).
+///   mode=overhead : orthographic top-down of the whole plus + a low-angle 3/4 view
+///                   + one shot per hallway looking arena→maze and maze→arena.
+///   mode=perf     : light census, then frame-time sampling (vsync off) from the
+///                   arena centre, inside the N maze, and mid N hallway.
+public partial class TestFfaCapture : Node3D
+{
+    string _mode = "overhead", _fixture = "worst", _dir = "screenshots/ffa";
+
+    bool _nogate;
+
+    public override async void _Ready()
+    {
+        foreach (var a in OS.GetCmdlineUserArgs())
+        {
+            var kv = a.Split('=', 2);
+            if (kv[0] == "mode") _mode = kv[1];
+            if (kv[0] == "fixture") _fixture = kv[1];
+            if (kv[0] == "nogate") _nogate = true;
+        }
+        DirAccess.MakeDirRecursiveAbsolute(ProjectSettings.GlobalizePath($"res://{_dir}"));
+        FfaLocalArena.Fixture = _fixture; FfaLocalArena.WithPlayer = false; FfaLocalArena.LightGate = !_nogate;
+        var arena = GD.Load<PackedScene>("res://test/FfaLocalArena.tscn").Instantiate<FfaLocalArena>();
+        AddChild(arena);
+        var cam = new Camera3D { Current = true, Far = 4000f };
+        AddChild(cam);
+        await Frames(10);
+        var L = arena.Layout;
+        float reach = ArenaBuilder.Apothem + L.HallLength + 100f;
+
+        if (_mode == "overhead")
+        {
+            // Lift ambient so layout reads in a top-down shot (review artefact only).
+            var env = arena.GetChildren().OfType<WorldEnvironment>().First().Environment;
+            env.AmbientLightEnergy = 3f;
+            // ADJUSTMENT (see task-7-report.md): ArenaBuilder's real night-sky HDRI
+            // (satara_night_4k.hdr, Sky background) renders as a radiating streak
+            // artefact when sampled by an Orthogonal camera looking straight down —
+            // an engine-level ortho+Sky interaction, not a geometry bug. The 3/4 and
+            // join shots look correct (non-vertical angle), so only the strictly
+            // vertical top-down shot swaps to a flat black background.
+            var bgMode = env.BackgroundMode;
+            env.BackgroundMode = Godot.Environment.BGMode.Color;
+            env.BackgroundColor = Colors.Black;
+            cam.Projection = Camera3D.ProjectionType.Orthogonal;
+            cam.Size = reach * 2f + 20f;
+            cam.Position = new Vector3(0f, 600f, 0f);
+            cam.RotationDegrees = new Vector3(-90f, 0f, 0f);
+            await Shot($"{_fixture}_overhead");
+            env.BackgroundMode = bgMode;
+            cam.Projection = Camera3D.ProjectionType.Perspective; cam.Fov = 60f;
+            cam.Position = new Vector3(reach * 0.9f, reach * 0.8f, reach * 0.9f);
+            cam.LookAt(Vector3.Zero, Vector3.Up);
+            await Shot($"{_fixture}_threequarter");
+            env.AmbientLightEnergy = 0.25f;
+            foreach (var s in L.Seats)
+            {
+                var u = PlusLayout.DoorDir(s.Door);
+                cam.Position = s.HallStart - u * 4f + Vector3.Up * 2f;
+                cam.LookAt(s.HallEnd + u * 10f + Vector3.Up * 2f, Vector3.Up);
+                await Shot($"{_fixture}_{s.Door}_arena_to_maze");
+                cam.Position = s.HallEnd + u * 4f + Vector3.Up * 2f;
+                cam.LookAt(s.HallStart - u * 10f + Vector3.Up * 2f, Vector3.Up);
+                await Shot($"{_fixture}_{s.Door}_maze_to_arena");
+            }
+        }
+        else
+        {
+            var lights = GetTree().Root.FindChildren("*", "OmniLight3D", true, false).Cast<OmniLight3D>().ToList();
+            GD.Print($"[PERF] fixture={_fixture} gate={(_nogate ? "off" : "on")} total omni lights = {lights.Count}");
+            foreach (var g in lights.GroupBy(l => TopName(l, arena)).OrderByDescending(g => g.Count()))
+                GD.Print($"[PERF]   {g.Key}: {g.Count()}");
+            DisplayServer.WindowSetVsyncMode(DisplayServer.VSyncMode.Disabled);
+            var n = L.Seats[0]; var un = PlusLayout.DoorDir(n.Door);
+            var spots = new (string, Vector3, Vector3)[]
+            {
+                ("arena centre",  new Vector3(0f, 2f, 8f),                         n.HallStart + Vector3.Up * 2f),
+                ("mid N hallway", (n.HallStart + n.HallEnd) * 0.5f + Vector3.Up * 2f, n.HallEnd + un * 20f + Vector3.Up * 2f),
+                ("inside N maze", n.HallEnd + un * 25f + Vector3.Up * 2f,          n.HallEnd + un * 60f + Vector3.Up * 2f),
+            };
+            foreach (var (label, pos, look) in spots)
+            {
+                cam.Position = pos; cam.LookAt(look, Vector3.Up);
+                await Frames(60);
+                ulong t0 = Time.GetTicksUsec(); await Frames(240); ulong t1 = Time.GetTicksUsec();
+                double ms = (t1 - t0) / 240.0 / 1000.0;
+                int inRange = lights.Count(l => l.Visible && l.GlobalPosition.DistanceTo(pos) < l.OmniRange + 20f);
+                GD.Print($"[PERF] {label}: {ms:F2} ms/frame ({1000 / ms:F0} fps), omnis within range+20 m = {inRange}");
+                await Shot($"{_fixture}_perf_{label.Replace(' ', '_')}");
+            }
+        }
+        GetTree().Quit(0);
+    }
+
+    static string TopName(Node n, Node root)
+    {
+        while (n.GetParent() != root && n.GetParent() != null) n = n.GetParent();
+        return n.Name;
+    }
+
+    async System.Threading.Tasks.Task Frames(int k)
+    {
+        for (int i = 0; i < k; i++) await ToSignal(GetTree(), SceneTree.SignalName.ProcessFrame);
+    }
+
+    async System.Threading.Tasks.Task Shot(string name)
+    {
+        await Frames(4);
+        var img = GetViewport().GetTexture().GetImage();
+        img.SavePng(ProjectSettings.GlobalizePath($"res://{_dir}/{name}.png"));
+        GD.Print($"[SHOT] {_dir}/{name}.png");
+    }
+}

@@ -1,0 +1,114 @@
+using Godot;
+using System.Linq;
+using System.Collections.Generic;
+
+/// test/TestPitDoorway.cs
+/// Pit-preview doorway markers (mirrors the room-edge open/walled treatment,
+/// AddRoomOpenMarker) must agree EXACTLY with PitBuilder.HasEntry — the same
+/// predicate the runtime shaft uses to decide which faces actually open. This
+/// pins that agreement directly against the real BuildPieceInto output (not a
+/// re-derived copy of the rule), at the same (perimeter cell, floor, face)
+/// granularity HasEntry itself operates at.
+///
+/// No live scene tree needed: MazeEditor3D.BuildPieceInto's Pit branch only
+/// reads _maze/FlMin/FlMax/PieceDB and writes into the `parent` Node3D handed
+/// to it — same "not in the tree" pattern as TestTeleportPairs.cs.
+public partial class TestPitDoorway : Node
+{
+    int _fail;
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    const float CS = DungeonBuilder.CellSize;
+    // MazeEditor3D.EdFH/FlMin/FlMax are private consts; mirrored here rather than
+    // widening their access just for this test (their values are load-bearing
+    // constants unlikely to change without every editor test needing a look anyway).
+    const float EdFH = 8f;
+    const int FlMin = -3, FlMax = 3;
+
+    public override void _Ready()
+    {
+        GD.Print("── pit doorway markers vs PitBuilder.HasEntry ──");
+
+        var ed = new MazeEditor3D();
+        // Pit anchored at (5,5,0) -> occupies floors {-1,0,1} (PieceDB.FloorSpan).
+        var pit = new MazePiece { Type = PieceType.Pit, X = 5, Y = 5, Floor = 0 };
+
+        // A) Block connection: Straight at (5,3,0), rot 0 (opens N|S) — its S face
+        // opens onto the pit's N-perimeter cell (5,4). Only floor 0's N/dx=0
+        // segment should be open; the same face on floors -1/+1 must stay walled,
+        // and the OTHER two sub-cells on the N face (dx=-1, dx=+1) must too.
+        var straight = new MazePiece { Type = PieceType.Straight, X = 5, Y = 3, Floor = 0, Rotation = 0 };
+
+        // C) Stair connection: StairsUp at (7,5,0) rot 3 -> CrossDir = W (verified
+        // against PieceDB.GetStairCrossDir's N->E->S->W rotation table). Its high
+        // end lands one floor up (floor 1) facing W, exactly onto the pit's
+        // E-perimeter cell (6,5) at floor 1 — HasEntry's "stair one floor below,
+        // matching CrossDir" branch.
+        var stairUp = new MazePiece { Type = PieceType.StairsUp, X = 7, Y = 5, Floor = 0, Rotation = 3 };
+
+        ed._maze = new MazeData { Name = "PitDoorwayTest",
+            Pieces = new List<MazePiece> { pit, straight, stairUp } };
+
+        var geo = new Node3D();
+        ed.BuildPieceInto(geo, PieceType.Pit, 0, pit.X * CS, pit.Floor * EdFH, pit.Y * CS, isActive: true);
+
+        var markers = geo.GetChildren().OfType<MeshInstance3D>()
+            .Where(mi => mi.MaterialOverride is StandardMaterial3D m && m.EmissionEnabled)
+            .ToList();
+
+        bool MarkerNear(float x, float y, float z) => markers.Any(mi =>
+            Mathf.Abs(mi.Position.X - x) < 0.5f &&
+            Mathf.Abs(mi.Position.Y - y) < 0.5f &&
+            Mathf.Abs(mi.Position.Z - z) < 0.5f);
+
+        // Independent cross-check against HasEntry directly (not just the marker
+        // count), using the exact same lookup the editor builds.
+        var lookup = MazeLookup.Build(ed._maze.Pieces, FlMin, FlMax);
+
+        // ── A) block connection ──────────────────────────────────────────────
+        bool aOpenAtF0 = PitBuilder.HasEntry(lookup, pit, 5, 4, 0, Dir.N, FlMin, FlMax);
+        Check(aOpenAtF0, "HasEntry: N face, (5,4), floor 0 is open (Straight connects)");
+        float aWorldZ = (pit.Y - 1) * CS;                       // pz0 (north boundary)
+        float aWorldX = 5 * CS + CS * 0.5f;                     // sub-cell dx=0 centre
+        float aWorldY = 0 * EdFH + EdFH * 0.5f;                 // floor 0 mid
+        Check(MarkerNear(aWorldX, aWorldY, aWorldZ), "editor draws an open marker exactly at (N, dx=0, floor 0)");
+
+        // Same face/sub-cell on floors -1 and +1 must stay walled (per-floor, not
+        // whole-face) — no marker anywhere near that X/Z at the other floor heights.
+        Check(!MarkerNear(aWorldX, -1 * EdFH + EdFH * 0.5f, aWorldZ),
+              "N face, dx=0, floor -1 stays WALLED (Straight is only on floor 0)");
+        Check(!MarkerNear(aWorldX, 1 * EdFH + EdFH * 0.5f, aWorldZ),
+              "N face, dx=0, floor +1 stays WALLED (Straight is only on floor 0)");
+
+        // ── B) no connection (south face, entirely empty) ───────────────────
+        int southOpenCount = 0;
+        for (int dx = -1; dx <= 1; dx++)
+            foreach (int f in new[] { -1, 0, 1 })
+                if (PitBuilder.HasEntry(lookup, pit, 5 + dx, 6, f, Dir.S, FlMin, FlMax))
+                    southOpenCount++;
+        Check(southOpenCount == 0, $"HasEntry: S face has zero open cells (has {southOpenCount})");
+        float sWorldZ = (pit.Y + 2) * CS;                       // pz1 (south boundary)
+        bool anySouthMarker = markers.Any(mi => Mathf.Abs(mi.Position.Z - sWorldZ) < 0.5f);
+        Check(!anySouthMarker, "editor draws NO open marker anywhere on the south face");
+
+        // ── C) stair connection ──────────────────────────────────────────────
+        bool cOpen = PitBuilder.HasEntry(lookup, pit, 6, 5, 1, Dir.E, FlMin, FlMax);
+        Check(cOpen, "HasEntry: E face, (6,5), floor 1 is open (StairsUp cross lands here)");
+        float cWorldX = (pit.X + 2) * CS;                       // px1 (east boundary)
+        float cWorldZ = 5 * CS + CS * 0.5f;                     // sub-cell dy=0 centre
+        float cWorldY = 1 * EdFH + EdFH * 0.5f;                 // floor 1 mid
+        Check(MarkerNear(cWorldX, cWorldY, cWorldZ), "editor draws an open marker exactly at (E, dy=0, floor 1)");
+        Check(!MarkerNear(cWorldX, 0 * EdFH + EdFH * 0.5f, cWorldZ),
+              "E face, dy=0, floor 0 stays WALLED (the stair's high end only lands on floor 1)");
+
+        GD.Print($"total open markers drawn: {markers.Count} (expect exactly 2 — one per real connection)");
+        Check(markers.Count == 2, "exactly two open markers total (A and C) — no stray opens");
+
+        GD.Print(_fail == 0 ? "RESULT OK" : $"RESULT {_fail} FAILURE(S)");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

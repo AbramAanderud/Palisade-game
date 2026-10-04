@@ -1,0 +1,266 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// Headless assertion harness for Room / Pit piece metadata and connectivity.
+/// Prints one line per check and quits non-zero if any check fails.
+public partial class TestRoomPitLogic : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    public override void _Ready()
+    {
+        RunPieceDbChecks();
+        RunRoomGroupChecks();
+        RunStairLandingChecks();
+        RunPitChecks();
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+
+    void RunPieceDbChecks()
+    {
+        GD.Print("── PieceDB ──");
+
+        // Room is open on all four faces at every rotation, so any corridor that
+        // points at it connects — this is what makes "any entry way hitting the
+        // open space is valid" true without special-casing the validator.
+        for (int rot = 0; rot < 4; rot++)
+            foreach (Dir d in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+                Check(PieceDB.HasSameFloorOpening(PieceType.Room, rot, d),
+                      $"Room rot={rot} has same-floor opening {d}");
+
+        // Pit is likewise open on all faces — every perimeter slot is a doorway.
+        for (int rot = 0; rot < 4; rot++)
+            foreach (Dir d in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+                Check(PieceDB.HasSameFloorOpening(PieceType.Pit, rot, d),
+                      $"Pit rot={rot} has same-floor opening {d}");
+
+        // Neither is a stair — they must not go down the stair code paths.
+        Check(!PieceDB.IsStair(PieceType.Room), "Room is not a stair");
+        Check(!PieceDB.IsStair(PieceType.Pit),  "Pit is not a stair");
+
+        // Footprints.
+        Check(PieceDB.Footprint(PieceType.Room).Length == 1,
+              "Room footprint is a single cell");
+        Check(PieceDB.Footprint(PieceType.Straight).Length == 1,
+              "Straight footprint is a single cell");
+
+        var pitCells = PieceDB.Footprint(PieceType.Pit);
+        Check(pitCells.Length == 9, "Pit footprint covers 9 cells");
+        Check(pitCells.Contains((0, 0)),   "Pit footprint includes its anchor");
+        Check(pitCells.Contains((-1, -1)), "Pit footprint includes (-1,-1)");
+        Check(pitCells.Contains((1, 1)),   "Pit footprint includes (1,1)");
+        Check(pitCells.All(c => Math.Abs(c.dx) <= 1 && Math.Abs(c.dy) <= 1),
+              "Pit footprint stays within a 3x3");
+        Check(pitCells.Distinct().Count() == 9, "Pit footprint has no duplicate cells");
+
+        // Floor spans.
+        Check(PieceDB.FloorSpan(PieceType.Room).SequenceEqual(new[] { 0 }),
+              "Room occupies only its own floor");
+        Check(PieceDB.FloorSpan(PieceType.Straight).SequenceEqual(new[] { 0 }),
+              "Straight occupies only its own floor");
+        Check(PieceDB.FloorSpan(PieceType.Pit).OrderBy(f => f).SequenceEqual(new[] { -1, 0, 1 }),
+              "Pit spans one floor down, its own, and one up");
+
+        // IsMultiCell.
+        Check(PieceDB.IsMultiCell(PieceType.Pit),   "Pit is multi-cell");
+        Check(!PieceDB.IsMultiCell(PieceType.Room), "Room is NOT multi-cell (painted per tile)");
+        Check(!PieceDB.IsMultiCell(PieceType.Cross), "Cross is not multi-cell");
+
+        // Palette metadata must exist or the editor will throw on open.
+        foreach (var pt in new[] { PieceType.Room, PieceType.Pit })
+        {
+            Check(PieceDB.Colors.ContainsKey(pt),      $"{pt} has a Color");
+            Check(PieceDB.Labels.ContainsKey(pt),      $"{pt} has a Label");
+            Check(PieceDB.ShortLabels.ContainsKey(pt), $"{pt} has a ShortLabel");
+            Check(PieceDB.GoldCosts.ContainsKey(pt),   $"{pt} has a GoldCost");
+        }
+
+        Check(PieceDB.CategoryOf(PieceType.Room) == PieceCategory.Structure,
+              "Room is in the Structure tab");
+        Check(PieceDB.CategoryOf(PieceType.Pit) == PieceCategory.Traversal,
+              "Pit is in the Traversal tab");
+
+        RunAliasingChecks();
+    }
+
+    // Footprint/FloorSpan must hand back a fresh array every call. They are
+    // backed by shared static readonly arrays (SingleCell/ThreeByThree,
+    // SingleFloor/ThreeFloors) — if a caller's in-place mutation leaked into
+    // that backing array, every other piece type sharing it would be
+    // silently corrupted for the rest of the process's lifetime.
+    void RunAliasingChecks()
+    {
+        GD.Print("── PieceDB aliasing (Footprint/FloorSpan return copies) ──");
+
+        // Mutating a Footprint result must not affect a later call for the same type.
+        var room1 = PieceDB.Footprint(PieceType.Room);
+        room1[0] = (9, 9);
+        var room2 = PieceDB.Footprint(PieceType.Room);
+        Check(room2[0] == (0, 0),
+              "Footprint(Room) mutation does not persist across calls");
+
+        // Mutating a Footprint result for one type must not affect a different
+        // type that shares the same backing array (Room and Straight both
+        // route through SingleCell).
+        var roomFootprint = PieceDB.Footprint(PieceType.Room);
+        roomFootprint[0] = (7, 7);
+        var straightFootprint = PieceDB.Footprint(PieceType.Straight);
+        Check(straightFootprint[0] == (0, 0),
+              "Footprint(Room) mutation does not leak into Footprint(Straight)");
+
+        // Same two checks for FloorSpan.
+        var span1 = PieceDB.FloorSpan(PieceType.Room);
+        span1[0] = 99;
+        var span2 = PieceDB.FloorSpan(PieceType.Room);
+        Check(span2[0] == 0,
+              "FloorSpan(Room) mutation does not persist across calls");
+
+        var roomSpan = PieceDB.FloorSpan(PieceType.Room);
+        roomSpan[0] = 42;
+        var straightSpan = PieceDB.FloorSpan(PieceType.Straight);
+        Check(straightSpan[0] == 0,
+              "FloorSpan(Room) mutation does not leak into FloorSpan(Straight)");
+    }
+
+    static MazePiece Room(int x, int y, int floor = 0)
+        => new() { Type = PieceType.Room, X = x, Y = y, Floor = floor, Rotation = 0 };
+
+    void RunRoomGroupChecks()
+    {
+        GD.Print("── RoomGroups ──");
+
+        // A 3x2 block of Room tiles must collapse into exactly one group.
+        var rect = new List<MazePiece>();
+        for (int x = 2; x <= 4; x++)
+            for (int y = 2; y <= 3; y++)
+                rect.Add(Room(x, y));
+        var g = RoomGroups.Build(rect);
+        Check(g.Count == 1, "3x2 block of Room tiles is one group");
+        Check(g[0].Cells.Count == 6, "group holds all 6 cells");
+        Check(g[0].MinX == 2 && g[0].MaxX == 4 && g[0].MinY == 2 && g[0].MaxY == 3,
+              "group bounds are (2,2)-(4,3)");
+        // Width 3 (X) vs depth 2 (Z): the long axis is X, so the barrel runs along X
+        // and arcs across Z.
+        Check(!g[0].VaultAlongZ, "3-wide x 2-deep room arcs across Z");
+
+        // Two Room blocks that do not touch are two separate groups.
+        var split = new List<MazePiece> { Room(0, 0), Room(1, 0), Room(5, 5) };
+        var gs = RoomGroups.Build(split);
+        Check(gs.Count == 2, "disconnected Room tiles form separate groups");
+
+        // Diagonal-only contact is NOT contact — rooms merge on shared faces only.
+        var diag = RoomGroups.Build(new List<MazePiece> { Room(0, 0), Room(1, 1) });
+        Check(diag.Count == 2, "diagonally-touching Room tiles do not merge");
+
+        // Rooms on different floors never merge, even at the same X/Y.
+        var floors = RoomGroups.Build(new List<MazePiece> { Room(3, 3, 0), Room(3, 3, 1) });
+        Check(floors.Count == 2, "Room tiles on different floors are separate groups");
+        Check(floors.Any(r => r.Floor == 0) && floors.Any(r => r.Floor == 1),
+              "each group records its own floor");
+
+        // Non-Room pieces are ignored entirely.
+        var mixed = RoomGroups.Build(new List<MazePiece>
+        {
+            Room(1, 1),
+            new() { Type = PieceType.Straight, X = 1, Y = 2, Floor = 0, Rotation = 0 },
+        });
+        Check(mixed.Count == 1 && mixed[0].Cells.Count == 1,
+              "non-Room pieces are excluded from groups");
+
+        // Perimeter faces: in the 3x2 rect, (2,2) is a top-left corner.
+        var r = g[0];
+        Check(r.IsPerimeterFace(2, 2, Dir.N), "(2,2) north face is perimeter");
+        Check(r.IsPerimeterFace(2, 2, Dir.W), "(2,2) west face is perimeter");
+        Check(!r.IsPerimeterFace(2, 2, Dir.E), "(2,2) east face is interior (touches (3,2))");
+        Check(!r.IsPerimeterFace(2, 2, Dir.S), "(2,2) south face is interior (touches (2,3))");
+        Check(r.IsPerimeterFace(4, 3, Dir.E), "(4,3) east face is perimeter");
+        Check(r.IsPerimeterFace(4, 3, Dir.S), "(4,3) south face is perimeter");
+
+        // An L-shape is still ONE group — irregular rooms are allowed and must not
+        // be silently split or rectangle-filled.
+        var lshape = RoomGroups.Build(new List<MazePiece>
+        {
+            Room(0, 0), Room(1, 0), Room(2, 0), Room(0, 1), Room(0, 2),
+        });
+        Check(lshape.Count == 1, "L-shaped room is one group");
+        Check(lshape[0].Cells.Count == 5, "L-shaped group keeps all 5 cells");
+        Check(!lshape[0].Contains(2, 2), "L-shaped group does not fill its bounding box");
+    }
+
+    void RunStairLandingChecks()
+    {
+        GD.Print("── Stair landings into rooms ──");
+
+        // A StairsUp at (3,3) floor 0 with rotation 0 has its cross (high) face
+        // pointing N, so it lands at (3,2) on floor 1.
+        var stair = new MazePiece
+        {
+            Type = PieceType.StairsUp, X = 3, Y = 3, Floor = 0, Rotation = 0,
+        };
+        Check(PieceDB.GetStairCrossDir(stair.Type, stair.Rotation) == Dir.N,
+              "StairsUp rot=0 crosses north");
+        Check(PieceDB.StairFloorDelta(stair.Type) == +1,
+              "StairsUp climbs one floor");
+
+        var lookup = new Dictionary<(int, int, int), MazePiece>
+        {
+            [(3, 3, 0)] = stair,
+        };
+
+        Check(RoomBuilder.IsStairLandingCell(lookup, 3, 2, 1),
+              "(3,2) on floor 1 is the stair's landing cell");
+        Check(!RoomBuilder.IsStairLandingCell(lookup, 3, 1, 1),
+              "(3,1) on floor 1 is NOT the landing cell");
+        Check(!RoomBuilder.IsStairLandingCell(lookup, 3, 2, 0),
+              "(3,2) on floor 0 is NOT the landing cell (wrong floor)");
+
+        // StairsDown at (5,5) floor 0 rot 0 crosses S, landing at (5,6) on floor -1.
+        var down = new MazePiece
+        {
+            Type = PieceType.StairsDown, X = 5, Y = 5, Floor = 0, Rotation = 0,
+        };
+        var lookup2 = new Dictionary<(int, int, int), MazePiece> { [(5, 5, 0)] = down };
+        Check(RoomBuilder.IsStairLandingCell(lookup2, 5, 6, -1),
+              "StairsDown lands at (5,6) on floor -1");
+    }
+
+    void RunPitChecks()
+    {
+        GD.Print("── Pit ──");
+
+        // Floor clipping: a pit anchored at the top floor loses its upper level but
+        // stays valid — the user requirement is "cut them off but keep the piece valid".
+        Check(PitBuilder.OccupiedFloors(0, -3, 3).SequenceEqual(new[] { -1, 0, 1 }),
+              "pit at floor 0 occupies -1, 0, 1");
+        Check(PitBuilder.OccupiedFloors(3, -3, 3).SequenceEqual(new[] { 2, 3 }),
+              "pit at the top floor is clipped to 2, 3");
+        Check(PitBuilder.OccupiedFloors(-3, -3, 3).SequenceEqual(new[] { -3, -2 }),
+              "pit at the bottom floor is clipped to -3, -2");
+        Check(PitBuilder.OccupiedFloors(3, 3, 3).SequenceEqual(new[] { 3 }),
+              "pit with no room above or below still yields its own floor");
+
+        // Occupancy: the anchor's 3x3 across its clipped floor span.
+        var pit = new MazePiece { Type = PieceType.Pit, X = 4, Y = 4, Floor = 0, Rotation = 0 };
+        Check(PitBuilder.Occupies(pit, 4, 4, 0,  -3, 3), "pit occupies its anchor cell");
+        Check(PitBuilder.Occupies(pit, 3, 3, 0,  -3, 3), "pit occupies its NW corner");
+        Check(PitBuilder.Occupies(pit, 5, 5, 1,  -3, 3), "pit occupies its SE corner one floor up");
+        Check(PitBuilder.Occupies(pit, 5, 5, -1, -3, 3), "pit occupies its SE corner one floor down");
+        Check(!PitBuilder.Occupies(pit, 6, 4, 0,  -3, 3), "pit does not occupy x=6");
+        Check(!PitBuilder.Occupies(pit, 4, 4, 2,  -3, 3), "pit does not occupy floor +2");
+
+        // Clipped pit does not claim floors outside the world.
+        var top = new MazePiece { Type = PieceType.Pit, X = 4, Y = 4, Floor = 3, Rotation = 0 };
+        Check(!PitBuilder.Occupies(top, 4, 4, 4, -3, 3), "clipped pit claims nothing above FlMax");
+        Check(PitBuilder.Occupies(top, 4, 4, 2, -3, 3),  "clipped pit still claims the floor below");
+    }
+}

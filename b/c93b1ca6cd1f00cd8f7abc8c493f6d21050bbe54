@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://ctitlewordmark1"]
+
+[ext_resource type="Script" path="res://test/TestTitleWordmark.cs" id="1_twm"]
+
+[node name="TestTitleWordmark" type="Node3D"]
+script = ExtResource("1_twm")

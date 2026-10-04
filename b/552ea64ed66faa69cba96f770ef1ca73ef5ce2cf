@@ -1,0 +1,106 @@
+using System.Collections.Generic;
+using Godot;
+
+/// res://test/TestTask.cs — per-task harness (overwritten each task).
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Repro/verification for the drop-trap readability bug: (1) the landing floor
+/// doesn't clearly read as solid ground when looking down through the open
+/// trapdoor, and (2) looking UP from the landing shows the night skybox
+/// through gaps flanking the hatch (owner screenshot). Builds a TrapDoor at
+/// (5,5,F0) with a connecting Straight at (5,4,-1) so the landing arms (opens).
+/// Two camera waypoints: looking down from above the hatch, looking up from
+/// the landing floor.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTask : Node3D
+{
+    Camera3D _cam = null!;
+    int _frame = 0;
+    const float CS = DungeonBuilder.CellSize;
+    const float FH = DungeonBuilder.FloorHeight;
+
+    static readonly (Vector3 pos, float yaw, float pitch, string note)[] Waypoints =
+    {
+        // Above the hatch on floor 0, looking down into the shaft.
+        (new(53f, 3.5f, 47f), 200f, -55f, "looking DOWN into the open trap"),
+        // Inside the landing (floor -1), looking up at the opening.
+        (new(55f, -17f, 55f), 0f, 70f, "looking UP from the landing at the opening"),
+    };
+
+    public override void _Ready()
+    {
+        var worldEnv = new WorldEnvironment();
+        worldEnv.Environment = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Sky,
+            Sky                = MakeStarrySky(),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.10f, 0.09f, 0.10f),
+            AmbientLightEnergy = 0.35f,
+            TonemapMode        = Godot.Environment.ToneMapper.Filmic,
+            TonemapExposure    = 1.3f,
+        };
+        AddChild(worldEnv);
+        AddChild(new DirectionalLight3D
+        {
+            Name = "TestSun", LightColor = new Color(1f, 0.95f, 0.85f), LightEnergy = 0.6f,
+            Rotation = new Vector3(-0.7f, 0.5f, 0f),
+        });
+
+        var pieces = new List<MazePiece>
+        {
+            new() { Type = PieceType.Start,    X = 5, Y = 7, Floor = 0 },
+            new() { Type = PieceType.Straight, X = 5, Y = 6, Floor = 0 },
+            new() { Type = PieceType.TrapDoor, X = 5, Y = 5, Floor = 0, Rotation = 0 },
+            new() { Type = PieceType.Straight, X = 5, Y = 4, Floor = 0 },
+            // Landing-floor neighbour so the trapdoor arms (opens) — its S face
+            // (default rot0, N|S) points back at the trapdoor's own landing cell.
+            new() { Type = PieceType.Straight, X = 5, Y = 4, Floor = -1 },
+        };
+        var dungeon = new DungeonBuilder();
+        AddChild(dungeon);
+        dungeon.Build(new MazeData { Name = "DropTrapCapture", Pieces = pieces });
+
+        // Simulate "already fallen through" (TrapdoorNode._PhysicsProcess's own
+        // open step) so the capture shows the OPEN trap, not its closed hatch.
+        var hatch = dungeon.GetNodeOrNull<StaticBody3D>("TrapdoorHatch_5_5_0");
+        if (hatch != null)
+        {
+            hatch.Visible = false;
+            foreach (var child in hatch.GetChildren())
+                if (child is CollisionShape3D cs) cs.Disabled = true;
+        }
+        else GD.PushWarning("TestTask: TrapdoorHatch_5_5_0 not found — is the trapdoor armed?");
+
+        _cam = new Camera3D { Fov = 75f, Current = true, Far = 500f };
+        AddChild(_cam);
+        Place(0);
+    }
+
+    static Sky MakeStarrySky()
+    {
+        var mat = new ProceduralSkyMaterial
+        {
+            SkyTopColor    = new Color(0.02f, 0.02f, 0.05f),
+            SkyHorizonColor= new Color(0.05f, 0.05f, 0.08f),
+            GroundBottomColor = new Color(0.02f, 0.02f, 0.03f),
+            GroundHorizonColor= new Color(0.05f, 0.05f, 0.08f),
+        };
+        return new Sky { SkyMaterial = mat };
+    }
+
+    void Place(int i)
+    {
+        var (pos, yaw, pitch, note) = Waypoints[i];
+        _cam.Position = pos;
+        _cam.Rotation = new Vector3(Mathf.DegToRad(pitch), Mathf.DegToRad(yaw), 0f);
+        GD.Print($"[frame {i}] {note}  pos={pos}");
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+        int idx = Mathf.Min(_frame / 6, Waypoints.Length - 1);
+        Place(idx);
+        if (_frame / 6 >= Waypoints.Length) GetTree().Quit();
+    }
+}

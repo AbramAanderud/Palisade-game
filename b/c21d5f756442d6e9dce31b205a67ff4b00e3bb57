@@ -1,0 +1,98 @@
+using System.Collections.Generic;
+using Godot;
+
+/// test/TestRoomStairBleed.cs
+/// Owner report: "when a stair piece is parallel with a large room the
+/// wallpaper bleeds in" — same family as the pit-side fix in commit 65035cb.
+///
+/// ROOT CAUSE (confirmed by this test): a stair's PERPENDICULAR-TO-TRAVEL
+/// envelope walls (the sides that seal the stairwell against whatever cell is
+/// next door — DungeonBuilder.AddStairGeometry's unconditional NSWall/EWWall
+/// calls into wallExt, e.g. ~line 900-901) are built UNCONDITIONALLY, with no
+/// opening/doorway check at all, because a stair's side faces are never
+/// doorways by design. RoomBuilder, however, decides whether to build its OWN
+/// solid wall on a perimeter face purely from HasCorridorThrough (RoomBuilder.
+/// cs ~line 235) — "does the neighbour have a matching opening pointing back
+/// at me?" — which is false for a stair's side (stairs only open N|S or E|W
+/// along their travel direction, never across it), so the room ALSO builds a
+/// full-height solid wall (AddPerimeterWall's `!doorway` branch, ~line 214-215,
+/// y=0 to yBase+FloorHeight) at the EXACT SAME boundary plane the stair's
+/// wallExt already sealed. Two independently-generated wall quads, same plane,
+/// different materials (room wallpaper vs. plain stair stone) — a textbook
+/// z-fight, which is what reads as "wallpaper bleeding into the stairwell".
+///
+/// This is the room-side twin of the pit bug fixed in 65035cb: pits stopped
+/// z-fighting because their divider got real 0.4 m thickness (a physical
+/// offset off the stair's coincident plane). Rooms have no such per-face
+/// thickness concept (AddPerimeterWall emits a single zero-thickness quad
+/// directly on the cell boundary, like the old flat wall treatment
+/// everywhere else in this codebase) — so the fix here instead skips the
+/// room's own duplicate wall when the stair already, unconditionally, owns
+/// that boundary, mirroring how a corridor already skips its OWN wall when a
+/// neighbour has a matching opening.
+public partial class TestRoomStairBleed : Node
+{
+    int _fail;
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    const float CS = DungeonBuilder.CellSize;
+
+    static MeshInstance3D? FindMesh(Node root, string bodyName, string meshName)
+        => root.GetNodeOrNull<MeshInstance3D>($"{bodyName}/{meshName}");
+
+    /// Mirrors TestRoomPitConnectivity.HasFaceAtConstantZ, for the X axis —
+    /// needed here because the room/stair shared boundary in this repro is a
+    /// NSWall-style face (constant X), not the EWWall-style (constant Z) faces
+    /// that suite's existing helper covers.
+    static bool HasFaceAtConstantX(Mesh? mesh, float x, float eps = 0.05f)
+    {
+        if (mesh == null) return false;
+        var f = mesh.GetFaces();
+        for (int i = 0; i + 2 < f.Length; i += 3)
+            if (Mathf.Abs(f[i].X - x) < eps && Mathf.Abs(f[i + 1].X - x) < eps &&
+                Mathf.Abs(f[i + 2].X - x) < eps)
+                return true;
+        return false;
+    }
+
+    public override void _Ready()
+    {
+        GD.Print("── Geometry: room wall parallel to a stair's side (wallpaper bleed) ──");
+
+        // Room at (4,5); StairsUp at (5,5) rot 0 -> upDir = Dir.N (opens N|S only,
+        // travels along Z). The room's east face (x=50) is exactly the stair's
+        // west envelope wall (NSWall(wallExt, x0=50, ...) in AddStairGeometry's
+        // Dir.N case) — parallel-to-travel, never a doorway, the reported case.
+        var pieces = new List<MazePiece>
+        {
+            new() { Type = PieceType.Room,     X = 4, Y = 5, Floor = 0 },
+            new() { Type = PieceType.StairsUp, X = 5, Y = 5, Floor = 0, Rotation = 0 },
+        };
+        var dungeon = new DungeonBuilder();
+        AddChild(dungeon);
+        dungeon.Build(new MazeData { Name = "RoomStairBleed", Pieces = pieces });
+
+        var wallRoom = FindMesh(dungeon, "Cell_4_5_0", "WallRoom_4_5");
+        var wallExt  = FindMesh(dungeon, "Cell_5_5_0", "WallExt_5_5");
+        Check(wallRoom != null, "room cell (4,5) built a WallRoom mesh");
+        Check(wallExt  != null, "stair cell (5,5) built a WallExt mesh");
+
+        float boundaryX = 5f * CS;   // x=50 — shared plane between the two cells
+
+        bool stairSealsBoundary = HasFaceAtConstantX(wallExt?.Mesh, boundaryX);
+        Check(stairSealsBoundary,
+              "sanity: the stair's own envelope wall (WallExt) covers the shared boundary (x=50)");
+
+        bool roomAlsoWallsBoundary = HasFaceAtConstantX(wallRoom?.Mesh, boundaryX);
+        Check(!roomAlsoWallsBoundary,
+              "FIX: the room's own wall (WallRoom) does NOT also build a coincident " +
+              "face at x=50 — no more double wall / z-fight against the stair's seal");
+
+        GD.Print(_fail == 0 ? "RESULT OK" : $"RESULT {_fail} FAILURE(S)");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

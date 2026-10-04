@@ -1,0 +1,156 @@
+using Godot;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+/// test/TestArenaPerf.cs
+/// Arena-only perf harness for the vertical tier stack (ArenaBuilder.Tiers).
+///
+/// Builds JUST the arena — no maze, no player, no corridor — so the numbers
+/// attribute cleanly to the stack rather than to whatever else a game scene
+/// happens to be carrying. Flies a fixed camera path, samples wall-clock frame
+/// time plus the renderer counters, prints a `[PERF]`-prefixed report, quits.
+///
+/// A/B protocol: run once at ArenaBuilder.Tiers = 1 (which reproduces the
+/// pre-stacking arena exactly) and once at Tiers = 3, and diff the reports.
+///
+/// Two things this harness must get right or the whole measurement is a lie:
+///
+///  1. VSYNC OFF + uncapped FPS. With vsync on, both runs sit at the monitor
+///     refresh and report "60fps, no problem" no matter how much headroom was
+///     actually eaten. Frame TIME with the brakes off is the only number that
+///     shows the delta.
+///  2. WARMUP. The first frames pay shader/pipeline compilation for every
+///     material in the arena, which on gl_compatibility is a multi-hundred-ms
+///     stall that would swamp the steady-state average. Samples start only
+///     after WarmupFrames, and the report states the pipeline-compilation
+///     count so a warmup that was too short is visible rather than silent.
+///
+/// The camera path is driven by FRAME INDEX, not delta time, so both runs
+/// sample byte-identical viewpoints even though they run at different speeds.
+public partial class TestArenaPerf : Node3D
+{
+    const int WarmupFrames = 180;   // pipeline compilation + first-frame costs
+    const int SampleFrames = 600;   // steady-state measurement window
+
+    const float Radius2 = ArenaBuilder.Radius * 2f;
+
+    Camera3D     _cam = null!;
+    int          _frame;
+    int          _copies;
+    double       _buildMs;
+    readonly List<double> _frameMs = new();
+    ulong        _lastUsec;
+
+    public override void _Ready()
+    {
+        // ── Brakes off (see class doc) ────────────────────────────────────────
+        // Read back and assert: a silently-ignored vsync disable pins BOTH runs
+        // to the monitor refresh and makes the whole A/B read "no difference".
+        DisplayServer.WindowSetVsyncMode(DisplayServer.VSyncMode.Disabled);
+        Engine.MaxFps = 0;
+        var vs = DisplayServer.WindowGetVsyncMode();
+        GD.Print($"[PERF] vsync={vs} maxfps={Engine.MaxFps} " +
+                 (vs == DisplayServer.VSyncMode.Disabled ? "OK" : "!! CAPPED — results invalid"));
+
+        // ── Arena, optionally replicated ──────────────────────────────────────
+        // User args (after `--`):
+        //   empty    build nothing — control run. If an EMPTY scene reports the
+        //            same frame time as a full one, the harness is sitting on a
+        //            refresh-rate cap and every other number is uninformative.
+        //   xN       build N arenas side by side, to find out where frame time
+        //            actually starts moving on this machine.
+        var uargs = OS.GetCmdlineUserArgs();
+        int copies = uargs.Contains("empty") ? 0 : 1;
+        foreach (var a in uargs)
+            if (a.StartsWith("x") && int.TryParse(a[1..], out var n)) copies = n;
+
+        var t0 = Time.GetTicksUsec();
+        for (int c = 0; c < copies; c++)
+        {
+            var arena = new ArenaBuilder { Name = $"Arena{c}" };
+            AddChild(arena);
+            // Spread copies far enough apart that they do not interpenetrate
+            // (2×Radius plus slack); all of them stay in frustum from the
+            // centre camera, which is the point.
+            arena.Build(new Vector3(c * (Radius2 + 10f), 0f, 0f), openNorth: true, openSouth: true);
+        }
+        _buildMs = (Time.GetTicksUsec() - t0) / 1000.0;
+        _copies = copies;
+
+        // Far plane must clear the top of a stacked arena plus its dome, or the
+        // upper tiers get frustum-clipped and the measurement flatters itself.
+        _cam = new Camera3D { Name = "Cam", Fov = 90f, Near = 0.05f, Far = 1200f };
+        AddChild(_cam);
+        _cam.MakeCurrent();
+        Aim(0);
+
+        GD.Print($"[PERF] tiers={ArenaBuilder.Tiers} wallH={ArenaBuilder.ArenaWallH}m " +
+                 $"build={_buildMs:F1}ms");
+        _lastUsec = Time.GetTicksUsec();
+    }
+
+    // Player-eye orbit at the arena floor: yaw sweeps a full turn across the
+    // window while pitch oscillates from level to near-vertical. The pitch-up
+    // phase is the worst case for a stack — it puts every tier in frustum at
+    // once — and the level phase is the ordinary gameplay view. Deliberately
+    // the SAME path at every Tiers value: the question is what the player pays
+    // standing on the arena floor, not what a flythrough of the shaft costs.
+    void Aim(int i)
+    {
+        float u     = (float)i / SampleFrames;
+        float yaw   = u * 360f;
+        float pitch = -37.5f + 37.5f * Mathf.Cos(u * Mathf.Tau * 2f);   // 0 .. -75 .. 0, twice
+        _cam.Position        = new Vector3(0f, 2f, 0f);
+        _cam.RotationDegrees = new Vector3(pitch, yaw, 0f);
+    }
+
+    public override void _Process(double delta)
+    {
+        ulong now = Time.GetTicksUsec();
+        double ms = (now - _lastUsec) / 1000.0;
+        _lastUsec = now;
+
+        _frame++;
+        if (_frame > WarmupFrames)
+        {
+            Aim(_frame - WarmupFrames);
+            _frameMs.Add(ms);
+        }
+
+        if (_frame >= WarmupFrames + SampleFrames) { Report(); GetTree().Quit(); }
+    }
+
+    static double Mon(Performance.Monitor m) => Performance.GetMonitor(m);
+
+    void Report()
+    {
+        var s = _frameMs.OrderBy(x => x).ToArray();
+        double avg = s.Average();
+        double p50 = s[s.Length / 2];
+        double p95 = s[(int)(s.Length * 0.95)];
+        double max = s[^1];
+
+        // Counters are instantaneous (last frame), not averaged — the camera is
+        // mid-orbit here, so treat them as a representative sample, not a peak.
+        void P(string line) => GD.Print("[PERF] " + line);
+        P("──────────────────────────────────────────────");
+        P($"tiers            {ArenaBuilder.Tiers}");
+        P($"arena copies     {_copies}");
+        P($"wall height      {ArenaBuilder.ArenaWallH} m");
+        P($"arena build      {_buildMs:F1} ms total ({(_copies > 0 ? _buildMs / _copies : 0):F1} ms each)");
+        P($"frames sampled   {s.Length} (after {WarmupFrames} warmup)");
+        P($"frame avg        {avg:F2} ms  ({1000.0 / avg:F0} fps)");
+        P($"frame p50        {p50:F2} ms");
+        P($"frame p95        {p95:F2} ms");
+        P($"frame max        {max:F2} ms");
+        P($"draw calls       {Mon(Performance.Monitor.RenderTotalDrawCallsInFrame):F0}");
+        P($"objects drawn    {Mon(Performance.Monitor.RenderTotalObjectsInFrame):F0}");
+        P($"primitives       {Mon(Performance.Monitor.RenderTotalPrimitivesInFrame):F0}");
+        P($"node count       {Mon(Performance.Monitor.ObjectNodeCount):F0}");
+        P($"video mem        {Mon(Performance.Monitor.RenderVideoMemUsed) / 1048576.0:F1} MB");
+        P($"pipeline compil. {Mon(Performance.Monitor.PipelineCompilationsSpecialization):F0} " +
+          "(nonzero at report time = warmup too short)");
+        P("──────────────────────────────────────────────");
+    }
+}

@@ -1,0 +1,65 @@
+using Godot;
+
+/// Test: interactive grass — wind sway + an orbiting interactor carving a
+/// visible bend trail across the arena grass. Camera low over the field.
+public partial class TestGrass : Node3D
+{
+    GrassInteractor _orbiter = null!;
+    float _t;
+
+    public override void _Ready()
+    {
+        var worldEnv = new WorldEnvironment();
+        var env = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0, 0, 0),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.25f, 0.28f, 0.38f),
+            AmbientLightEnergy = 0.8f,
+            TonemapMode        = Godot.Environment.ToneMapper.Filmic,
+            TonemapExposure    = 1.2f,
+        };
+        worldEnv.Environment = env;
+        AddChild(worldEnv);
+
+        var arena = new ArenaBuilder { Name = "Arena" };
+        AddChild(arena);
+        arena.Build(Vector3.Zero, openNorth: true, openSouth: true);
+
+        // visible marker sphere with the interactor attached
+        var marker = new MeshInstance3D
+        {
+            Name = "Orbiter",
+            Mesh = new SphereMesh { Radius = 0.6f, Height = 1.2f },
+            Position = new Vector3(8, 0.6f, 0),
+        };
+        marker.MaterialOverride = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(1f, 0.2f, 0.2f),
+            EmissionEnabled = true,
+            Emission = new Color(1f, 0.2f, 0.2f),
+            EmissionEnergyMultiplier = 2f,
+        };
+        _orbiter = new GrassInteractor { Radius = 2.2f, Strength = 1f };
+        marker.AddChild(_orbiter);
+        AddChild(marker);
+
+        var cam = new Camera3D { Name = "Cam", Fov = 75f, Near = 0.05f, Far = 400f };
+        cam.Position = new Vector3(0, 3.2f, 16f);
+        cam.RotationDegrees = new Vector3(-14f, 0, 0);
+        AddChild(cam);
+        cam.MakeCurrent();
+
+        GD.Print("[TestGrass] Ready");
+    }
+
+    public override void _Process(double delta)
+    {
+        // spiral the marker through the grass so the trail is obvious
+        _t += (float)delta;
+        float r = 8f - _t * 0.35f;
+        var p = new Vector3(Mathf.Cos(_t * 0.9f) * r, 0.6f, Mathf.Sin(_t * 0.9f) * r + 4f);
+        ((Node3D)_orbiter.GetParent()).Position = p;
+    }
+}

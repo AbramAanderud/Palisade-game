@@ -1,0 +1,176 @@
+using Godot;
+using System.Collections.Generic;
+using System.Reflection;
+
+/// test/TestEditorCapture.cs — visual capture harness for the maze-editor UX
+/// pass (see JOURNAL.md for the task write-up). Not a --headless run: intended
+/// for `--write-movie` so a human (and this session) can SEE:
+///   I5: a room edge that's OPEN (bright cyan marker, no wall) vs WALLED
+///       (solid wall) — should be readable at a glance from one frame.
+///   I6: the always-on "green = start · red = exit" legend line.
+///   I7: orbit yaw is preserved (no north-lock snap) crossing the 1.50 pitch
+///       threshold at a deliberately non-north yaw.
+///   I1: the camera's floor-switch glide — traced quantitatively via _camViewY
+///       printed every frame around the FloorUp() call (smoother/stronger
+///       evidence than eyeballing pixels for an 8-unit vertical ease).
+///   Pit doorway markers (follow-up task): the pit's purple preview box shows
+///   the same bright-marker/no-wall contrast as I5, at PitBuilder.HasEntry's
+///   (perimeter cell, floor, face) granularity — a block connection, a genuine
+///   dead face, and a stair-crossing connection, all on ONE pit.
+/// Private fields/methods on MazeEditor3D are touched via reflection rather
+/// than widening access just for a capture harness.
+public partial class TestEditorCapture : Node
+{
+    MazeEditor3D _ed = null!;
+    int _frame;
+    bool _tweenTraceDone;
+
+    public override void _Ready()
+    {
+        var packed = GD.Load<PackedScene>("res://scenes/MazeEditor3D.tscn");
+        _ed = packed.Instantiate<MazeEditor3D>();
+        AddChild(_ed);
+    }
+
+    void SetF(string name, object value)
+    {
+        var fi = typeof(MazeEditor3D).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);
+        fi!.SetValue(_ed, value);
+    }
+    object GetF(string name)
+    {
+        var fi = typeof(MazeEditor3D).GetField(name, BindingFlags.NonPublic | BindingFlags.Instance);
+        return fi!.GetValue(_ed)!;
+    }
+    void CallM(string name, params object[] args)
+    {
+        var mi = typeof(MazeEditor3D).GetMethod(name, BindingFlags.NonPublic | BindingFlags.Instance);
+        mi!.Invoke(_ed, args);
+    }
+
+    const float CS = 10f; // DungeonBuilder.CellSize
+
+    void BuildDemoMaze()
+    {
+        // Room 2x2 at (3,4)-(4,5): N edge opens onto a corridor (Straight at (4,3)
+        // and (3,3)… only ONE cell needs to connect to make the point, so just (4,3)
+        // opens onto (4,4)'s N face). S/E/W edges of the room have no neighbours at
+        // all, so they read WALLED — the open vs walled contrast lands in one frame.
+        var pieces = new List<MazePiece>
+        {
+            new MazePiece { Type = PieceType.Start, X = 4, Y = 0, Floor = 0 },
+            new MazePiece { Type = PieceType.Straight, X = 4, Y = 1, Floor = 0 },
+            new MazePiece { Type = PieceType.Straight, X = 4, Y = 2, Floor = 0 },
+            new MazePiece { Type = PieceType.Straight, X = 4, Y = 3, Floor = 0 },
+            new MazePiece { Type = PieceType.Room, X = 3, Y = 4, Floor = 0, RoomGroup = 1 },
+            new MazePiece { Type = PieceType.Room, X = 4, Y = 4, Floor = 0, RoomGroup = 1 },
+            new MazePiece { Type = PieceType.Room, X = 3, Y = 5, Floor = 0, RoomGroup = 1 },
+            new MazePiece { Type = PieceType.Room, X = 4, Y = 5, Floor = 0, RoomGroup = 1 },
+        };
+        _ed._maze = new MazeData { Name = "CaptureDemo", Pieces = pieces };
+        CallM("RebuildGeometry");
+        CallM("RebuildBorderHints");
+        CallM("RefreshGridOpacity");
+    }
+
+    void FrameCamera()
+    {
+        // Room centre ≈ world (35, 45); GridCentre ≈ (50, 0, 50) for a 10x10 grid.
+        SetF("_camPan", new Vector3(35f - 50f, 0f, 45f - 50f));
+        SetF("_camYaw", -0.55f);
+        SetF("_camPitch", 0.55f);
+        SetF("_camDist", 55f);
+        SetF("_floor", 0);
+    }
+
+    // ── Pit doorway markers (follow-up task) ────────────────────────────────
+    // Same three cases test/TestPitDoorway.cs pins at the method level, built
+    // here so a human can SEE them: a Pit at (5,5,0) with —
+    //   A) a block (Straight corridor) connected on its N face, floor 0
+    //   B) its S face left with no neighbour at all — must read as an
+    //      unbroken purple wall
+    //   C) a StairsUp one floor below/east, whose cross (high) end lands on
+    //      the pit's E face at floor 1 — PitBuilder.HasEntry's stair branch
+    void BuildPitDemoMaze()
+    {
+        var pieces = new List<MazePiece>
+        {
+            new MazePiece { Type = PieceType.Pit, X = 5, Y = 5, Floor = 0 },
+            new MazePiece { Type = PieceType.Straight, X = 5, Y = 3, Floor = 0, Rotation = 0 },
+            new MazePiece { Type = PieceType.StairsUp, X = 7, Y = 5, Floor = 0, Rotation = 3 },
+        };
+        _ed._maze = new MazeData { Name = "PitDoorwayDemo", Pieces = pieces };
+        CallM("RebuildGeometry");
+        CallM("RebuildBorderHints");
+        CallM("RefreshGridOpacity");
+    }
+
+    // Pit footprint centre ≈ world (55, 55) for the (5,5) anchor; GridCentre ≈ (50, 0, 50).
+    void FramePitCamera(float yaw, float dist)
+    {
+        SetF("_camPan", new Vector3(55f - 50f, 0f, 55f - 50f));
+        SetF("_camYaw", yaw);
+        SetF("_camPitch", 0.55f);
+        SetF("_camDist", dist);
+        SetF("_floor", 0);
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+
+        if (_frame == 20) { BuildDemoMaze(); FrameCamera(); }
+
+        // ~2s hold (fixed-fps 20 → frame 20-60) for the I5/I6 room-edge + legend shot.
+
+        if (_frame == 65)
+        {
+            GD.Print("── I1: floor-switch camera glide trace (_camViewY per frame) ──");
+            CallM("FloorUp");   // starts the 0.3s tween toward floor 1's height
+        }
+        if (_frame >= 65 && _frame <= 80 && !_tweenTraceDone)
+        {
+            GD.Print($"frame {_frame}: _camViewY = {GetF("_camViewY")}");
+            if (_frame == 80) _tweenTraceDone = true;
+        }
+
+        // Non-north yaw so a north-locked up-vector would visibly snap the view.
+        if (_frame == 90)
+        {
+            SetF("_camYaw", 0.9f);
+            SetF("_camPitch", 1.40f);
+        }
+        // hold frames 90-105 → capture ~100 for "pitch 1.40, non-north yaw"
+
+        if (_frame == 110)
+        {
+            SetF("_camPitch", 1.54f);
+        }
+        // hold frames 110-125 → capture ~120 for "pitch 1.54, SAME yaw" — compare
+        // against the frame-100 shot: the maze's on-screen orientation must not jump.
+
+        // ── Pit doorway markers ──────────────────────────────────────────────
+        if (_frame == 140)
+        {
+            GD.Print("── pit doorway markers: block (N), no-connection (S), stair (E) ──");
+            // Reset floor BEFORE building — the I1 stage above left _floor at 1
+            // (via a real FloorUp()), and RebuildGeometry bakes each piece's
+            // active/ghosted look in at build time, not per-frame. OnFloorChanged
+            // also refreshes the "Floor N" label/grid, which a raw field poke skips.
+            SetF("_floor", 0);
+            CallM("OnFloorChanged");
+            BuildPitDemoMaze();
+            FramePitCamera(yaw: -0.55f, dist: 90f);   // wide angle, matches the room shot's yaw
+        }
+        // hold 140-165 → capture ~155: wide view, all three faces in one frame.
+
+        if (_frame == 170) FramePitCamera(yaw: 0.9f, dist: 75f);
+        // hold 170-195 → capture ~185: rotated view, closer on the N-face block doorway.
+
+        if (_frame == 200) FramePitCamera(yaw: 2.4f, dist: 75f);
+        // hold 200-225 → capture ~215: rotated view, closer on the E-face stair doorway
+        // and the S-face unbroken wall.
+
+        if (_frame >= 230) GetTree().Quit(0);
+    }
+}

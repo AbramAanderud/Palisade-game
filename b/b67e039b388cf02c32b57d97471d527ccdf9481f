@@ -1,0 +1,88 @@
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// test/TestMazeRotation.cs — MazeRotation turns maze DATA clockwise.
+/// Proves: 4 turns = identity; every same-floor connection and every stair's
+/// cross/flat direction survives a turn; Exit (c,9) lands on the expected edge.
+public partial class TestMazeRotation : Node
+{
+    int _fail;
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    static string Key(MazePiece p) => $"{p.Type}@{p.X},{p.Y},{p.Floor}r{((p.Rotation % 4) + 4) % 4}L{p.LinkId}G{p.RoomGroup}";
+
+    // Same-floor adjacency: both cells single-cell pieces with facing openings.
+    static HashSet<string> Links(MazeData m)
+    {
+        var at = m.Pieces.Where(p => !PieceDB.IsMultiCell(p.Type))
+                         .GroupBy(p => (p.X, p.Y, p.Floor))
+                         .ToDictionary(g => g.Key, g => g.First());
+        var links = new HashSet<string>();
+        foreach (var p in at.Values)
+            foreach (var d in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+            {
+                var (dx, dy) = PieceDB.Delta(d);
+                if (!at.TryGetValue((p.X + dx, p.Y + dy, p.Floor), out var q)) continue;
+                if (PieceDB.HasSameFloorOpening(p.Type, p.Rotation, d) &&
+                    PieceDB.HasSameFloorOpening(q.Type, q.Rotation, PieceDB.Opposite(d)))
+                    links.Add($"{p.X},{p.Y},{p.Floor}>{d}");
+            }
+        return links;
+    }
+
+    public override void _Ready()
+    {
+        var src = DefaultMaze.Build();
+        src.Pieces.Add(new MazePiece { Type = PieceType.StairsDown, X = 0, Y = 0, Floor = 2, Rotation = 1 });
+        src.Pieces.Add(new MazePiece { Type = PieceType.LHall, X = 9, Y = 0, Floor = 2, Rotation = 3, RoomGroup = 7 });
+
+        // 4 turns = identity
+        var r4 = MazeRotation.Rotate(MazeRotation.Rotate(MazeRotation.Rotate(MazeRotation.Rotate(src, 1), 1), 1), 1);
+        Check(src.Pieces.Select(Key).OrderBy(s => s).SequenceEqual(r4.Pieces.Select(Key).OrderBy(s => s)),
+              "four quarter turns reproduce the original pieces exactly");
+        Check(MazeRotation.Rotate(src, 4).Pieces.Select(Key).SequenceEqual(src.Pieces.Select(Key)),
+              "Rotate(src,4) is identity");
+        Check(!ReferenceEquals(MazeRotation.Rotate(src, 0), src), "Rotate returns a new instance");
+
+        for (int k = 1; k <= 3; k++)
+        {
+            var rot = MazeRotation.Rotate(src, k);
+            // Every source link maps to a link in the rotated maze
+            var expected = new HashSet<string>();
+            foreach (var l in Links(src))
+            {
+                var parts = l.Split('>'); var xyz = parts[0].Split(',');
+                var (x, y) = MazeRotation.RotateCell(int.Parse(xyz[0]), int.Parse(xyz[1]), k);
+                var d = MazeRotation.RotateDir(System.Enum.Parse<Dir>(parts[1]), k);
+                expected.Add($"{x},{y},{xyz[2]}>{d}");
+            }
+            Check(expected.SetEquals(Links(rot)), $"k={k}: same-floor connections preserved ({expected.Count})");
+
+            // Stairs: cross dir rotates with the grid
+            bool stairsOk = true;
+            for (int i = 0; i < src.Pieces.Count; i++)
+            {
+                var a = src.Pieces[i]; var b = rot.Pieces[i];
+                if (!PieceDB.IsStair(a.Type)) continue;
+                stairsOk &= PieceDB.GetStairCrossDir(b.Type, b.Rotation) ==
+                            MazeRotation.RotateDir(PieceDB.GetStairCrossDir(a.Type, a.Rotation), k);
+            }
+            Check(stairsOk, $"k={k}: every stair's cross-floor face rotates with the grid");
+        }
+
+        // Exit column c on row 9 lands on the expected edge
+        Check(MazeRotation.RotateCell(3, 9, 1) == (0, 3), "k=1: Exit (3,9) → west edge (0,3)");
+        Check(MazeRotation.RotateCell(3, 9, 2) == (6, 0), "k=2: Exit (3,9) → north edge (6,0)");
+        Check(MazeRotation.RotateCell(3, 9, 3) == (9, 6), "k=3: Exit (3,9) → east edge (9,6)");
+        Check(MazeRotation.RotateDir(Dir.S, 1) == Dir.W && MazeRotation.RotateDir(Dir.S, 2) == Dir.N &&
+              MazeRotation.RotateDir(Dir.S, 3) == Dir.E, "arena-side Dir.S rotates S→W→N→E");
+
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

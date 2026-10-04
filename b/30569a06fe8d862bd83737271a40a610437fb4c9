@@ -1,0 +1,106 @@
+using System.Text.Json;
+using Godot;
+
+/// res://scripts/RemotePeer.cs — one remote player in the online FFA arena:
+/// its seat, display name and puppet body. OnlineFfaArena routes each incoming
+/// cosmetic/movement message to the RemotePeer whose Seat matches the relay's
+/// `from` stamp. Every Apply* body is the 1v1 OnlineDungeonArena.OnGameData case
+/// of the same name, applied to this peer's puppet instead of the single _puppet.
+public sealed class RemotePeer
+{
+    public int              Seat   { get; }
+    public string           Name   { get; }
+    public PlayerController Puppet { get; }
+
+    public RemotePeer(int seat, string name, PlayerController puppet)
+    {
+        Seat   = seat;
+        Name   = name;
+        Puppet = puppet;
+    }
+
+    bool Alive => GodotObject.IsInstanceValid(Puppet);
+
+    /// Mirrors OnlineDungeonArena.OnGameData `case "pos"` (exact body).
+    public void ApplyPos(JsonElement root)
+    {
+        if (!Alive) return;
+        Vector3 ppos = new(
+            root.GetProperty("x").GetSingle(),
+            root.GetProperty("y").GetSingle(),
+            root.GetProperty("z").GetSingle());
+        Vector3 pvel = Vector3.Zero;
+        if (root.TryGetProperty("vx", out var vx))
+            pvel = new Vector3(
+                vx.GetSingle(),
+                root.GetProperty("vy").GetSingle(),
+                root.GetProperty("vz").GetSingle());
+        Puppet.SetPuppetTarget(
+            ppos, pvel,
+            root.GetProperty("yaw").GetSingle(),
+            root.GetProperty("pitch").GetSingle());
+        if (root.TryGetProperty("stam", out var sp))
+            Puppet.PuppetStamina = sp.GetSingle();
+        if (root.TryGetProperty("ex", out var exProp))
+            Puppet.PuppetExhausted = exProp.GetInt32() == 1;
+        if (root.TryGetProperty("spr", out var sprProp))
+            Puppet.SetPuppetSprinting(sprProp.GetInt32() == 1);
+        if (root.TryGetProperty("aim", out var aimProp))
+            Puppet.SetPuppetAiming(aimProp.GetInt32() == 1);
+        // Mirror the peer's locomotion / combat anim so they aren't T-posed.
+        if (root.TryGetProperty("as", out var asProp))
+        {
+            float horizSpeed = new Vector2(pvel.X, pvel.Z).Length();
+            Puppet.ApplyPuppetAnimState(asProp.GetInt32(), horizSpeed);
+        }
+        // FFA: the sender's own HP is the display truth (heals included). Only
+        // a live display copy (CannotDie) takes it, floored at 1 so it still
+        // can't die from a pos; a corpse (CannotDie cleared on "die") keeps 0.
+        if (root.TryGetProperty("hp", out var hpProp) && hpProp.ValueKind == JsonValueKind.Number &&
+            Puppet.GetNodeOrNull<PlayerHealth>("PlayerHealth") is { CannotDie: true } health)
+            health.SetHealth(Mathf.Max(hpProp.GetSingle(), 1f));
+    }
+
+    /// Mirrors OnlineDungeonArena.OnGameData `case "shot"`. Cosmetic only; the
+    /// endpoint replays the exact tracer/rocket they fired.
+    public void ApplyShot(JsonElement root)
+    {
+        if (!Alive) return;
+        if (root.TryGetProperty("x", out var sx) &&
+            root.TryGetProperty("y", out var sy) &&
+            root.TryGetProperty("z", out var sz))
+            Puppet.TriggerPuppetShot(new Vector3(sx.GetSingle(), sy.GetSingle(), sz.GetSingle()));
+        else
+            Puppet.TriggerPuppetShot();
+    }
+
+    /// Mirrors OnlineDungeonArena.OnGameData `case "reload"`.
+    public void ApplyReload()
+    {
+        if (Alive) Puppet.TriggerPuppetReload();
+    }
+
+    /// Mirrors OnlineDungeonArena.OnGameData `case "dryfire"`.
+    public void ApplyDryFire()
+    {
+        if (Alive) Puppet.TriggerPuppetDryFire();
+    }
+
+    /// Mirrors OnlineDungeonArena.OnGameData `case "gunsel"`. Plain EquipGun on
+    /// purpose: stats/wallhack belong to the owner's client, not the mirror.
+    public void ApplyGunSel(JsonElement root)
+    {
+        if (Alive && root.TryGetProperty("id", out var gunSel) && gunSel.GetString() is string id)
+            Puppet.EquipGun(id);
+    }
+
+    /// Takes the body out of the match. `died` = play the death animation and
+    /// leave the body where it fell (the 1v1 `case "die"` look); otherwise the
+    /// peer left the match and the puppet is freed outright.
+    public void Remove(bool died = false)
+    {
+        if (!Alive) return;
+        if (died) Puppet.PlayPuppetDeath();
+        else      Puppet.QueueFree();
+    }
+}

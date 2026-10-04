@@ -1,0 +1,675 @@
+using Godot;
+using System;
+using System.Collections.Generic;
+
+/// res://scripts/GunCombat.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// PALISADE GUNPLAY — replaces SwordCombat on the player. Training bots keep
+/// their swords, so SwordCombat stays live for them.
+///
+/// Every player spawns with a random gun from the STARTER pool and races for a
+/// random gun from the ARENA pool in the middle. Both rolls are shared between
+/// the two players (the host picks and broadcasts), so a match varies but is
+/// never lopsided.
+///
+/// One verb: FIRE. Accuracy is the skill expression — spread grows with your
+/// horizontal speed and while airborne, so moving fast makes you hard to hit but
+/// unable to shoot straight, while standing still makes you accurate and a
+/// target. The crosshair opens and closes with live spread, so the tradeoff
+/// teaches itself.
+///
+/// ADS is scope-only: the AWP is the single gun in the pack with a scope, so it
+/// is the only one that can aim down sights (tighter cone, capped move speed).
+/// Every other gun ignores the aim input.
+///
+/// Damage is client-authoritative, matching the existing net contract: we resolve
+/// hits locally, damage the opponent's puppet, and PlayerHealth.DamageDealt
+/// relays {"t":"hit","dmg":X}. No new damage netcode.
+///
+/// Models are the Styloo pack (free, itch.io). They ship with NO animation clips,
+/// but every gun is modelled in separate parts — slide/bolt, magazine, trigger,
+/// and the shotgun's pump — which PlayerController.AnimateFpGun drives
+/// procedurally. That stays locked to whatever fire rate and reload duration are
+/// tuned here, which baked clips could not.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class GunCombat : Node
+{
+    public enum FireMode { Hitscan, Pellets, Projectile }
+    public enum Phase    { Idle, Firing, Reloading, Empty }
+
+    // ── Gun definitions ───────────────────────────────────────────────────────
+    public sealed class GunDef
+    {
+        public string   Id            = "";
+        public string   Display       = "";
+        public string   Model         = "";
+        public FireMode Mode          = FireMode.Hitscan;
+
+        public float Damage        = 18f;   // per bullet, or per pellet
+        public int   Pellets       = 1;
+        public float FireInterval  = 0.18f;
+        public int   MagSize       = 12;
+        public float ReloadDur     = 1.4f;
+        public float Range         = 120f;
+
+        public float SpreadBase     = 0.6f;
+        public float SpreadPerSpeed = 0.42f;
+        public float SpreadAir      = 3.0f;
+        public float SpreadMax      = 9.0f;
+        public float AdsSpreadMult  = 0.15f;
+        public float RecoilKick     = 1.0f;
+
+        /// Only the AWP has a scope, so only the AWP can aim down sights. Every
+        /// other gun ignores the aim input entirely — no zoom, no speed cap, no
+        /// spread bonus.
+        public bool CanAds = false;
+
+        // Projectile-only
+        public float SplashRadius  = 0f;
+        public float SplashDamage  = 0f;
+        public float ProjSpeed     = 40f;
+        public float SelfKnockback = 0f;   // rocket-jump impulse on the shooter
+
+        public string FireSfx = "res://assets/audio/sfx/combat/GunShotLight.wav";
+
+        // Node names inside the GLB, for procedural part animation. Empty = absent.
+        public string PartSlide   = "";   // slide / bolt — cycles on every shot
+        public string PartMag     = "";   // magazine — drops and reseats on reload
+        public string PartTrigger = "";   // trigger — pulls on every shot
+        public string PartPump    = "";   // shotgun pump — cycles between shots
+
+        /// Viewmodel scale + offset, tuned per model so each sits right in hand.
+        public float   FpScale = 1.0f;
+        public Vector3 FpPos   = new(0.22f, -0.20f, -0.45f);
+        public Vector3 FpRot   = Vector3.Zero;
+    }
+
+    const string Dir =
+        "res://assets/guns/Styloo Guns Asset Pack GLTF FBX V1.1/Normal version Color and NormalMap/GLB/";
+
+    public static readonly Dictionary<string, GunDef> Defs = new()
+    {
+        // ── STARTER POOL ───────────────────────────────────────────────────────
+        ["mac10"] = new GunDef
+        {
+            Id = "mac10", Display = "MAC-10", Model = Dir + "mac10.glb",
+            Damage = 18f, FireInterval = 0.15f, MagSize = 24, ReloadDur = 1.6f,
+            SpreadBase = 1.4f, SpreadPerSpeed = 0.50f, SpreadAir = 3.5f,
+            RecoilKick = 0.7f,
+            FireSfx = "res://assets/audio/sfx/combat/GunShotLight.wav",
+            PartSlide = "mac10derriere_low", PartMag = "mac10magazine_low",
+            PartTrigger = "mac10trigger_low",
+        },
+        ["pew"] = new GunDef
+        {
+            Id = "pew", Display = "Sidearm", Model = Dir + "pew.glb",
+            Damage = 22f, FireInterval = 0.22f, MagSize = 12, ReloadDur = 1.4f,
+            SpreadBase = 0.5f, SpreadPerSpeed = 0.40f, SpreadAir = 3.0f,
+            RecoilKick = 1.0f,
+            FireSfx = "res://assets/audio/sfx/combat/GunShotLight.wav",
+            PartSlide = "pewhaut", PartMag = "pewmagazine", PartTrigger = "pewtrigger",
+        },
+        ["shotgun"] = new GunDef
+        {
+            Id = "shotgun", Display = "Shotgun", Model = Dir + "shotgun.glb",
+            Mode = FireMode.Pellets,
+            Damage = 8f, Pellets = 8, FireInterval = 0.80f, MagSize = 5,
+            ReloadDur = 2.4f, Range = 30f,
+            // Wide even at rest — lethal close, harmless past ~12 m.
+            SpreadBase = 4.5f, SpreadPerSpeed = 0.35f, SpreadAir = 2.5f,
+            SpreadMax = 12f, AdsSpreadMult = 0.6f, RecoilKick = 2.6f,
+            FireSfx = "res://assets/audio/sfx/combat/GunShotHeavy.wav",
+            PartPump = "shotgunpomp", PartTrigger = "shotguntrigger",
+        },
+
+        // ── ARENA POOL ─────────────────────────────────────────────────────────
+        ["awp"] = new GunDef
+        {
+            Id = "awp", Display = "AWP", Model = Dir + "awp.glb",
+            Damage = 55f, FireInterval = 1.2f, MagSize = 5, ReloadDur = 2.6f,
+            Range = 200f,
+            // Punishes movement hard: nearly pinpoint standing still, useless running.
+            SpreadBase = 0.05f, SpreadPerSpeed = 1.10f, SpreadAir = 6.0f,
+            SpreadMax = 14f, AdsSpreadMult = 0.05f, RecoilKick = 3.4f,
+            CanAds = true,   // the only gun in the pack with a scope
+            FireSfx = "res://assets/audio/sfx/combat/GunShotHeavy.wav",
+            PartSlide = "snipertendon_low", PartMag = "snipermagazine_low",
+            PartTrigger = "snipertrigger_low",
+        },
+        ["ak47"] = new GunDef
+        {
+            Id = "ak47", Display = "AK-47", Model = Dir + "ak47.glb",
+            Damage = 32f, FireInterval = 0.20f, MagSize = 30, ReloadDur = 2.2f,
+            SpreadBase = 0.7f, SpreadPerSpeed = 0.55f, SpreadAir = 4.0f,
+            RecoilKick = 1.6f,
+            FireSfx = "res://assets/audio/sfx/combat/GunShotHeavy.wav",
+            PartSlide = "akderriere_low", PartMag = "akmagazine_low",
+            PartTrigger = "aktrigger_low",
+        },
+        ["rocketlaucher"] = new GunDef
+        {
+            Id = "rocketlaucher", Display = "Rocket Launcher",
+            Model = Dir + "rocketlaucher.glb",
+            Mode = FireMode.Projectile,
+            Damage = 80f, FireInterval = 0.95f, MagSize = 4, ReloadDur = 2.8f,
+            SplashRadius = 4.5f, SplashDamage = 50f, ProjSpeed = 34f,
+            SelfKnockback = 13f,
+            SpreadBase = 0.2f, SpreadPerSpeed = 0.10f, SpreadAir = 0.5f,
+            RecoilKick = 3.8f,
+            FireSfx = "res://assets/audio/sfx/combat/GunShotHeavy.wav",
+            PartSlide = "rockethaut_low", PartMag = "rocketbullet_low",
+            PartTrigger = "rockettrigger_low",
+        },
+        ["quadrocket"] = new GunDef
+        {
+            Id = "quadrocket", Display = "Quad Rocket",
+            Model = Dir + "quadrocket.glb",
+            Mode = FireMode.Projectile,
+            Damage = 45f, FireInterval = 0.30f, MagSize = 4, ReloadDur = 3.2f,
+            SplashRadius = 3.5f, SplashDamage = 30f, ProjSpeed = 42f,
+            SelfKnockback = 9f,
+            SpreadBase = 0.8f, SpreadPerSpeed = 0.25f, SpreadAir = 1.5f,
+            RecoilKick = 2.4f,
+            FireSfx = "res://assets/audio/sfx/combat/GunShotHeavy.wav",
+            PartSlide = "quadrocketderierre_low", PartMag = "quadrocketdevant_low",
+        },
+    };
+
+    /// Bounding box of a whole model hierarchy, measured in the ROOT's local
+    /// space. Each mesh's AABB is transformed by its chain of parent transforms
+    /// before merging — the guns are multi-part models (slide, magazine, trigger
+    /// are separate nodes with their own offsets), so merging raw mesh-local
+    /// boxes would badly mis-measure them and throw off both scaling and the
+    /// barrel-axis check.
+    public static Aabb MeasureAabb(Node root)
+    {
+        var  result = new Aabb();
+        bool first  = true;
+
+        void Walk(Node n, Transform3D xform)
+        {
+            // The root's own transform is excluded so the result stays local to it.
+            var local = (n is Node3D n3 && n != root) ? xform * n3.Transform : xform;
+
+            if (n is MeshInstance3D mi && mi.Mesh != null)
+            {
+                var a = local * mi.Mesh.GetAabb();
+                if (first) { result = a; first = false; }
+                else       { result = result.Merge(a); }
+            }
+            foreach (Node c in n.GetChildren()) Walk(c, local);
+        }
+
+        Walk(root, Transform3D.Identity);
+        return result;
+    }
+
+    public static readonly string[] StarterPool = { "mac10", "pew", "shotgun" };
+    public static readonly string[] ArenaPool   = { "awp", "ak47", "rocketlaucher", "quadrocket" };
+
+    /// Roll an index into a pool. The caller decides how the roll is shared —
+    /// OnlineDungeonArena has the host roll once and broadcast, so both players
+    /// get the same guns.
+    public static string RollStarter(int idx) => StarterPool[Mathf.PosMod(idx, StarterPool.Length)];
+    public static string RollArena(int idx)   => ArenaPool  [Mathf.PosMod(idx, ArenaPool.Length)];
+
+    // ── Hit-location thresholds (match SwordCombat so behaviour stays consistent)
+    const float HeadMinY = 1.5f;
+    const float LegsMaxY = 0.4f;
+    const float HeadMult = 1.5f;
+    const float LegsMult = 0.5f;
+
+    // ── Live-tunable overrides for the equipped gun ───────────────────────────
+    // Copied from the GunDef on Equip and exposed so they can be edited in the
+    // remote inspector mid-match — retuning TTK never needs a rebuild.
+    [Export] public float Damage       = 18f;
+    [Export] public float FireInterval = 0.18f;
+    [Export] public int   MagSize      = 12;
+    [Export] public float ReloadDur    = 1.4f;
+    [Export] public float RecoilKick   = 1.0f;
+
+    // ── Modifiers (trinkets will drive these later) ───────────────────────────
+    public float DamageMultiplier = 1.0f;
+    public float Lifesteal        = 0.0f;
+    public int   CombatTeam       = 0;    // 0 = player, 1 = enemies
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    GunDef _def   = Defs["pew"];
+    Phase  _phase = Phase.Idle;
+    int    _ammo;
+    float  _fireTimer  = 0f;
+    float  _reloadLeft = 0f;
+    float  _flashLeft  = 0f;
+    bool   _aiming     = false;
+    float  _spreadNow  = 0.6f;
+
+    bool _attackRequested = false;
+    bool _reloadRequested = false;
+
+    public void RequestAttack() => _attackRequested = true;
+    public void RequestReload() => _reloadRequested = true;
+
+    /// Aim input is ignored entirely on guns without a scope, so only the AWP
+    /// ever enters ADS. Everything downstream (spread bonus, speed cap, viewmodel
+    /// pull-in, third-person camera) keys off IsAiming, so this one gate covers
+    /// all of them.
+    public void SetAiming(bool on) => _aiming = on && _def.CanAds;
+
+    /// Whether the equipped gun can aim at all — the HUD hides the ADS hint and
+    /// the controller skips the speed cap when this is false.
+    public bool CanAds => _def.CanAds;
+
+    // ── Read-only surface ─────────────────────────────────────────────────────
+    public GunDef  Def           => _def;
+    public Phase   CombatPhase   => _phase;
+    public int     Ammo          => _ammo;
+    public bool    IsAiming      => _aiming;
+    public bool    IsReloading   => _phase == Phase.Reloading;
+    public bool    IsEmpty       => _ammo <= 0;
+    public float   SpreadDegrees => _spreadNow;
+    public float   AmmoFraction  => MagSize > 0 ? _ammo / (float)MagSize : 0f;
+    public bool    JustFired     => _flashLeft > 0f;
+
+    /// 0 → just started, 1 → complete. Drives the HUD reload ring; 0 when idle.
+    public float ReloadProgress =>
+        _phase == Phase.Reloading && ReloadDur > 0.001f
+            ? Mathf.Clamp(1f - (_reloadLeft / ReloadDur), 0f, 1f)
+            : 0f;
+
+    /// 0 → just fired, 1 → ready again. Drives the slide/pump cycle animation.
+    public float FireCycle =>
+        FireInterval > 0.001f ? Mathf.Clamp(1f - (_fireTimer / FireInterval), 0f, 1f) : 1f;
+
+    // ── Events ────────────────────────────────────────────────────────────────
+    public Action<string>? OnFired;        // gun id
+    public Action?         OnReloadStart;
+    public Action?         OnReloadEnd;
+    public Action?         OnDryFire;
+    public Action<string>? OnEquipped;     // gun id — viewmodel swaps on this
+
+    /// Set by PlayerController so rocket self-knockback can push the shooter.
+    public Action<Vector3>? ApplyImpulse;
+
+    // ── Audio ─────────────────────────────────────────────────────────────────
+    AudioStreamPlayer3D _fireSfx   = null!;
+    AudioStreamPlayer3D _reloadSfx = null!;
+    AudioStreamPlayer3D _drySfx    = null!;
+
+    // The gun WAVs may not exist yet. ResourceLoader.Exists is checked FIRST so a
+    // missing file is a silent no-op instead of a wall of GD.Load error spam —
+    // the guns stay fully playable, just silent, until the audio is dropped in.
+    static AudioStreamPlayer3D MakeSfx3D(Node3D parent, string path, float maxDist)
+    {
+        var sfx = new AudioStreamPlayer3D { MaxDistance = maxDist };
+        if (ResourceLoader.Exists(path))
+        {
+            var stream = GD.Load<AudioStream>(path);
+            if (stream != null) sfx.Stream = stream;
+        }
+        parent.AddChild(sfx);
+        return sfx;
+    }
+
+    public override void _Ready()
+    {
+        var parent = GetParent<Node3D>();
+        _fireSfx   = MakeSfx3D(parent, _def.FireSfx, 110f);
+        _reloadSfx = MakeSfx3D(parent, "res://assets/audio/sfx/combat/GunReload.wav", 25f);
+        _drySfx    = MakeSfx3D(parent, "res://assets/audio/sfx/combat/GunDryFire.wav", 20f);
+        Equip(_def.Id);
+    }
+
+    // ── Equip ─────────────────────────────────────────────────────────────────
+    /// Swap the active weapon and refill it.
+    public void Equip(string id)
+    {
+        if (!Defs.TryGetValue(id, out var def))
+        {
+            GD.PrintErr($"[Gun] Unknown gun id '{id}' — falling back to pew");
+            def = Defs["pew"];
+        }
+        _def = def;
+
+        Damage       = def.Damage;
+        FireInterval = def.FireInterval;
+        MagSize      = def.MagSize;
+        ReloadDur    = def.ReloadDur;
+        RecoilKick   = def.RecoilKick;
+
+        _ammo       = MagSize;
+        _phase      = Phase.Idle;
+        _reloadLeft = 0f;
+        _fireTimer  = 0f;
+
+        // Swap the firing sound to match the new gun (silent if the WAV is absent).
+        if (_fireSfx != null && ResourceLoader.Exists(def.FireSfx))
+        {
+            var stream = GD.Load<AudioStream>(def.FireSfx);
+            if (stream != null) _fireSfx.Stream = stream;
+        }
+
+        GD.Print($"[Gun] Equipped {def.Display} ({def.Mode}, {def.Damage} dmg × {def.Pellets})");
+        OnEquipped?.Invoke(def.Id);
+    }
+
+    // ── Per-frame tick ────────────────────────────────────────────────────────
+    /// aimOrigin/aimDir come from the FP camera; moveSpeed is horizontal m/s.
+    public void Tick(float dt, Vector3 aimOrigin, Vector3 aimDir,
+                     float moveSpeed, bool airborne)
+    {
+        if (_fireTimer > 0f) _fireTimer -= dt;
+        if (_flashLeft > 0f) _flashLeft -= dt;
+
+        _spreadNow = CurrentSpread(moveSpeed, airborne);
+
+        if (_phase == Phase.Reloading)
+        {
+            _reloadLeft -= dt;
+            if (_reloadLeft <= 0f)
+            {
+                _ammo  = MagSize;
+                _phase = Phase.Idle;
+                OnReloadEnd?.Invoke();
+            }
+            _attackRequested = false;
+            _reloadRequested = false;
+            return;
+        }
+
+        if (_reloadRequested)
+        {
+            _reloadRequested = false;
+            if (_ammo < MagSize) StartReload();
+        }
+
+        if (_attackRequested)
+        {
+            _attackRequested = false;
+
+            if (_ammo <= 0)
+            {
+                // Dry click, then auto-reload so nobody is stuck holding an empty
+                // gun because they forgot to press R.
+                if (_fireTimer <= 0f)
+                {
+                    _drySfx.Play();
+                    OnDryFire?.Invoke();
+                    _fireTimer = 0.25f;
+                    StartReload();
+                }
+            }
+            else if (_fireTimer <= 0f)
+            {
+                Fire(aimOrigin, aimDir);
+            }
+        }
+
+        // Do NOT clobber a reload that just started this tick — StartReload sets
+        // Phase.Reloading above, and overwriting it here would cancel every
+        // reload on the same frame it began (IsReloading would never read true,
+        // so the HUD ring would never appear and the magazine would never refill).
+        if (_phase != Phase.Reloading)
+            _phase = _flashLeft > 0f ? Phase.Firing
+                   : _ammo <= 0      ? Phase.Empty
+                   : Phase.Idle;
+    }
+
+    void StartReload()
+    {
+        if (_phase == Phase.Reloading) return;
+        _phase      = Phase.Reloading;
+        _reloadLeft = ReloadDur;
+        _reloadSfx.Play();
+        OnReloadStart?.Invoke();
+    }
+
+    /// Cone half-angle in degrees for the current movement state.
+    public float CurrentSpread(float moveSpeed, bool airborne)
+    {
+        float s = _def.SpreadBase + _def.SpreadPerSpeed * Mathf.Max(moveSpeed, 0f);
+        if (airborne) s += _def.SpreadAir;
+        s = Mathf.Min(s, _def.SpreadMax);
+        if (_aiming) s *= _def.AdsSpreadMult;
+        return s;
+    }
+
+    // ── Shooting ──────────────────────────────────────────────────────────────
+    void Fire(Vector3 origin, Vector3 dir)
+    {
+        _ammo--;
+        _fireTimer = FireInterval;
+        _flashLeft = 0.06f;
+
+        _fireSfx.Play();
+        OnFired?.Invoke(_def.Id);
+
+        switch (_def.Mode)
+        {
+            case FireMode.Projectile: FireProjectile(origin, dir); break;
+            case FireMode.Pellets:    FireHitscan(origin, dir, _def.Pellets); break;
+            default:                  FireHitscan(origin, dir, 1); break;
+        }
+    }
+
+    void FireHitscan(Vector3 origin, Vector3 dir, int pellets)
+    {
+        // Accumulate per-target so a shotgun blast produces ONE damage number
+        // and one TakeDamage call rather than eight of each.
+        var tally = new Dictionary<Node3D, (float dmg, Vector3 pos, bool head)>();
+
+        for (int i = 0; i < pellets; i++)
+        {
+            var shotDir = ApplySpread(dir, _spreadNow);
+            var to      = origin + shotDir * _def.Range;
+            var hit     = Raycast(origin, to);
+
+            Vector3 endPoint = to;
+            if (hit.Count > 0)
+            {
+                endPoint = (Vector3)hit["position"];
+                if (hit["collider"].As<GodotObject>() is Node3D body)
+                {
+                    // Shootable world objects (e.g. a gate's targets) react to the hit
+                    // directly; they carry no PlayerHealth so TallyHit ignores them.
+                    if (body is IShootable shootable) shootable.OnShot(endPoint);
+                    TallyHit(tally, body, endPoint);
+                }
+                else
+                    SpawnImpactSpark(endPoint);
+            }
+            SpawnTracer(origin, endPoint);
+        }
+
+        foreach (var (body, e) in tally)
+        {
+            var health = body.GetNodeOrNull<PlayerHealth>("PlayerHealth");
+            if (health != null) DeliverDamage(body, health, e.dmg, e.pos, e.head);
+        }
+    }
+
+    void TallyHit(Dictionary<Node3D, (float, Vector3, bool)> tally,
+                  Node3D body, Vector3 hitPos)
+    {
+        var health = body.GetNodeOrNull<PlayerHealth>("PlayerHealth");
+        if (health == null) { SpawnImpactSpark(hitPos); return; }
+
+        // Never damage our own team.
+        var theirs = FindGunCombat(body);
+        if (theirs != null && theirs.CombatTeam == CombatTeam) return;
+
+        float relY    = hitPos.Y - body.GlobalPosition.Y;
+        bool  head    = relY > HeadMinY;
+        float locMult = head ? HeadMult : relY < LegsMaxY ? LegsMult : 1.0f;
+
+        if (tally.TryGetValue(body, out var cur))
+            tally[body] = (cur.Item1 + Damage * locMult, cur.Item2, cur.Item3 || head);
+        else
+            tally[body] = (Damage * locMult, hitPos, head);
+    }
+
+    void FireProjectile(Vector3 origin, Vector3 dir)
+    {
+        var shotDir = ApplySpread(dir, _spreadNow);
+        Rocket.Spawn(GetTree().Root, origin + shotDir * 0.8f, shotDir, _def, this);
+
+        // Rocket jumping falls out for free: kick the shooter back along the shot.
+        if (_def.SelfKnockback > 0f)
+            ApplyImpulse?.Invoke(-shotDir * _def.SelfKnockback);
+    }
+
+    Godot.Collections.Dictionary Raycast(Vector3 from, Vector3 to)
+    {
+        var space = GetParent<Node3D>().GetWorld3D().DirectSpaceState;
+        var query = PhysicsRayQueryParameters3D.Create(from, to);
+        query.CollideWithBodies = true;
+        query.CollideWithAreas  = false;
+        if (GetParent() is CollisionObject3D self)
+            query.Exclude = new Godot.Collections.Array<Rid> { self.GetRid() };
+        return space.IntersectRay(query);
+    }
+
+    /// Rotate `dir` by a random offset inside a cone of `degrees` half-angle.
+    Vector3 ApplySpread(Vector3 dir, float degrees)
+    {
+        if (degrees <= 0.001f) return dir.Normalized();
+
+        dir = dir.Normalized();
+        var up    = Mathf.Abs(dir.Dot(Vector3.Up)) > 0.99f ? Vector3.Right : Vector3.Up;
+        var right = dir.Cross(up).Normalized();
+        up        = right.Cross(dir).Normalized();
+
+        // Uniform disc sample so the cone fills evenly rather than clustering.
+        float ang = GD.Randf() * Mathf.Tau;
+        float rad = Mathf.Sqrt(GD.Randf()) * Mathf.DegToRad(degrees);
+        var offset = (right * Mathf.Cos(ang) + up * Mathf.Sin(ang)) * Mathf.Tan(rad);
+        return (dir + offset).Normalized();
+    }
+
+    /// Public so Rocket can route its splash through the same damage path.
+    public void DeliverDamage(Node3D target, PlayerHealth health,
+                              float damage, Vector3 hitPos, bool headshot)
+    {
+        float finalDmg = damage * DamageMultiplier;
+        GD.Print($"[Gun] HIT {target.Name} | {(headshot ? "HEAD" : "BODY")} | " +
+                 $"{finalDmg:F0} dmg ({_def.Display}, spread {_spreadNow:F2}°)");
+
+        health.TakeDamage(finalDmg, hitPos);
+        SpawnDamageNumber(hitPos, finalDmg, headshot);
+
+        if (Lifesteal > 0f)
+        {
+            var selfHealth = GetParent<Node3D>()?.GetNodeOrNull<PlayerHealth>("PlayerHealth");
+            selfHealth?.Heal(finalDmg * Lifesteal);
+        }
+    }
+
+    static GunCombat? FindGunCombat(Node3D body)
+    {
+        foreach (Node child in body.GetChildren())
+            if (child is GunCombat gc) return gc;
+        return null;
+    }
+
+    // ── Visuals ───────────────────────────────────────────────────────────────
+    public void SpawnDamageNumber(Vector3 worldPos, float damage, bool headshot)
+    {
+        var label = new Label3D
+        {
+            Text        = ((int)damage).ToString(),
+            FontSize    = headshot ? 96 : 72,
+            Modulate    = headshot ? new Color(1f, 0.85f, 0.15f, 1f)
+                                   : new Color(1f, 0.12f, 0.08f, 1f),
+            Billboard   = BaseMaterial3D.BillboardModeEnum.Enabled,
+            NoDepthTest = true,
+            Position    = worldPos + new Vector3(GD.Randf() * 0.5f - 0.25f, 0f,
+                                                 GD.Randf() * 0.3f - 0.15f),
+        };
+        GetTree().Root.AddChild(label);
+
+        var tween = label.CreateTween();
+        tween.TweenProperty(label, "position:y", label.Position.Y + 1.8f, 0.85f)
+             .SetEase(Tween.EaseType.Out).SetTrans(Tween.TransitionType.Quad);
+        tween.Parallel()
+             .TweenProperty(label, "modulate:a", 0f, 0.5f)
+             .SetDelay(0.35f);
+        tween.TweenCallback(Callable.From(label.QueueFree));
+    }
+
+    /// Thin glowing line from muzzle to impact, faded over ~80 ms. This is the
+    /// main thing that makes a hitscan shot legible to the person being shot at.
+    void SpawnTracer(Vector3 from, Vector3 to)
+    {
+        float len = from.DistanceTo(to);
+        if (len < 0.1f) return;
+
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor              = new Color(1f, 0.88f, 0.55f, 0.85f),
+            EmissionEnabled          = true,
+            Emission                 = new Color(1f, 0.80f, 0.40f),
+            EmissionEnergyMultiplier = 4f,
+            ShadingMode              = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            Transparency             = BaseMaterial3D.TransparencyEnum.Alpha,
+            CullMode                 = BaseMaterial3D.CullModeEnum.Disabled,
+        };
+
+        var mesh = new MeshInstance3D
+        {
+            Mesh = new CylinderMesh
+            {
+                TopRadius = 0.012f, BottomRadius = 0.012f, Height = len,
+                RadialSegments = 4, Rings = 1,
+            },
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+        };
+        mesh.SetSurfaceOverrideMaterial(0, mat);
+
+        GetTree().Root.AddChild(mesh);
+        mesh.GlobalPosition = (from + to) * 0.5f;
+        var dir = (to - from).Normalized();
+        if (Mathf.Abs(dir.Dot(Vector3.Up)) < 0.999f)
+            mesh.LookAtFromPosition(mesh.GlobalPosition, mesh.GlobalPosition + dir, Vector3.Up);
+        mesh.RotateObjectLocal(Vector3.Right, Mathf.Pi / 2f);
+
+        var tw = mesh.CreateTween();
+        tw.TweenProperty(mat, "albedo_color:a", 0f, 0.08f);
+        tw.TweenCallback(Callable.From(mesh.QueueFree));
+    }
+
+    void SpawnImpactSpark(Vector3 pos)
+    {
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor              = new Color(1f, 0.9f, 0.6f, 0.9f),
+            EmissionEnabled          = true,
+            Emission                 = new Color(1f, 0.75f, 0.35f),
+            EmissionEnergyMultiplier = 6f,
+            ShadingMode              = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            Transparency             = BaseMaterial3D.TransparencyEnum.Alpha,
+        };
+        var spark = new MeshInstance3D
+        {
+            Mesh = new SphereMesh { Radius = 0.05f, Height = 0.1f,
+                                    RadialSegments = 6, Rings = 3 },
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+        };
+        spark.SetSurfaceOverrideMaterial(0, mat);
+        GetTree().Root.AddChild(spark);
+        spark.GlobalPosition = pos;
+
+        var tw = spark.CreateTween();
+        tw.TweenProperty(spark, "scale", Vector3.One * 0.1f, 0.12f);
+        tw.Parallel().TweenProperty(mat, "albedo_color:a", 0f, 0.12f);
+        tw.TweenCallback(Callable.From(spark.QueueFree));
+    }
+
+    // ── Interrupts ────────────────────────────────────────────────────────────
+    /// Taking a hit cancels a reload — getting shot mid-reload should hurt.
+    public void InterruptByHit()
+    {
+        if (_phase != Phase.Reloading) return;
+        _phase      = Phase.Idle;
+        _reloadLeft = 0f;
+        OnReloadEnd?.Invoke();
+    }
+}

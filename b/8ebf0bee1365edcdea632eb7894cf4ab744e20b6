@@ -1,0 +1,75 @@
+using Godot;
+using System.Collections.Generic;
+
+/// test/TestKnifeProbe.cs
+/// Measures assets/guns/combat_knife.glb so it can be seated like a Styloo gun
+/// (tip along +X): prints the node tree, the model AABB, and — along the
+/// longest axis — the cross-section thickness near each end. A blade end is
+/// thin in one perpendicular axis; the grip end is thicker in both.
+public partial class TestKnifeProbe : Node
+{
+    const string Path = "res://scenes/weapons/CombatKnife.tscn";
+
+    public override void _Ready()
+    {
+        var scene = GD.Load<PackedScene>(Path);
+        if (scene == null) { GD.Print("[Probe] failed to load"); GetTree().Quit(1); return; }
+        var root = scene.Instantiate<Node3D>();
+        AddChild(root);
+
+        Dump(root, "");
+        var aabb = GunCombat.MeasureAabb(root);
+        GD.Print($"[Probe] AABB pos={aabb.Position} size={aabb.Size}");
+
+        // Probe the MESH in its own local space — the Sketchfab parents tilt it.
+        var mesh = root; // wrapper space: after ModelRebase
+        aabb = GunCombat.MeasureAabb(root);
+        GD.Print($"[Probe] mesh-local AABB pos={aabb.Position} size={aabb.Size} ");
+        var verts = new List<Vector3>();
+        Collect(mesh, Transform3D.Identity, mesh, verts);
+        int ax = aabb.Size.X >= aabb.Size.Y && aabb.Size.X >= aabb.Size.Z ? 0
+               : aabb.Size.Y >= aabb.Size.Z ? 1 : 2;
+        string[] names = { "X", "Y", "Z" };
+        float lo = aabb.Position[ax], len = aabb.Size[ax];
+        GD.Print($"[Probe] longest axis = {names[ax]} ({len:F3}), {verts.Count} verts");
+
+        // Cross-section extents in the other two axes for 10 slices along it.
+        for (int s = 0; s < 10; s++)
+        {
+            float a = lo + len * s / 10f, b = lo + len * (s + 1) / 10f;
+            var mn = new Vector3(1e9f, 1e9f, 1e9f); var mx = -mn; int n = 0;
+            foreach (var v in verts)
+                if (v[ax] >= a && v[ax] <= b) { mn = mn.Min(v); mx = mx.Max(v); n++; }
+            var sz = mx - mn;
+            GD.Print($"[Probe] slice {s} ({a:F3}..{b:F3}) n={n} size={sz}");
+        }
+        GetTree().Quit();
+    }
+
+    static MeshInstance3D? FindMesh(Node n)
+    {
+        if (n is MeshInstance3D mi) return mi;
+        foreach (Node c in n.GetChildren()) { var m = FindMesh(c); if (m != null) return m; }
+        return null;
+    }
+
+    static void Dump(Node n, string ind)
+    {
+        string t = n is Node3D n3 ? $" pos={n3.Position} rot={n3.RotationDegrees} scale={n3.Scale}" : "";
+        GD.Print($"[Probe] {ind}{n.Name} ({n.GetClass()}){t}");
+        foreach (Node c in n.GetChildren()) Dump(c, ind + "  ");
+    }
+
+    static void Collect(Node n, Transform3D xf, Node root, List<Vector3> into)
+    {
+        var local = (n is Node3D n3 && n != root) ? xf * n3.Transform : xf;
+        if (n is MeshInstance3D mi && mi.Mesh != null)
+            for (int s = 0; s < mi.Mesh.GetSurfaceCount(); s++)
+            {
+                var arr = mi.Mesh.SurfaceGetArrays(s);
+                foreach (var v in arr[(int)Mesh.ArrayType.Vertex].AsVector3Array())
+                    into.Add(local * v);
+            }
+        foreach (Node c in n.GetChildren()) Collect(c, local, root, into);
+    }
+}

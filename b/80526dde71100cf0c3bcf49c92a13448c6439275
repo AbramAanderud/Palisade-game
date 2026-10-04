@@ -1,0 +1,70 @@
+using Godot;
+using System.Collections.Generic;
+
+/// Guards the map editor's overlay layering. With the 3D view now filling the
+/// whole window, two things must hold or controls silently stop responding:
+///   1. the SubViewportContainer must be the BACKMOST child (Godot picks mouse
+///      input in reverse tree order, so anything added after a full-rect
+///      viewport would be covered AND unclickable)
+///   2. the floating left column must not be a Stop-filter slab, or it carves an
+///      invisible dead strip out of the maze between its buttons
+/// Also asserts nothing paints an opaque full-screen backdrop over the maze.
+public partial class TestEditorLayering : Node3D
+{
+    int _frame;
+    Control _editor = null!;
+
+    public override void _Ready()
+    {
+        var packed = GD.Load<PackedScene>("res://scenes/MazeEditor3D.tscn");
+        _editor = packed.Instantiate<Control>();
+        AddChild(_editor);
+    }
+
+    public override void _Process(double delta)
+    {
+        if (++_frame < 30) return;      // let BuildUI finish
+
+        bool ok = true;
+
+        // 1. viewport is backmost
+        SubViewportContainer? vp = null;
+        foreach (var c in _editor.GetChildren())
+            if (c is SubViewportContainer svc) { vp = svc; break; }
+        if (vp == null) { GD.Print("[Layer] FAIL no SubViewportContainer"); ok = false; }
+        else
+        {
+            int idx = vp.GetIndex();
+            bool backmost = idx == 0;
+            GD.Print($"[Layer] viewport index={idx} (must be 0) full-rect=" +
+                     $"{vp.Size} anchors L{vp.AnchorLeft} T{vp.AnchorTop} R{vp.AnchorRight} B{vp.AnchorBottom}  " +
+                     $"{(backmost ? "OK" : "FAIL")}");
+            ok &= backmost;
+
+            // Everything interactive must sit ABOVE it.
+            var below = new List<string>();
+            foreach (var c in _editor.GetChildren())
+                if (c is Control ctl && ctl != vp && ctl.GetIndex() < idx) below.Add(ctl.Name);
+            if (below.Count > 0) { GD.Print($"[Layer] FAIL controls under viewport: {string.Join(", ", below)}"); ok = false; }
+        }
+
+        // 2. no opaque full-screen backdrop
+        foreach (var c in _editor.GetChildren())
+            if (c is ColorRect cr && cr.Color.A > 0.99f && cr.Size.X > 1000 && cr.Size.Y > 600)
+            { GD.Print($"[Layer] FAIL opaque backdrop {cr.Name} {cr.Color}"); ok = false; }
+
+        // 3. tall containers must not be Stop-filter slabs over the maze
+        foreach (var c in _editor.GetChildren())
+        {
+            if (c is not Container ct) continue;
+            if (ct.Size.Y < 300) continue;                     // only the tall side column
+            bool pass = ct.MouseFilter != Control.MouseFilterEnum.Stop;
+            GD.Print($"[Layer] container {ct.Name} size={ct.Size} filter={ct.MouseFilter} " +
+                     $"{(pass ? "OK" : "FAIL - dead strip over maze")}");
+            ok &= pass;
+        }
+
+        GD.Print($"[Layer] VERDICT {(ok ? "PASS" : "FAIL")}");
+        GetTree().Quit();
+    }
+}

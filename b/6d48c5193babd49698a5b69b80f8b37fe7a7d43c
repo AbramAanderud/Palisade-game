@@ -1,0 +1,40 @@
+# Assets
+
+**Art direction:** Dark gothic dungeon. Stone brick walls, worn stone floors, vaulted ceilings. Warm amber torch lighting on cool grey stone. First-person perspective. Gritty, atmospheric, medieval.
+
+## Generated Assets
+
+| Asset | Type | Path | Notes |
+|-------|------|------|-------|
+| Stone brick wall | Texture | assets/img/wall_stone.png | Tileable, 512×512 |
+| Stone floor | Texture | assets/img/floor_stone.png | Tileable, 512×512 |
+| Stone ceiling | Texture | assets/img/ceiling_stone.png | Tileable, 512×512 |
+| Iron sword | Image→3D | assets/glb/sword.glb | Player weapon + pickup |
+| Torch flame | Texture | assets/img/torch_flame.png | Sprite for OmniLight3D |
+
+## Pending Generation
+
+All assets above need generation. Run asset-gen stage when ready.
+
+## Manor Prop GLB Batch (godogen)
+
+14 manor/library props: ref image (xAI Grok, $0.02 each) → GLB (Tripo3D, $0.40 each, high quality).
+
+| name | glb path | ref path | subject | cost_cents |
+|------|----------|----------|---------|------------|
+| torch_a | assets/glb/props/torch_a.glb | assets/img/props/torch_a.png | wall torch, lit flame | 42 |
+| torch_b | assets/glb/props/torch_b.glb | assets/img/props/torch_b.png | wall torch, stylized low-poly flame finial | 42 |
+| candelabra_a | assets/glb/props/candelabra_a.glb | assets/img/props/candelabra_a.png | 5-arm candelabra, lit candles, wax drips | 42 |
+| candelabra_b | assets/glb/props/candelabra_b.glb | assets/img/props/candelabra_b.png | 3-arm candelabra, tall dark bronze | 42 |
+| bookrow_a | assets/glb/props/bookrow_a.glb | assets/img/props/bookrow_a.png | book row, jewel-tone spines, gold lettering | 42 |
+| bookrow_b | assets/glb/props/bookrow_b.glb | assets/img/props/bookrow_b.png | book row, red/brown spines, leaning books | 42 |
+| bookrow_c | assets/glb/props/bookrow_c.glb | assets/img/props/bookrow_c.png | book row, blue/green spines | 42 |
+| balustrade_a | assets/glb/props/balustrade_a.glb | assets/img/props/balustrade_a.png | balustrade, 3 turned balusters + handrail, gothic capitals | 42 |
+| column_a | assets/glb/props/column_a.glb | assets/img/props/column_a.png | column, gold-leaf capital | 44 (2 ref attempts + GLB) |
+| plant_a | assets/glb/props/plant_a.glb | assets/img/props/plant_a.png | broadleaf plant, ornate gothic ceramic urn | 42 |
+| plant_b | assets/glb/props/plant_b.glb | assets/img/props/plant_b.png | fern, gothic bronze planter on stand | 42 |
+| clutter_bookstack | assets/glb/props/clutter_bookstack.glb | assets/img/props/clutter_bookstack.png | 3 worn leather books, stacked | 42 |
+| clutter_goblet | assets/glb/props/clutter_goblet.glb | assets/img/props/clutter_goblet.png | tarnished brass goblet, iron tracery | 42 |
+| clutter_pot | assets/glb/props/clutter_pot.glb | assets/img/props/clutter_pot.png | terracotta pot, gothic arch relief | 42 |
+
+**Total: 590 cents** (14 refs × 2¢ = 28¢, 1 rejected/regenerated ref (column_a attempt 1) × 2¢ = 2¢, 14 GLBs × 40¢ = 560¢) — 410 cents remain of the 1000¢ budget.

@@ -1,0 +1,64 @@
+using Godot;
+using System.Text.Json;
+
+/// Persists name + gold to the currently active account.
+/// Storage path is resolved by AccountManager — typically:
+///     user://accounts/{active}/profile.json
+public static class PlayerProfile
+{
+    public static void Load()
+    {
+        AccountManager.EnsureLoaded();
+        string path = AccountManager.ProfilePath();
+
+        if (!FileAccess.FileExists(path))
+        {
+            // Fresh account — seed with starter rank and the account name as display name.
+            OnlineGameState.PlayerName = AccountManager.ActiveAccount;
+            OnlineGameState.Gold       = AccountManager.StarterRank;
+            OnlineGameState.SelectedMazeSlot = DefaultMaze.SentinelSlot;
+            Save();
+            return;
+        }
+
+        // Profiles written before "maze_slot" existed have no pick → default.
+        OnlineGameState.SelectedMazeSlot = DefaultMaze.SentinelSlot;
+
+        using var file = FileAccess.Open(path, FileAccess.ModeFlags.Read);
+        if (file == null) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(file.GetAsText());
+            var root = doc.RootElement;
+            if (root.TryGetProperty("name", out var n))
+            {
+                string name = n.GetString() ?? "";
+                if (!string.IsNullOrEmpty(name))
+                    OnlineGameState.PlayerName = name;
+            }
+            if (root.TryGetProperty("gold", out var g))
+                OnlineGameState.Gold = g.GetInt32();
+            // Last-used online maze. Stored as a real slot or -1 for the
+            // built-in default, so the file never depends on SentinelSlot's
+            // value. A slot that's since been deleted is left for the picker,
+            // which falls back to the default when it can't find it.
+            if (root.TryGetProperty("maze_slot", out var ms) && ms.TryGetInt32(out int slot) &&
+                slot >= 0 && slot < MazeSerializer.SlotCount)
+                OnlineGameState.SelectedMazeSlot = slot;
+        }
+        catch { }
+    }
+
+    public static void Save()
+    {
+        AccountManager.EnsureLoaded();
+        string json = JsonSerializer.Serialize(new
+        {
+            name = OnlineGameState.PlayerName,
+            gold = OnlineGameState.Gold,
+            maze_slot = OnlineGameState.SelectedMazeSlot >= 0 ? OnlineGameState.SelectedMazeSlot : -1,
+        });
+        using var file = FileAccess.Open(AccountManager.ProfilePath(), FileAccess.ModeFlags.Write);
+        file?.StoreString(json);
+    }
+}

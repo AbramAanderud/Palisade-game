@@ -1,0 +1,150 @@
+using Godot;
+using System.Collections.Generic;
+
+/// Verifies third person is no longer locked:
+///   1. pitching the look actually MOVES the third-person camera (it used to
+///      orbit on yaw only, so looking up/down did nothing to the view)
+///   2. the reticle tracks the real aim point instead of sitting at screen
+///      centre pointing at the player's own back
+///   3. first person is untouched — reticle stays exactly centred
+/// Drives real InputEventMouseMotion through PlayerController._Input so the
+/// production input path is what gets exercised, not a test-only shortcut.
+public partial class TestTpFreeLook : Node3D
+{
+    PlayerController _p = null!;
+    SpreadCrosshair  _cross = null!;
+
+    // (label, target pitch in radians). Negative pitch = looking down.
+    static readonly (string label, float pitch)[] Beats =
+    {
+        ("level",     0.0f),
+        ("up 40deg",  0.70f),
+        ("down 40deg", -0.70f),
+    };
+
+    const int BeatFrames = 90;
+    int _frame;
+    readonly List<(string label, float pitch, float camDy, Vector2 reticle)> _tp = new();
+    Vector2 _fpReticle = Vector2.Zero;
+    bool _fpRecorded;
+
+    public override void _Ready()
+    {
+        var env = new WorldEnvironment();
+        env.Environment = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.05f, 0.05f, 0.07f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.7f, 0.7f, 0.7f),
+            AmbientLightEnergy = 1.0f,
+        };
+        AddChild(env);
+        AddChild(new DirectionalLight3D { LightEnergy = 1.4f, Rotation = new(-0.8f, 0.4f, 0f) });
+
+        // Closed box so the aim ray always lands on a real surface at any pitch.
+        BuildBox();
+
+        _p = PlayerController.Spawn(this, new Vector3(0, 1.2f, 0), yawDeg: 180f);
+
+        // No HUD is added here on purpose: PlayerController._Ready already
+        // creates its own PlayerHUD as a direct child. Adding a second one would
+        // draw a duplicate reticle and, worse, would let this test pass on a HUD
+        // the real game never builds.
+
+        Input.MouseMode = Input.MouseModeEnum.Captured;   // mouse look is gated on this
+    }
+
+    void BuildBox()
+    {
+        void Slab(Vector3 size, Vector3 pos)
+        {
+            var body = new StaticBody3D { Position = pos };
+            body.AddChild(new CollisionShape3D { Shape = new BoxShape3D { Size = size } });
+            body.AddChild(new MeshInstance3D
+            {
+                Mesh = new BoxMesh { Size = size },
+                MaterialOverride = new StandardMaterial3D { AlbedoColor = new Color(0.35f, 0.33f, 0.30f) },
+            });
+            AddChild(body);
+        }
+        Slab(new Vector3(60, 1, 60), new Vector3(0, -0.5f, 0));    // floor
+        Slab(new Vector3(60, 1, 60), new Vector3(0, 20f, 0));      // ceiling
+        Slab(new Vector3(60, 21, 1), new Vector3(0, 10f, -30f));   // walls
+        Slab(new Vector3(60, 21, 1), new Vector3(0, 10f,  30f));
+        Slab(new Vector3(1, 21, 60), new Vector3(-30f, 10f, 0));
+        Slab(new Vector3(1, 21, 60), new Vector3( 30f, 10f, 0));
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+
+        // Frames 1..40: still FIRST person — record where the reticle sits.
+        if (_frame == 40)
+        {
+            _fpReticle  = ReticleScreenPos();
+            _fpRecorded = true;
+            _p.ToggleCameraMode();          // -> third person
+            GD.Print($"[TpLook] FP reticle at {_fpReticle} (viewport centre " +
+                     $"{GetViewport().GetVisibleRect().Size / 2f})");
+            return;
+        }
+        if (_frame < 40) return;
+
+        int beat = (_frame - 41) / BeatFrames;
+        if (beat >= Beats.Length) { Report(); GetTree().Quit(); return; }
+
+        // Nudge pitch toward this beat's target with real mouse motion.
+        float want = Beats[beat].pitch;
+        float err  = want - _p.Pitch;
+        if (Mathf.Abs(err) > 0.005f)
+            Input.ParseInputEvent(new InputEventMouseMotion
+            {
+                // _pitch -= relative.Y * sens, so a NEGATIVE Y looks up.
+                Relative = new Vector2(0f, -Mathf.Sign(err) * Mathf.Min(12f, Mathf.Abs(err) * 60f)),
+            });
+
+        // Last frame of the beat: measure.
+        if ((_frame - 41) % BeatFrames == BeatFrames - 1)
+        {
+            var cam   = _p.ActiveCamera;
+            float dy  = cam.GlobalPosition.Y - _p.GlobalPosition.Y;
+            _tp.Add((Beats[beat].label, _p.Pitch, dy, ReticleScreenPos()));
+        }
+    }
+
+    Vector2 ReticleScreenPos()
+    {
+        var cam = _p.ActiveCamera;
+        if (cam.IsPositionBehind(_p.AimPoint)) return GetViewport().GetVisibleRect().Size / 2f;
+        return _p.TpMode ? cam.UnprojectPosition(_p.AimPoint)
+                         : GetViewport().GetVisibleRect().Size / 2f;
+    }
+
+    void Report()
+    {
+        var centre = GetViewport().GetVisibleRect().Size / 2f;
+        GD.Print("[TpLook] --- third person ---");
+        foreach (var (label, pitch, camDy, ret) in _tp)
+            GD.Print($"[TpLook] {label,-11} pitch={pitch,6:F3}  camY-playerY={camDy,7:F3}  " +
+                     $"reticle={ret}  offCentre={(ret - centre).Length(),7:F1}px");
+
+        bool fpCentred = _fpRecorded && (_fpReticle - centre).Length() < 0.5f;
+
+        // Looking UP must drop the camera; looking DOWN must raise it. That is
+        // the whole point — before, camY never changed with pitch.
+        float lvl = _tp[0].camDy, up = _tp[1].camDy, down = _tp[2].camDy;
+        bool camMoves = up < lvl - 0.5f && down > lvl + 0.5f;
+
+        // The reticle must leave screen centre in third person and must move
+        // between pitches, rather than being pinned like it was.
+        float sepUp   = (_tp[1].reticle - centre).Length();
+        float sepDown = (_tp[2].reticle - centre).Length();
+        bool retMoves = sepUp > 20f && sepDown > 20f &&
+                        (_tp[1].reticle - _tp[2].reticle).Length() > 40f;
+
+        GD.Print($"[TpLook] fpReticleCentred={fpCentred}  tpCameraPitches={camMoves}  tpReticleTracks={retMoves}");
+        GD.Print($"[TpLook] VERDICT {(fpCentred && camMoves && retMoves ? "PASS" : "FAIL")}");
+    }
+}

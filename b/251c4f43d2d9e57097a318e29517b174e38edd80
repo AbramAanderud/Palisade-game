@@ -1,0 +1,123 @@
+# Knife Slot + Air Dash — Design
+
+Date: 2026-09-27 · Branch: `feat/melee-dash` · Status: approved in brainstorm, pending spec review
+
+## Goal
+
+Give every player an always-carried knife on key 3 whose alt-fire (right
+click) is a one-charge air dash. The knife is the melee identity; the dash is
+its mobility verb. Hero-shooter rules apply (memory `gunplay_direction`):
+movement never costs accuracy, balance lives in damage / rate / charges.
+
+## Decisions (from brainstorm)
+
+| Topic | Decision |
+|---|---|
+| Melee weapon | New knife slot; guns remain primary/secondary |
+| Knife ownership | One knife for now, addressed by id; collectable/personal knives are a later project (save data) |
+| Placeholder model | Procedural (primitive meshes), ~0.30 m |
+| Moveset | New fast stab — not SwordCombat's Joust |
+| Stab | 45 dmg (×1.5 head zone = 67.5), 0.45 s interval, 2.2 m reach, backstab kills |
+| Dash key | Right click (`knife_dash`), rebindable |
+| Dash availability | Air only, knife out |
+| Recharge | 1 charge, refills on landing or wall-run start |
+| Dash shape | 22 m/s for 0.15 s (~3.3 m burst) along camera look incl. pitch; gravity paused |
+| Exit speed | Horizontal clamped to 16 m/s (bhop ceiling), upward clamped to 10.5 (jump speed), then normal air physics |
+| Ground dash | None (slide is the ground burst) |
+| Per-weapon | Dash numbers live on the knife def so later knives can differ |
+| HUD | Diamond pip under reticle, knife-only |
+| Keys | Knife = 3; camera toggle 3 → V |
+| Architecture | Approach A: knife is a `GunDef` with `FireMode.Melee` inside GunCombat |
+
+## 1. Knife (GunCombat.cs)
+
+- `FireMode.Melee`, `GunSlot.Melee`.
+- `GunDef` gains `BackstabKills` (bool) and `DashSpeed` (22), `DashDur`
+  (0.15), `DashExitCap` (16).
+- `Defs["knife"]`: Mode Melee, Slot Melee, Damage 45, FireInterval 0.45,
+  Range 2.2, MagSize 0, RecoilKick small, IsPistol true, AnimFamily
+  "pistol", BackstabKills true, Model = `res://scenes/weapons/KnifePlaceholder.tscn`,
+  TrueLength 0.30. Not in `StarterPool` or `ArenaPool`.
+- Melee `Fire`: no ammo decrement, no muzzle flash / casing / tracer / auto
+  reload. Sphere sweep (radius 0.3) along the camera ray to Range; first body
+  with PlayerHealth that is an opponent (same team rule as `TallyHit`) is hit.
+  Damage = Damage × zone mult (existing head/legs zones), or
+  `PlayerHealth.MaxHealth` (÷ DamageMultiplier, as the AWP rule does) when
+  `BackstabKills` and the attacker is within ±60° behind the target's facing.
+  Facing: `PlayerController.ForwardVector` for players/puppets, `-Basis.Z`
+  for other bodies. Damage goes through `DeliverDamage` (relay, hitmarker,
+  numbers unchanged). `OnShotEndpoint` still fires (hit point or reach end).
+- Melee guards: `RequestReload` ignored; `IsEmpty` false; `SwitchTo` never
+  auto-reloads a melee weapon; `AmmoFraction` reads 1.
+
+## 2. Model
+
+`scenes/weapons/KnifePlaceholder.tscn` — Node3D root with blade / guard /
+grip MeshInstance3D boxes, blade along local +X (Styloo convention), steel +
+dark grip materials. Tracked in git (not `assets/`, which is gitignored). The
+existing FP/TP gun pipeline (`RebuildFpGun` / `RebuildTpGun`, TrueLength
+scaling, grip seating) loads it via `Model`. Swapping in a real knife later
+= change `Model`.
+
+## 3. Slot + input (PlayerController.cs, minimal)
+
+- `MeleeGunId = "knife"` set in `EquipStarterGun` (spawn loadout).
+- `SelectMelee()` → existing `SelectGun` (so `WeaponSwitched` relays it).
+- `weapon_melee` action handled next to `weapon_primary/secondary`.
+- `CycleWeapon` ring includes the knife as a third stop.
+- Puppet shot handler: skip tracer when the def is Melee.
+- FP stab visual: on a melee `OnFired`, a short forward thrust of the arms
+  (placeholder until knife clips exist) plus the pistol shoot one-shot.
+
+## 4. Dash (PlayerController.cs, one self-contained block)
+
+Fields `_dashCharge`, `_dashLeft`, `_dashDir`; property `DashReady`.
+
+1. Refill: `if (onFloor || _wallRunning) _dashCharge = true;`
+2. Start: `knife_dash` just pressed && knife held && !onFloor &&
+   !_wallRunning && !_sliding && _dashCharge → `_dashDir` = camera forward,
+   `_dashLeft = DashDur`, charge spent, FOV kick.
+3. Burst: after the `WallRunTick/SlideTick/NormalTick` dispatch, while
+   `_dashLeft > 0`: `vel = _dashDir * DashSpeed`.
+4. End (timer out, landed, or wall run started): clamp horizontal to
+   `DashExitCap`, clamp upward Y to `JumpSpeed`.
+
+Not touched: NormalTick, WallRunTick, SlideTick, momentum/bhop/wall-run/air
+constants. Dash-into-wall flows into the normal `TryStartWallRun`.
+
+## 5. HUD (PlayerHUD.cs)
+
+- `DashPip`: 7 px diamond, 18 px below reticle, knife-only; ready = warm
+  white, spent = grey ~25% alpha; one scale pulse on refill.
+- Ammo label shows `KNIFE` for melee; reload ring never shows.
+- WeaponSlotsPanel: third card for the knife (GunSlotIcon renders the model).
+
+## 6. Input map + rebind screen
+
+- `project.godot`: add `weapon_melee` (physical 3), `knife_dash` (mouse
+  right); `toggle_camera` 3 → V.
+- `SettingsPanel.BindableActions`: add "Melee Weapon", "Knife Dash".
+- Saved binds store only overrides, so defaults flow to existing players.
+  Known edge: a player who explicitly saved camera-toggle = 3 gets 3 doing
+  both until they rebind; accepted, no migration.
+
+## 7. Docs
+
+CLAUDE.md pillar: third person toggle on V; knife on 3, right-click air
+dash. JOURNAL.md entry.
+
+## 8. Verification
+
+- `test/TestKnife`: 45 dmg in range, miss past 2.2 m, backstab kills, front
+  stab doesn't, knife ⇄ gun swap never reloads, knife in no pool.
+- `test/TestKnifeDash`: real PlayerController — dash ≈ 3.3 m burst, exit
+  horizontal ≤ 16, no second air dash, refill on land, no ground dash, no
+  dash with a gun out.
+- Re-run TestGunSlots, TestLoadoutSlots, TestGunTuning, TestHitMarker.
+- `dotnet build` clean. Capture of FP/TP knife + pip, windowed on the
+  second monitor (not the one running League).
+
+## Out of scope
+
+Knife ownership/collecting, knife animation clips, knife move-speed bonus,
+dash sound (unless an existing SFX fits), ground dash.

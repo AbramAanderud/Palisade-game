@@ -1,0 +1,111 @@
+using System;
+using Godot;
+
+/// res://scripts/MatchCountdown.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Match-start gate for online matches. Shows "WAITING FOR OPPONENT" over a
+/// dimmed screen while the other client builds its arena, then a 3-2-1-GO once
+/// both sides have reported arena_ready. The players stay Frozen underneath —
+/// spawned facing their maze — and the owning arena unfreezes them in the
+/// BeginCountdown completion callback, which fires when "GO!" APPEARS (not
+/// after it fades) so control returns exactly on the beat.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class MatchCountdown : CanvasLayer
+{
+    static readonly Color Gold = new(1.00f, 0.82f, 0.20f);   // GunSwitcher's select gold
+
+    /// Optional UI font, set before AddChild (the arena passes its Agmena face).
+    public FontFile? Font;
+
+    /// Headline shown while waiting for the other client(s). Set before AddChild;
+    /// the default is the 1v1 wording (FFA passes "WAITING FOR PLAYERS").
+    public string WaitingText { get; set; } = "WAITING FOR OPPONENT";
+
+    /// Small line under the headline while waiting. Set before AddChild; the
+    /// default is the 1v1 wording.
+    public string WaitingSubText { get; set; } = "the countdown starts when both players are in";
+
+    ColorRect? _tint;
+    Label?     _big;
+    Label?     _sub;
+
+    public override void _Ready()
+    {
+        Layer = 50;   // over HUD (10) and weapon wheel (20), under the death overlay (100)
+
+        _tint = new ColorRect
+        {
+            Color       = new Color(0f, 0f, 0f, 0.40f),
+            MouseFilter = Control.MouseFilterEnum.Ignore,
+        };
+        _tint.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        AddChild(_tint);
+
+        var box = new VBoxContainer { MouseFilter = Control.MouseFilterEnum.Ignore };
+        box.SetAnchorsPreset(Control.LayoutPreset.Center);
+        box.GrowHorizontal = Control.GrowDirection.Both;
+        box.GrowVertical   = Control.GrowDirection.Both;
+        box.Alignment      = BoxContainer.AlignmentMode.Center;
+        box.AddThemeConstantOverride("separation", 10);
+        AddChild(box);
+
+        _big = new Label
+        {
+            Text                = WaitingText,
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (Font != null) _big.AddThemeFontOverride("font", Font);
+        _big.AddThemeFontSizeOverride("font_size", 42);
+        _big.AddThemeColorOverride("font_color", new Color(0.93f, 0.91f, 0.83f, 0.95f));
+        box.AddChild(_big);
+
+        _sub = new Label
+        {
+            Text                = WaitingSubText,
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (Font != null) _sub.AddThemeFontOverride("font", Font);
+        _sub.AddThemeFontSizeOverride("font_size", 16);
+        _sub.AddThemeColorOverride("font_color", new Color(0.70f, 0.68f, 0.60f, 0.75f));
+        box.AddChild(_sub);
+    }
+
+    /// 3 → 2 → 1 → GO!. `onGo` fires the moment GO! shows; the overlay lingers
+    /// through the GO flash and frees itself.
+    public void BeginCountdown(Action onGo)
+    {
+        if (_sub != null) _sub.Visible = false;
+
+        var tw = CreateTween();
+        foreach (var step in new[] { "3", "2", "1" })
+        {
+            string s = step;   // capture per iteration, not the loop variable
+            tw.TweenCallback(Callable.From(() => ShowStep(s, Gold, 110)));
+            tw.TweenInterval(0.8);
+        }
+        tw.TweenCallback(Callable.From(() =>
+        {
+            ShowStep("GO!", new Color(0.55f, 1.00f, 0.55f), 120);
+            if (_tint != null)
+            {
+                var ft = _tint.CreateTween();
+                ft.TweenProperty(_tint, "color:a", 0f, 0.25f);
+            }
+            onGo();
+        }));
+        tw.TweenInterval(0.6);
+        tw.TweenCallback(Callable.From(QueueFree));
+    }
+
+    void ShowStep(string text, Color color, int size)
+    {
+        if (_big == null) return;
+        _big.Text = text;
+        _big.AddThemeFontSizeOverride("font_size", size);
+        _big.AddThemeColorOverride("font_color", color);
+        // Quick fade-in per beat — reads as a pulse without scale-pivot fuss.
+        _big.Modulate = new Color(1f, 1f, 1f, 0f);
+        var t = _big.CreateTween();
+        t.TweenProperty(_big, "modulate:a", 1f, 0.12f);
+    }
+}

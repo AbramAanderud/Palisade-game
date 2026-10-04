@@ -1,0 +1,52 @@
+using Godot;
+
+/// res://test/TestTitleWordmark.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Films the maze-tile "CORNERS" wordmark through the orbit range the mouse can
+/// reach, so the drag gesture can be judged without a human at the mouse. Each
+/// beat is one second: default framing, straight-down floor plan, near edge-on,
+/// yawed both ways, then zoomed in.
+///
+/// Renders the wordmark standalone in a Node3D scene — if it looks right here
+/// but wrong on the title screen, the fault is the Control-root compositing,
+/// not the geometry.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTitleWordmark : Node3D
+{
+    TitleWordmark? _wm;
+    float _t = 0f;
+    string _beat = "";
+
+    public override void _Ready()
+    {
+        _wm = new TitleWordmark { Name = "Wordmark" };
+        AddChild(_wm);
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_wm == null) return;
+        _t += (float)delta;
+
+        // (beat name, yaw, pitch, dist) — every beat is a pose the mouse can
+        // actually reach, so what the capture shows is what a player can do.
+        var (beat, yaw, pitch, dist) =
+              _t < 1.0f ? ("DEFAULT",    0.00f, 0.78f, 340f)
+            : _t < 2.0f ? ("MAX-PITCH",  0.00f, 1.25f, 340f)
+            : _t < 3.0f ? ("MIN-PITCH",  0.00f, 0.40f, 340f)
+            : _t < 4.0f ? ("YAW LEFT",  -0.15f, 0.78f, 340f)
+            : _t < 5.0f ? ("YAW RIGHT",  0.15f, 0.78f, 340f)
+            : _t < 6.0f ? ("ZOOMED IN",  0.00f, 0.78f, 310f)
+            :             ("ZOOMED OUT", 0.00f, 0.78f, 900f);
+
+        _wm.DebugSetView(yaw, pitch, dist);
+
+        if (beat != _beat)
+        {
+            _beat = beat;
+            GD.Print($"[Wordmark] t={_t:F2} beat={beat} " +
+                     $"yaw={_wm.Yaw:F2} pitch={_wm.Pitch:F2} dist={_wm.Dist:F0} " +
+                     $"tiles={_wm.TileCount}");
+        }
+    }
+}

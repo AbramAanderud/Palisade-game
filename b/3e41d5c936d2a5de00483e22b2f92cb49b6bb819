@@ -1,0 +1,135 @@
+using System.Collections.Generic;
+
+/// scripts/DesignRegions.cs
+/// Corridor zoning: partitions a maze's corridor cells into connected runs of
+/// ~4-6 pieces, assigns each run one "design" id, and makes adjacent runs use
+/// DIFFERENT ids so every zone boundary is a visible switch. A run follows the
+/// actual corridor — cells that open into each other on the same floor — so the
+/// look changes as you round a corner or pass a junction, like moving between
+/// districts.
+///
+/// Pure and deterministic: no scene tree, no RNG. Both multiplayer clients derive
+/// identical zones from identical MazeData (same discipline as PieceVariants, which
+/// consumes this), so it needs no shared seed and nothing is serialized.
+///
+/// Rooms and pits are NOT zoned here — rooms keep their per-group carpet and pits
+/// carry no per-cell decor, so both act as natural zone boundaries. Vertical stair
+/// links are never traversed, so a design also changes when you climb.
+public static class DesignRegions
+{
+    /// A zone grows until it reaches a hashed target in [MinZone, MaxZone] or its
+    /// connected frontier runs dry (small isolated stubs just end up shorter).
+    public const int MinZone = 4;
+    public const int MaxZone = 6;
+
+    // Distinct FNV salts so the size roll and the design roll don't correlate.
+    const int SizeSalt   = 4001;
+    const int DesignSalt = 4002;
+
+    static readonly Dir[] Dirs = { Dir.N, Dir.E, Dir.S, Dir.W };
+
+    /// A cell that takes part in corridor zoning: single-cell and not a room.
+    /// (Pits are multi-cell and undecorated; rooms use a per-group carpet.)
+    static bool IsCorridorCell(MazePiece p)
+        => !PieceDB.IsMultiCell(p.Type) && p.Type != PieceType.Room;
+
+    /// Maps every corridor cell to a design id in [0, designCount). Rooms and pits
+    /// are absent from the result (the caller falls back to its own per-cell hash).
+    public static Dictionary<(int X, int Y, int Floor), int> Assign(
+        IEnumerable<MazePiece> pieces, int designCount)
+    {
+        var result = new Dictionary<(int, int, int), int>();
+        if (designCount <= 0) return result;
+
+        // Index corridor cells for O(1) neighbour lookup.
+        var cellAt = new Dictionary<(int, int, int), MazePiece>();
+        foreach (var p in pieces)
+            if (IsCorridorCell(p))
+                cellAt[(p.X, p.Y, p.Floor)] = p;
+
+        // Canonical seed order (Floor, X, Y) — makes the whole assignment independent
+        // of the input list order, which is what keeps two clients in lock-step.
+        var order = new List<(int X, int Y, int Floor)>(cellAt.Keys);
+        order.Sort((a, b) =>
+        {
+            if (a.Floor != b.Floor) return a.Floor.CompareTo(b.Floor);
+            if (a.X != b.X)         return a.X.CompareTo(b.X);
+            return a.Y.CompareTo(b.Y);
+        });
+
+        // Same-floor walkable neighbours of c: a neighbour in direction d counts only
+        // if BOTH pieces open toward each other, i.e. the corridor actually connects.
+        List<(int, int, int)> Neighbours((int X, int Y, int Floor) c)
+        {
+            var list = new List<(int, int, int)>(4);
+            var me = cellAt[c];
+            Dir myOpen = PieceDB.GetOpenings(me.Type, me.Rotation);
+            foreach (var d in Dirs)
+            {
+                if ((myOpen & d) == 0) continue;                     // I don't open this way
+                var (dx, dy) = PieceDB.Delta(d);
+                var nc = (c.X + dx, c.Y + dy, c.Floor);              // same floor only
+                if (!cellAt.TryGetValue(nc, out var nb)) continue;
+                Dir nbOpen = PieceDB.GetOpenings(nb.Type, nb.Rotation);
+                if ((nbOpen & PieceDB.Opposite(d)) == 0) continue;   // neighbour opens back?
+                list.Add(nc);
+            }
+            return list;
+        }
+
+        foreach (var seed in order)
+        {
+            if (result.ContainsKey(seed)) continue;
+
+            // Grow one zone by BFS from the seed up to a hashed target size. Neighbour
+            // order is fixed (Dirs), so the grown set is fully determined by the seed.
+            int target = MinZone + (PieceVariants.Fnv(seed.X, seed.Y, seed.Floor, SizeSalt)
+                                    % (MaxZone - MinZone + 1));
+            var zone   = new List<(int, int, int)> { seed };
+            var inZone = new HashSet<(int, int, int)> { seed };
+            var queue  = new Queue<(int, int, int)>();
+            queue.Enqueue(seed);
+            while (queue.Count > 0 && zone.Count < target)
+            {
+                var cur = queue.Dequeue();
+                foreach (var nc in Neighbours(cur))
+                {
+                    if (zone.Count >= target) break;
+                    if (result.ContainsKey(nc) || inZone.Contains(nc)) continue;
+                    inZone.Add(nc);
+                    zone.Add(nc);
+                    queue.Enqueue(nc);
+                }
+            }
+
+            // Pick a design different from every ALREADY-assigned neighbour zone, so
+            // this zone's whole boundary is a visible switch. Because each later zone
+            // avoids its assigned neighbours, every boundary ends up between two
+            // different designs.
+            var forbidden = new HashSet<int>();
+            foreach (var cell in zone)
+                foreach (var nc in Neighbours(cell))
+                    if (result.TryGetValue(nc, out int nd))
+                        forbidden.Add(nd);
+
+            int design = PickDesign(seed, designCount, forbidden);
+            foreach (var cell in zone) result[cell] = design;
+        }
+
+        return result;
+    }
+
+    /// Hashed pick that skips forbidden ids, scanning deterministically from the
+    /// hashed start. Falls back to the raw hash only if a zone somehow touches
+    /// designCount-or-more distinct neighbour zones (rare in corridor layouts).
+    static int PickDesign((int X, int Y, int Floor) seed, int designCount, HashSet<int> forbidden)
+    {
+        int start = PieceVariants.Fnv(seed.X, seed.Y, seed.Floor, DesignSalt) % designCount;
+        for (int i = 0; i < designCount; i++)
+        {
+            int cand = (start + i) % designCount;
+            if (!forbidden.Contains(cand)) return cand;
+        }
+        return start;
+    }
+}

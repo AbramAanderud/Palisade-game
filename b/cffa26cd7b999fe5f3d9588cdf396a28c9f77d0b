@@ -1,0 +1,80 @@
+using Godot;
+using System.Linq;
+using System.Text.Json;
+
+/// test/TestDefaultMaze.cs
+/// Owner: "make it so everyone has access to a default maze which is just a
+/// straight line... as an option in online games." Pins DefaultMaze.Build()
+/// against MazeValidator directly (the same checks the online picker gates
+/// on) and round-trips it through the exact JSON path the relay exchange uses
+/// (OnlineDungeonArena.SetupShared / OnGameData "maze" case: JsonSerializer,
+/// no MazeSerializer/file I/O involved).
+public partial class TestDefaultMaze : Node
+{
+    int _fail;
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    public override void _Ready()
+    {
+        GD.Print("── DefaultMaze.Build() ──");
+
+        var maze = DefaultMaze.Build();
+        System.Collections.Generic.List<MazePiece> pieces = maze.Pieces ?? new();
+
+        Check(pieces != null && pieces.Count > 0, "build produces a non-empty piece list");
+        Check(maze.IsOnline, "IsOnline is true (required for both pickers' IsOnline filter)");
+
+        bool ready = MazeValidator.IsGameReady(maze, out string err);
+        Check(ready, $"MazeValidator.IsGameReady accepts the default maze ({(ready ? "" : err)})");
+
+        var offending = MazeValidator.FindOffendingCells(maze);
+        Check(offending.Count == 0, $"FindOffendingCells is empty (has {offending.Count})");
+
+        int startCount = pieces.Count(p => p.Type == PieceType.Start);
+        int exitCount  = pieces.Count(p => p.Type == PieceType.Exit);
+        Check(startCount == 1, $"exactly one Start piece (has {startCount})");
+        Check(exitCount == 1, $"exactly one Exit piece (has {exitCount})");
+
+        int otherCount = pieces.Count(p =>
+            p.Type != PieceType.Start && p.Type != PieceType.Exit && p.Type != PieceType.Straight);
+        Check(otherCount == 0, $"every non-Start/Exit piece is a Straight (found {otherCount} of some other type)");
+
+        int floor = pieces[0].Floor;
+        bool singleFloor = pieces.All(p => p.Floor == floor);
+        Check(singleFloor, "every piece sits on a single floor");
+
+        // Sensible length: "8-12 cells" per the spec, not counting Start/Exit.
+        int straightCount = pieces.Count(p => p.Type == PieceType.Straight);
+        Check(straightCount >= 8 && straightCount <= 12,
+              $"straight run length is in the requested 8-12 range (has {straightCount})");
+
+        // Sentinel must never collide with a real MazeSerializer slot index.
+        Check(DefaultMaze.SentinelSlot < 0, "SentinelSlot is negative — can never equal a real slot index (0..SlotCount-1)");
+
+        // Round-trip through the EXACT JSON path the relay exchange uses —
+        // OnlineDungeonArena.SetupShared serializes with JsonSerializer.Serialize
+        // (no MazeSerializer/file I/O), and OnGameData's "maze" case deserializes
+        // with JsonSerializer.Deserialize<MazeData> — never touching a save slot.
+        string json = JsonSerializer.Serialize(maze);
+        var roundTripped = JsonSerializer.Deserialize<MazeData>(json);
+        var rtPieces = roundTripped?.Pieces;
+        bool hasPieces = rtPieces != null;
+        Check(hasPieces, "JSON round-trip deserializes to a non-null MazeData with a piece list");
+        Check(hasPieces && rtPieces!.Count == pieces.Count,
+              $"round-tripped piece count matches ({(hasPieces ? rtPieces!.Count : -1)} vs {pieces.Count})");
+        bool piecesIdentical = hasPieces && rtPieces!
+            .Zip(pieces, (a, b) => a.Type == b.Type && a.X == b.X && a.Y == b.Y &&
+                                    a.Floor == b.Floor && a.Rotation == b.Rotation)
+            .All(same => same);
+        Check(piecesIdentical, "every round-tripped piece matches the original exactly (type/x/y/floor/rotation)");
+        Check(hasPieces && MazeValidator.IsGameReady(roundTripped, out _),
+              "the round-tripped copy is STILL game-ready — the receiver's exact code path");
+
+        GD.Print(_fail == 0 ? "RESULT OK" : $"RESULT {_fail} FAILURE(S)");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

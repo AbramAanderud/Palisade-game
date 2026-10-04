@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://testmovementfeel1"]
+
+[ext_resource type="Script" path="res://test/TestMovementFeel.cs" id="1_s"]
+
+[node name="TestMovementFeel" type="Node3D"]
+script = ExtResource("1_s")

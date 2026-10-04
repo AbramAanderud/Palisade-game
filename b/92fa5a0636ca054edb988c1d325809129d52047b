@@ -1,0 +1,126 @@
+using System.Collections.Generic;
+using Godot;
+
+/// Visual-only capture harness for the Gap 1 + Gap 2 fix (traps-task-6 palette
+/// wiring report). NOT part of the headless assertion suite — it exists purely
+/// so a human (or an agent with the Read tool) can look at what the real
+/// palette bar now renders, without needing --write-movie (crashes this build)
+/// or the --quit CLI flag (can hang).
+///
+/// Rebuilds all 16 of MazeEditor3D.Palette's thumbnails by literally reusing
+/// SetupThumbs' per-tile setup (own SubViewport, OwnWorld3D, orthographic
+/// top-down camera, ambient/sun) and calling BuildPieceInto directly — the
+/// exact same method the live palette bar and grid tiles call. All 16 render
+/// in parallel (each isolated in its own SubViewport/world), then this script
+/// blits every SubViewport's texture into one composite grid image and saves
+/// it with Image.SavePng — a manual capture, not the engine's MovieWriter.
+public partial class TestPaletteCapture : Node
+{
+    const float CS   = DungeonBuilder.CellSize;
+    const int   Th   = 256;   // per-tile capture size (bigger than the real 96px thumbnail, for legibility)
+    const int   Cols = 4;
+
+    readonly List<SubViewport> _vps   = new();
+    readonly List<PieceType>   _types = new();
+    int _frame = 0;
+
+    public override void _Ready()
+    {
+        var editor = new MazeEditor3D();   // never added to the tree — only used to call BuildPieceInto
+
+        foreach (var pt in MazeEditor3D.Palette)
+        {
+            var svp = new SubViewport
+            {
+                Name                   = $"Vp_{pt}",
+                Size                   = new Vector2I(Th, Th),
+                RenderTargetClearMode  = SubViewport.ClearMode.Once,
+                // I5 fix verification: MazeEditor3D.SetupThumbs now uses Once instead
+                // of Always (16 SubViewports re-rendering forever, most hidden behind
+                // an inactive tab, was pure waste). Mirrored here so this capture
+                // proves the SAME update mode still produces visible thumbnails for
+                // this exact SubViewport recipe (OwnWorld3D + orthographic cam +
+                // WorldEnvironment + DirectionalLight3D + BuildPieceInto), not just
+                // that Always used to work.
+                RenderTargetUpdateMode = SubViewport.UpdateMode.Once,
+                HandleInputLocally     = false,
+                OwnWorld3D             = true,
+            };
+            AddChild(svp);
+
+            var wenv = new WorldEnvironment();
+            var env  = new Godot.Environment
+            {
+                BackgroundMode     = Godot.Environment.BGMode.Color,
+                BackgroundColor    = new Color(0.07f, 0.07f, 0.09f),
+                AmbientLightSource = Godot.Environment.AmbientSource.Color,
+                AmbientLightColor  = new Color(0.45f, 0.45f, 0.45f),
+                AmbientLightEnergy = 0.75f,
+            };
+            wenv.Environment = env;
+            svp.AddChild(wenv);
+
+            var cam = new Camera3D
+            {
+                Projection = Camera3D.ProjectionType.Orthogonal,
+                Size       = CS * 1.35f,
+                Position   = new Vector3(CS * 0.5f, 60f, CS * 0.5f),
+            };
+            svp.AddChild(cam);
+            cam.LookAt(new Vector3(CS * 0.5f, 0f, CS * 0.5f), new Vector3(0, 0, -1));
+
+            var light = new DirectionalLight3D
+            {
+                Rotation    = new Vector3(-0.85f, 0.65f, 0f),
+                LightEnergy = 1.1f,
+            };
+            svp.AddChild(light);
+
+            var root = new Node3D();
+            svp.AddChild(root);
+            editor.BuildPieceInto(root, pt, 0, 0f, 0f, 0f, isActive: true);
+
+            _vps.Add(svp);
+            _types.Add(pt);
+        }
+
+        GD.Print($"[TestPaletteCapture] built {_vps.Count} thumbnail viewports (Palette.Length={MazeEditor3D.Palette.Length})");
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+        if (_frame < 6) return;   // let every SubViewport render a few frames before reading its texture
+
+        int rows = Mathf.CeilToInt(_vps.Count / (float)Cols);
+        var composite = Image.CreateEmpty(Cols * Th, rows * Th, false, Image.Format.Rgba8);
+        composite.Fill(new Color(0f, 0f, 0f));
+
+        DirAccess.MakeDirRecursiveAbsolute("res://screenshots/palette_capture");
+
+        for (int i = 0; i < _vps.Count; i++)
+        {
+            var img = _vps[i].GetTexture().GetImage();
+            int cx = (i % Cols) * Th;
+            int cy = (i / Cols) * Th;
+            composite.BlitRect(img, new Rect2I(0, 0, Th, Th), new Vector2I(cx, cy));
+            GD.Print($"[TestPaletteCapture] tile {i} = {_types[i]}");
+
+            // Also save the two glyph-vs-tile-colour risk cases (TrapIce, TrapDoor)
+            // individually at 2x scale so they can be inspected up close.
+            if (_types[i] == PieceType.TrapIce || _types[i] == PieceType.TrapDoor)
+            {
+                if (img.Duplicate() is Image big)
+                {
+                    big.Resize(Th * 2, Th * 2, Image.Interpolation.Nearest);
+                    big.SavePng($"res://screenshots/palette_capture/zoom_{_types[i]}.png");
+                }
+            }
+        }
+
+        var err = composite.SavePng("res://screenshots/palette_capture/palette_grid.png");
+        GD.Print($"[TestPaletteCapture] SavePng result: {err}");
+
+        GetTree().Quit();
+    }
+}

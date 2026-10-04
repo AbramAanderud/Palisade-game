@@ -1,0 +1,43 @@
+using System.Collections.Generic;
+
+/// test/FfaFixtures.cs — deterministic mazes for FFA layout tests and captures.
+/// Slab: every cell of `slabFloor` is a Room tile, so the footprint is the full
+/// 100×100 m square — the worst case for hallway sizing. Start sits at (4,0)
+/// on floor 0 and Exit at (exitCol, 9) on exitFloor, as the editor enforces.
+public static class FfaFixtures
+{
+    public static MazeData Slab(int exitCol, int exitFloor = 0, int slabFloor = 0)
+    {
+        var m = new MazeData { Name = $"Slab c{exitCol} f{slabFloor}", IsOnline = false };
+        m.Pieces.Add(new MazePiece { Type = PieceType.Start, X = 4, Y = 0, Floor = 0, Rotation = 0 });
+        m.Pieces.Add(new MazePiece { Type = PieceType.Exit, X = exitCol, Y = 9, Floor = exitFloor, Rotation = 0 });
+        for (int y = 0; y < 10; y++)
+            for (int x = 0; x < 10; x++)
+            {
+                if (slabFloor == 0 && x == 4 && y == 0) continue;
+                if (slabFloor == exitFloor && x == exitCol && y == 9) continue;
+                m.Pieces.Add(new MazePiece { Type = PieceType.Room, X = x, Y = y, Floor = slabFloor, RoomGroup = 1 });
+            }
+        return m;
+    }
+
+    /// Seven stacked corridor floors (−3..3) — a light-heavy stress maze.
+    /// Each floor is a full grid of Cross pieces (every wall face has sconces), and floors
+    /// are joined by a StairsUp at (0, y) per floor. Walkability is not the point; it
+    /// maximises the omni count for the perf capture.
+    public static MazeData Tall(int exitCol)
+    {
+        var m = new MazeData { Name = $"Tall c{exitCol}", IsOnline = false };
+        m.Pieces.Add(new MazePiece { Type = PieceType.Start, X = 4, Y = 0, Floor = 0 });
+        m.Pieces.Add(new MazePiece { Type = PieceType.Exit, X = exitCol, Y = 9, Floor = 0 });
+        for (int f = -3; f <= 3; f++)
+            for (int y = 0; y < 10; y++)
+                for (int x = 0; x < 10; x++)
+                {
+                    if (f == 0 && ((x == 4 && y == 0) || (x == exitCol && y == 9))) continue;
+                    var type = (x == 0 && y == f + 3 && f < 3) ? PieceType.StairsUp : PieceType.Straight;
+                    m.Pieces.Add(new MazePiece { Type = type, X = x, Y = y, Floor = f, Rotation = (x + y) % 2 });
+                }
+        return m;
+    }
+}

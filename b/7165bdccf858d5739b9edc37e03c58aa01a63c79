@@ -1,0 +1,48 @@
+using Godot;
+
+/// res://scripts/ModelRebase.cs
+/// Root script for a wrapper scene around an imported model whose export
+/// buries the mesh under tilted/scaled parents (e.g. Sketchfab GLBs). It
+/// cancels that whole parent chain so the MESH's own local axes become the
+/// wrapper's axes, then applies `MeshRotationDeg` — so a weapon can be put
+/// onto the Styloo convention (tip/barrel along +X) with one clean rotation.
+///
+/// Runs on NOTIFICATION_SCENE_INSTANTIATED: after the children exist but
+/// BEFORE the scene enters the tree — BuildFpGun / RebuildTpGun / GunSlotIcon
+/// measure the model's AABB right after Instantiate(), so fixing it any later
+/// (e.g. in _Ready) would be too late.
+public partial class ModelRebase : Node3D
+{
+    /// Rotation applied to the mesh's own local frame, in degrees.
+    [Export] public Vector3 MeshRotationDeg = Vector3.Zero;
+
+    public override void _Notification(int what)
+    {
+        if (what != NotificationSceneInstantiated) return;
+
+        var mesh = FindMesh(this);
+        if (mesh == null) { GD.PrintErr($"[ModelRebase] {Name}: no mesh found"); return; }
+
+        // The direct child that contains the mesh — that is the node we move.
+        Node3D? top = null;
+        for (Node? n = mesh; n != null && n != this; n = n.GetParent())
+            if (n.GetParent() == this) top = n as Node3D;
+        if (top == null) return;
+
+        // Transform from `top`'s frame down to the mesh (excluding top itself).
+        var below = Transform3D.Identity;
+        for (Node? n = mesh; n != null && n != top; n = n.GetParent())
+            if (n is Node3D n3) below = n3.Transform * below;
+
+        var want = new Transform3D(Basis.FromEuler(MeshRotationDeg * (Mathf.Pi / 180f)), Vector3.Zero);
+        top.Transform = want * below.AffineInverse();
+    }
+
+    static MeshInstance3D? FindMesh(Node n)
+    {
+        if (n is MeshInstance3D mi) return mi;
+        foreach (Node c in n.GetChildren())
+            if (FindMesh(c) is { } hit) return hit;
+        return null;
+    }
+}

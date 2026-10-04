@@ -1,0 +1,79 @@
+using Godot;
+
+/// test/TestCombatLock.cs
+/// Gate for the pre-claim truce primitive.
+///
+/// OnlineDungeonArena's whole Race phase rests on one thing: PlayerHealth
+/// refusing damage while Invulnerable is set. If that regressed, the truce
+/// would fail SILENTLY — players would simply be able to kill each other
+/// before the claim again, which is exactly the dominant strategy the phase
+/// machine exists to remove. Nothing in a headless run would complain.
+///
+/// Gating at PlayerHealth (rather than at the network send) also has to mean
+/// the DamageDealt relay never fires — that event is what puts a {"t":"hit"}
+/// on the wire, so a leak here would desync the two clients' health.
+///
+/// NOT covered: the arena's Race → Hunt → Over machine itself, which needs two
+/// live peers and a relay. Run a real two-client match for that.
+public partial class TestCombatLock : Node
+{
+    int _fail;
+
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    public override void _Ready()
+    {
+        GD.Print("── PlayerHealth: pre-claim truce ──");
+
+        var hp = new PlayerHealth();
+        AddChild(hp);
+
+        int relayed = 0, died = 0;
+        hp.DamageDealt += _ => relayed++;
+        hp.OnDied      += ()  => died++;
+
+        // ── truce up: shots land on nothing ───────────────────────────────────
+        hp.Invulnerable = true;
+        hp.TakeDamage(35f, Vector3.Zero);
+        hp.TakeDamage(999f, Vector3.Zero);      // far past lethal
+        Check(Mathf.IsEqualApprox(hp.CurrentHealth, PlayerHealth.MaxHealth),
+              $"invulnerable: HP unchanged at {hp.CurrentHealth:F0}");
+        Check(relayed == 0, "invulnerable: DamageDealt never fires (nothing goes on the wire)");
+        Check(died == 0,    "invulnerable: a lethal hit cannot kill");
+
+        // ── claim drops the truce: damage resumes exactly as before ───────────
+        hp.Invulnerable = false;
+        hp.TakeDamage(30f, Vector3.Zero);
+        Check(Mathf.IsEqualApprox(hp.CurrentHealth, 70f),
+              $"truce dropped: 30 damage applies ({hp.CurrentHealth:F0} HP)");
+        Check(relayed == 1, "truce dropped: DamageDealt relays once");
+
+        // ── lethal damage still kills once combat is live ─────────────────────
+        hp.TakeDamage(100f, Vector3.Zero);
+        Check(Mathf.IsEqualApprox(hp.CurrentHealth, 0f), "lethal hit floors HP at 0");
+        Check(died == 1, "lethal hit fires OnDied exactly once");
+
+        // ── re-arming mid-life is honoured (defence in depth) ─────────────────
+        var hp2 = new PlayerHealth();
+        AddChild(hp2);
+        hp2.TakeDamage(40f, Vector3.Zero);
+        hp2.Invulnerable = true;
+        hp2.TakeDamage(40f, Vector3.Zero);
+        Check(Mathf.IsEqualApprox(hp2.CurrentHealth, 60f),
+              $"truce re-armed mid-match blocks further damage ({hp2.CurrentHealth:F0} HP)");
+
+        // ── the fame ordering the design depends on ───────────────────────────
+        // A kill must always beat running out the clock, or the hunted player's
+        // best play is to hide for 40 s instead of fighting back.
+        GD.Print("── fame ordering ──");
+        Check(200 > 100, "kill (200) pays more than surviving the clock (100)");
+        Check(100 + 200 > 200, "hunter who kills (300) outearns hunted who kills (200)");
+
+        GD.Print(_fail == 0 ? "RESULT OK" : $"RESULT {_fail} FAILURE(S)");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

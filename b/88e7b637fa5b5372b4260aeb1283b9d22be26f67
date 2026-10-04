@@ -1,0 +1,151 @@
+using Godot;
+using System.Collections.Generic;
+
+/// Regression guard: Room and Pit doorways must seal against the ARCHED corridors
+/// that connect to them, with no gap at the ceiling.
+///
+/// The world background is BRIGHT MAGENTA and the dungeon interior is fully enclosed
+/// geometry, so any magenta pixel in a capture is a hole straight out of the level —
+/// the "you can see outside" symptom. Frames are swept systematically from inside the
+/// corridor (several distances, several look angles) rather than from hand-picked
+/// spots, so a gap can't hide just outside one chosen framing.
+///
+/// Cases, chosen for the geometry that actually stresses the seal:
+///   room     entry on the vault's END face — room ceiling ~17.5 m vs an 18 m corridor
+///            arch, i.e. the thin lens that caused the original bug
+///   roomside entry on the face where the vault SPRINGS — ceiling 11 m under an 18 m
+///            arch, the largest clip
+///   roomL    L-shaped group — the entry face sits off the bounding-box centre, so the
+///            ceiling above it is neither peak nor spring
+///   pit      shaft entry on a middle floor — ceiling is just the next floor level
+///   pittop   shaft entry on the TOP floor, the only one with a real vault cap
+public partial class TestRoomArchSeal : Node3D
+{
+    const float CS = DungeonBuilder.CellSize;    // 10
+    const float FH = DungeonBuilder.FloorHeight; // 18
+
+    Camera3D _cam = null!;
+    int _frame;
+    readonly List<(Vector3 pos, Vector3 look)> _shots = new();
+
+    public override void _Ready()
+    {
+        var we = new WorldEnvironment();
+        we.Environment = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(1f, 0f, 1f),   // MAGENTA = outside the level
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.75f, 0.75f, 0.78f),
+            AmbientLightEnergy = 1.0f,
+            TonemapMode        = Godot.Environment.ToneMapper.Linear,
+        };
+        AddChild(we);
+
+        string which = "room";
+        foreach (var a in OS.GetCmdlineUserArgs())
+            if (a.StartsWith("--case=")) which = a.Substring(7);
+
+        // Each case returns its maze plus the junction it wants inspected:
+        // the doorway centre, and the direction the corridor runs toward it.
+        var (data, door, approach, floor) = Make(which);
+
+        var db = new DungeonBuilder { Name = "Dungeon" };
+        AddChild(db);
+        db.Build(data);
+
+        float yBase = floor * FH;
+        // Sweep: three stand-off distances down the corridor, four look angles each.
+        foreach (float back in new[] { 4f, 9f, 15f })
+        foreach (float lookUp in new[] { 2.0f, 9f, 15f, 17.5f })
+        foreach (float side in new[] { -2f, 0f, 2f })
+        {
+            var pos  = door - approach * back + new Vector3(0, yBase + 2.5f, 0);
+            var look = door + approach * 5f + new Vector3(side, yBase + lookUp, 0);
+            _shots.Add((pos, look));
+        }
+
+        _cam = new Camera3D { Fov = 85f, Near = 0.05f, Far = 900f };
+        AddChild(_cam);
+        Apply(0);
+        _cam.MakeCurrent();
+        GD.Print($"[ArchSeal] case={which} shots={_shots.Count}");
+    }
+
+    /// (maze, doorway-centre world point at floor level, unit vector the corridor
+    /// travels toward the doorway, floor index)
+    static (MazeData, Vector3, Vector3, int) Make(string which)
+    {
+        var d = new MazeData { Name = which };
+
+        switch (which)
+        {
+            case "roomside":
+            {
+                // 3x3 room; corridor enters the WEST face, where the barrel springs.
+                for (int x = 3; x <= 5; x++)
+                for (int y = 3; y <= 5; y++)
+                    d.Pieces.Add(new MazePiece { Type = PieceType.Room, X = x, Y = y, Floor = 0, RoomGroup = 1 });
+                // Rotation 1 turns Straight's N|S into E|W.
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 2, Y = 4, Floor = 0, Rotation = 1 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 1, Y = 4, Floor = 0, Rotation = 1 });
+                return (d, new Vector3(3 * CS, 0, 4 * CS + CS * 0.5f), new Vector3(1, 0, 0), 0);
+            }
+            case "roomL":
+            {
+                // L-shape: the entry face is off the bounding box centre.
+                foreach (var (x, y) in new[] { (3, 3), (4, 3), (5, 3), (3, 4), (3, 5) })
+                    d.Pieces.Add(new MazePiece { Type = PieceType.Room, X = x, Y = y, Floor = 0, RoomGroup = 1 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 5, Y = 4, Floor = 0, Rotation = 0 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 5, Y = 5, Floor = 0, Rotation = 0 });
+                return (d, new Vector3(5 * CS + CS * 0.5f, 0, 4 * CS), new Vector3(0, 0, -1), 0);
+            }
+            case "corridor":
+            {
+                // CONTROL: no room, no pit — just corridor pieces. Any void this case
+                // reports is pre-existing corridor geometry, not the doorway seal, and
+                // is the baseline the other cases must be judged against.
+                for (int y = 1; y <= 4; y++)
+                    d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 4, Y = y, Floor = 0, Rotation = 0 });
+                return (d, new Vector3(4 * CS + CS * 0.5f, 0, 3 * CS), new Vector3(0, 0, 1), 0);
+            }
+            case "pit":
+            {
+                d.Pieces.Add(new MazePiece { Type = PieceType.Pit, X = 4, Y = 4, Floor = 0 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 4, Y = 2, Floor = 0, Rotation = 0 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 4, Y = 1, Floor = 0, Rotation = 0 });
+                return (d, new Vector3(4 * CS + CS * 0.5f, 0, 3 * CS), new Vector3(0, 0, 1), 0);
+            }
+            case "pittop":
+            {
+                // Pit anchored on floor 0 spans floors -1..1, so floor 1 is its TOP —
+                // the only level with a vault cap to clip the doorway head against.
+                d.Pieces.Add(new MazePiece { Type = PieceType.Pit, X = 4, Y = 4, Floor = 0 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 4, Y = 2, Floor = 1, Rotation = 0 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 4, Y = 1, Floor = 1, Rotation = 0 });
+                return (d, new Vector3(4 * CS + CS * 0.5f, 0, 3 * CS), new Vector3(0, 0, 1), 1);
+            }
+            default:
+            {
+                for (int x = 3; x <= 5; x++)
+                for (int y = 3; y <= 5; y++)
+                    d.Pieces.Add(new MazePiece { Type = PieceType.Room, X = x, Y = y, Floor = 0, RoomGroup = 1 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 4, Y = 2, Floor = 0, Rotation = 0 });
+                d.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = 4, Y = 1, Floor = 0, Rotation = 0 });
+                return (d, new Vector3(4 * CS + CS * 0.5f, 0, 3 * CS), new Vector3(0, 0, 1), 0);
+            }
+        }
+    }
+
+    void Apply(int i)
+    {
+        _cam.Position = _shots[i].pos;
+        _cam.LookAt(_shots[i].look, Vector3.Up);
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+        if (_frame < _shots.Count) Apply(_frame);
+    }
+}

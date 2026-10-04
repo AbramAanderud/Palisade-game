@@ -1,0 +1,130 @@
+using System;
+using System.Linq;
+using Godot;
+
+/// Headless assertion harness for Room / Pit piece metadata and connectivity.
+/// Prints one line per check and quits non-zero if any check fails.
+public partial class TestRoomPitLogic : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    public override void _Ready()
+    {
+        RunPieceDbChecks();
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+
+    void RunPieceDbChecks()
+    {
+        GD.Print("── PieceDB ──");
+
+        // Room is open on all four faces at every rotation, so any corridor that
+        // points at it connects — this is what makes "any entry way hitting the
+        // open space is valid" true without special-casing the validator.
+        for (int rot = 0; rot < 4; rot++)
+            foreach (Dir d in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+                Check(PieceDB.HasSameFloorOpening(PieceType.Room, rot, d),
+                      $"Room rot={rot} has same-floor opening {d}");
+
+        // Pit is likewise open on all faces — every perimeter slot is a doorway.
+        for (int rot = 0; rot < 4; rot++)
+            foreach (Dir d in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+                Check(PieceDB.HasSameFloorOpening(PieceType.Pit, rot, d),
+                      $"Pit rot={rot} has same-floor opening {d}");
+
+        // Neither is a stair — they must not go down the stair code paths.
+        Check(!PieceDB.IsStair(PieceType.Room), "Room is not a stair");
+        Check(!PieceDB.IsStair(PieceType.Pit),  "Pit is not a stair");
+
+        // Footprints.
+        Check(PieceDB.Footprint(PieceType.Room).Length == 1,
+              "Room footprint is a single cell");
+        Check(PieceDB.Footprint(PieceType.Straight).Length == 1,
+              "Straight footprint is a single cell");
+
+        var pitCells = PieceDB.Footprint(PieceType.Pit);
+        Check(pitCells.Length == 9, "Pit footprint covers 9 cells");
+        Check(pitCells.Contains((0, 0)),   "Pit footprint includes its anchor");
+        Check(pitCells.Contains((-1, -1)), "Pit footprint includes (-1,-1)");
+        Check(pitCells.Contains((1, 1)),   "Pit footprint includes (1,1)");
+        Check(pitCells.All(c => Math.Abs(c.dx) <= 1 && Math.Abs(c.dy) <= 1),
+              "Pit footprint stays within a 3x3");
+        Check(pitCells.Distinct().Count() == 9, "Pit footprint has no duplicate cells");
+
+        // Floor spans.
+        Check(PieceDB.FloorSpan(PieceType.Room).SequenceEqual(new[] { 0 }),
+              "Room occupies only its own floor");
+        Check(PieceDB.FloorSpan(PieceType.Straight).SequenceEqual(new[] { 0 }),
+              "Straight occupies only its own floor");
+        Check(PieceDB.FloorSpan(PieceType.Pit).OrderBy(f => f).SequenceEqual(new[] { -1, 0, 1 }),
+              "Pit spans one floor down, its own, and one up");
+
+        // IsMultiCell.
+        Check(PieceDB.IsMultiCell(PieceType.Pit),   "Pit is multi-cell");
+        Check(!PieceDB.IsMultiCell(PieceType.Room), "Room is NOT multi-cell (painted per tile)");
+        Check(!PieceDB.IsMultiCell(PieceType.Cross), "Cross is not multi-cell");
+
+        // Palette metadata must exist or the editor will throw on open.
+        foreach (var pt in new[] { PieceType.Room, PieceType.Pit })
+        {
+            Check(PieceDB.Colors.ContainsKey(pt),      $"{pt} has a Color");
+            Check(PieceDB.Labels.ContainsKey(pt),      $"{pt} has a Label");
+            Check(PieceDB.ShortLabels.ContainsKey(pt), $"{pt} has a ShortLabel");
+            Check(PieceDB.GoldCosts.ContainsKey(pt),   $"{pt} has a GoldCost");
+        }
+
+        Check(PieceDB.CategoryOf(PieceType.Room) == PieceCategory.Structure,
+              "Room is in the Structure tab");
+        Check(PieceDB.CategoryOf(PieceType.Pit) == PieceCategory.Traversal,
+              "Pit is in the Traversal tab");
+
+        RunAliasingChecks();
+    }
+
+    // Footprint/FloorSpan must hand back a fresh array every call. They are
+    // backed by shared static readonly arrays (SingleCell/ThreeByThree,
+    // SingleFloor/ThreeFloors) — if a caller's in-place mutation leaked into
+    // that backing array, every other piece type sharing it would be
+    // silently corrupted for the rest of the process's lifetime.
+    void RunAliasingChecks()
+    {
+        GD.Print("── PieceDB aliasing (Footprint/FloorSpan return copies) ──");
+
+        // Mutating a Footprint result must not affect a later call for the same type.
+        var room1 = PieceDB.Footprint(PieceType.Room);
+        room1[0] = (9, 9);
+        var room2 = PieceDB.Footprint(PieceType.Room);
+        Check(room2[0] == (0, 0),
+              "Footprint(Room) mutation does not persist across calls");
+
+        // Mutating a Footprint result for one type must not affect a different
+        // type that shares the same backing array (Room and Straight both
+        // route through SingleCell).
+        var roomFootprint = PieceDB.Footprint(PieceType.Room);
+        roomFootprint[0] = (7, 7);
+        var straightFootprint = PieceDB.Footprint(PieceType.Straight);
+        Check(straightFootprint[0] == (0, 0),
+              "Footprint(Room) mutation does not leak into Footprint(Straight)");
+
+        // Same two checks for FloorSpan.
+        var span1 = PieceDB.FloorSpan(PieceType.Room);
+        span1[0] = 99;
+        var span2 = PieceDB.FloorSpan(PieceType.Room);
+        Check(span2[0] == 0,
+              "FloorSpan(Room) mutation does not persist across calls");
+
+        var roomSpan = PieceDB.FloorSpan(PieceType.Room);
+        roomSpan[0] = 42;
+        var straightSpan = PieceDB.FloorSpan(PieceType.Straight);
+        Check(straightSpan[0] == 0,
+              "FloorSpan(Room) mutation does not leak into FloorSpan(Straight)");
+    }
+}

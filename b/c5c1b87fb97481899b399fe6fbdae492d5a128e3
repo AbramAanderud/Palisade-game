@@ -1,0 +1,73 @@
+using System.Collections.Generic;
+using System.Linq;
+
+/// Pure, deterministic rules for a 3-4 player last-standing free-for-all.
+/// Every client feeds the same network events into its own instance.
+public sealed class FfaMatch
+{
+    public const float ClockSeconds = 480f;
+    public const int FameFirst = 300, FameSecond = 150, FameThird = 50, FameKill = 50, FamePickup = 100;
+
+    readonly List<int> _seats;
+    readonly HashSet<int> _eliminated = new();
+    readonly List<int> _order = new();
+    readonly Dictionary<int, float> _damage = new();
+    readonly Dictionary<int, int> _kills = new();
+    readonly HashSet<int> _pickups = new();
+
+    public FfaMatch(IEnumerable<int> seats)
+    {
+        _seats = seats.Distinct().OrderBy(s => s).ToList();
+    }
+
+    public IReadOnlyCollection<int> Seats => _seats;
+    public IReadOnlyCollection<int> Alive => _seats.Where(s => !_eliminated.Contains(s)).ToList();
+    public IReadOnlyList<int> EliminationOrder => _order;
+
+    public float DamageBy(int seat) => _damage.TryGetValue(seat, out var d) ? d : 0f;
+    public int KillsBy(int seat) => _kills.TryGetValue(seat, out var k) ? k : 0;
+    public bool HasPickup(int seat) => _pickups.Contains(seat);
+
+    public void RecordDamage(int by, int victim, float amt)
+    {
+        if (by < 0 || !_seats.Contains(by)) return;
+        _damage[by] = DamageBy(by) + amt;
+    }
+
+    public void RecordDeath(int victim, int by)
+    {
+        if (!Eliminate(victim)) return;
+        if (by >= 0 && by != victim && _seats.Contains(by)) _kills[by] = KillsBy(by) + 1;
+    }
+
+    public void RecordLeave(int seat) => Eliminate(seat);
+
+    public void RecordPickup(int seat) { if (_seats.Contains(seat)) _pickups.Add(seat); }
+
+    bool Eliminate(int seat)
+    {
+        if (!_seats.Contains(seat) || !_eliminated.Add(seat)) return false;
+        _order.Add(seat);
+        return true;
+    }
+
+    public bool IsOver => Alive.Count <= 1;
+
+    /// Final order, best first. See task brief for tie-breaks.
+    public IReadOnlyList<int> Placements(bool clockExpired)
+    {
+        IEnumerable<int> survivors = _seats.Where(s => !_eliminated.Contains(s));
+        survivors = clockExpired
+            ? survivors.OrderByDescending(DamageBy).ThenByDescending(KillsBy).ThenBy(s => s)
+            : survivors.OrderBy(s => s);
+        return survivors.Concat(Enumerable.Reverse(_order)).ToList();
+    }
+
+    public int Fame(int seat, bool clockExpired)
+    {
+        int place = Placements(clockExpired).ToList().IndexOf(seat);
+        if (place < 0) return 0;
+        int f = place switch { 0 => FameFirst, 1 => FameSecond, 2 => FameThird, _ => 0 };
+        return f + KillsBy(seat) * FameKill + (HasPickup(seat) ? FamePickup : 0);
+    }
+}

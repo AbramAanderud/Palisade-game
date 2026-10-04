@@ -1,0 +1,198 @@
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Godot;
+
+/// test/TestArenaDoors.cs
+/// Golden: a fingerprint of today's N/S arena — every mesh triangle with its
+/// winding, every collision shape's world AABB (concave shapes additionally
+/// get a content hash + face count over their triangle geometry), every
+/// MultiMeshInstance3D's instance count and node origin, every light position
+/// — is recorded BEFORE the door-angle refactor with `-- record`, and compared
+/// after. 1v1's arena must stay identical. New: with doors at N/E/S/W, a ray
+/// from the centre passes through each doorway and hits the wall at 45°.
+///
+/// NOT covered headless: per-instance decor PLACEMENT inside a MultiMesh.
+/// Under --headless, MultiMesh instance-transform buffers aren't kept
+/// server-side, so `Multimesh.GetInstanceTransform(i)` reads back identity for
+/// every instance — fingerprinting per-instance transforms was silently
+/// fingerprinting nothing but a constant. The fingerprint instead records one
+/// line per MultiMeshInstance3D (node name + instance count + the node's own
+/// origin relative to the arena), which is real, deterministic signal: it
+/// catches a batch appearing/disappearing or changing count, just not a
+/// single instance's placement moving within an unchanged count.
+///
+/// (Recording history: the four-door and single-door blocks below were
+/// temporarily wrapped in `#if ARENA_DOORS_NEW` while the golden was recorded
+/// against the pre-refactor ArenaBuilder, since the
+/// `Build(Vector3, IReadOnlyList<float>)` overload they call did not exist
+/// yet. The guard is gone now that the refactor has landed.)
+public partial class TestArenaDoors : Node
+{
+    const string GoldenPath = "res://test/golden/arena_doors.txt";
+    int _fail;
+    void Check(bool ok, string label) { GD.Print((ok ? "PASS  " : "FAIL  ") + label); if (!ok) _fail++; }
+
+    static string R(Vector3 v) => $"{v.X:F2},{v.Y:F2},{v.Z:F2}";
+
+    // FNV-1a over the F2-formatted, arena-relative vertex strings of a concave
+    // shape's faces, taken in GetFaces() order (not sorted) — a stable content
+    // hash so a change to the collision geometry's actual triangles shows up
+    // even though `C|` only records the shape's overall AABB.
+    static uint Fnv1a(IEnumerable<string> parts)
+    {
+        uint hash = 2166136261u;
+        foreach (var part in parts)
+            foreach (byte b in Encoding.UTF8.GetBytes(part))
+            {
+                hash ^= b;
+                hash *= 16777619u;
+            }
+        return hash;
+    }
+
+    static string Fingerprint(ArenaBuilder a)
+    {
+        var lines = new List<string>();
+        var inv = a.GlobalTransform.AffineInverse();
+        foreach (var n in a.FindChildren("*", "", true, false))
+        {
+            if (n is MeshInstance3D mi && mi.Mesh != null)
+            {
+                var xf = inv * mi.GlobalTransform;
+                for (int s = 0; s < mi.Mesh.GetSurfaceCount(); s++)
+                {
+                    var arr = mi.Mesh.SurfaceGetArrays(s);
+                    var v = arr[(int)Mesh.ArrayType.Vertex].AsVector3Array();
+                    var idx = arr[(int)Mesh.ArrayType.Index].VariantType == Variant.Type.Nil
+                        ? Enumerable.Range(0, v.Length).ToArray()
+                        : arr[(int)Mesh.ArrayType.Index].AsInt32Array();
+                    for (int t = 0; t + 2 < idx.Length; t += 3)
+                    {
+                        var tri = new[] { R(xf * v[idx[t]]), R(xf * v[idx[t + 1]]), R(xf * v[idx[t + 2]]) };
+                        int m = 0;   // canonical cyclic start (keeps winding)
+                        for (int k = 1; k < 3; k++) if (string.CompareOrdinal(tri[k], tri[m]) < 0) m = k;
+                        lines.Add($"T|{tri[m]}|{tri[(m + 1) % 3]}|{tri[(m + 2) % 3]}");
+                    }
+                }
+            }
+            else if (n is MultiMeshInstance3D mm && mm.Multimesh != null)
+                lines.Add($"M|{mm.Name}|{mm.Multimesh.InstanceCount}|{R((inv * mm.GlobalTransform).Origin)}");
+            else if (n is CollisionShape3D cs && cs.Shape != null)
+            {
+                var xf = inv * cs.GlobalTransform;
+                var box = xf * cs.Shape.GetDebugMesh().GetAabb();
+                lines.Add($"C|{cs.Shape.GetType().Name}|{R(box.Position)}|{R(box.Size)}");
+                if (cs.Shape is ConcavePolygonShape3D concave)
+                {
+                    var faces = concave.GetFaces();
+                    var verts = new string[faces.Length];
+                    for (int i = 0; i < faces.Length; i++) verts[i] = R(xf * faces[i]);
+                    lines.Add($"CF|{cs.Shape.GetType().Name}|{faces.Length / 3}|{Fnv1a(verts):x8}");
+                }
+            }
+            else if (n is OmniLight3D l)
+                lines.Add($"L|{R((inv * l.GlobalTransform).Origin)}");
+        }
+        lines.Sort(string.CompareOrdinal);
+        return string.Join("\n", lines);
+    }
+
+    ArenaBuilder Make(System.Action<ArenaBuilder> build)
+    {
+        var a = new ArenaBuilder { Name = "Arena", GrassInnerRadius = AltarBuilder.BaseRadius };
+        AddChild(a);
+        build(a);
+        return a;
+    }
+
+    public override async void _Ready()
+    {
+        bool record = OS.GetCmdlineUserArgs().Contains("record");
+        var cases = new (string name, System.Action<ArenaBuilder> build)[]
+        {
+            ("NS",    a => a.Build(Vector3.Zero, openNorth: true,  openSouth: true)),
+            ("Nonly", a => a.Build(Vector3.Zero, openNorth: true,  openSouth: false)),
+        };
+        var sb = new StringBuilder();
+        foreach (var (name, build) in cases)
+        {
+            var a = Make(build);
+            sb.Append($"### {name}\n{Fingerprint(a)}\n");
+            a.Free();
+        }
+        if (record)
+        {
+            using var f = FileAccess.Open(GoldenPath, FileAccess.ModeFlags.Write);
+            f.StoreString(sb.ToString());
+            GD.Print($"RECORDED {GoldenPath}");
+            GetTree().Quit(0);
+            return;
+        }
+        var golden = FileAccess.GetFileAsString(GoldenPath);
+        bool same = golden == sb.ToString();
+        if (!same)
+        {
+            using var f = FileAccess.Open("user://arena_doors_actual.txt", FileAccess.ModeFlags.Write);
+            f.StoreString(sb.ToString());
+            GD.Print("diff against " + ProjectSettings.GlobalizePath("user://arena_doors_actual.txt"));
+        }
+        Check(same, "N/S and N-only arenas identical to the pre-refactor golden");
+
+        // Four doors: rays through each doorway, blocked at 45°
+        var four = Make(a => a.Build(Vector3.Zero, new float[] { 0f, Mathf.Pi / 2, Mathf.Pi, 3 * Mathf.Pi / 2 }));
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        var space = four.GetWorld3D().DirectSpaceState;
+        foreach (var (label, ang) in new[] { ("N", 0f), ("E", Mathf.Pi / 2), ("S", Mathf.Pi), ("W", 3 * Mathf.Pi / 2) })
+        {
+            foreach (float y in new[] { 1f, 5f })
+            {
+                var to = new Vector3(Mathf.Sin(ang), 0f, -Mathf.Cos(ang)) * 40f + Vector3.Up * y;
+                var hit = space.IntersectRay(PhysicsRayQueryParameters3D.Create(Vector3.Up * y, to));
+                Check(hit.Count == 0, $"door {label}: ray at y={y} passes through the doorway");
+            }
+        }
+        foreach (float deg in new[] { 45f, 135f, 225f, 315f })
+        {
+            float ang = Mathf.DegToRad(deg);
+            var to = new Vector3(Mathf.Sin(ang), 0f, -Mathf.Cos(ang)) * 40f + Vector3.Up;
+            var hit = space.IntersectRay(PhysicsRayQueryParameters3D.Create(Vector3.Up, to));
+            Check(hit.Count > 0, $"wall at {deg}° blocks");
+        }
+
+        // Above the arch curve but below the wall top, the doorway is sealed
+        // by the arch/lintel panel (AddArchDoorway's domeST quads run from the
+        // parabola up to ArenaWallH) — a ray through the doorway centre at
+        // that height must HIT it, not pass through like the checks above.
+        {
+            float peak = DungeonBuilder.CellHeight + DungeonBuilder.ArchRise;   // SpringY + ArchRise ≈ 18m
+            float y = peak + 2f;                                               // ≈20m, well below ArenaWallH (108m)
+            var to = Vector3.Right * 40f + Vector3.Up * y;
+            var hit = space.IntersectRay(PhysicsRayQueryParameters3D.Create(Vector3.Up * y, to));
+            Check(hit.Count > 0, $"door E: ray at y={y:F0} (above the arch) hits the arch/lintel panel");
+        }
+        four.Free();
+
+        // Single door (E only): the opposite side (W) must stay walled, and
+        // the open side (E) must still pass — the NearDoor/DoorwayBay checks
+        // must not accidentally key off "is this a 2-door arena".
+        var one = Make(a => a.Build(Vector3.Zero, new float[] { Mathf.Pi / 2 }));
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        await ToSignal(GetTree(), SceneTree.SignalName.PhysicsFrame);
+        var oneSpace = one.GetWorld3D().DirectSpaceState;
+        {
+            var toE = Vector3.Right * 40f + Vector3.Up;
+            var hitE = oneSpace.IntersectRay(PhysicsRayQueryParameters3D.Create(Vector3.Up, toE));
+            Check(hitE.Count == 0, "single door (E): ray at y=1 toward E passes through the doorway");
+
+            var toW = Vector3.Left * 40f + Vector3.Up;
+            var hitW = oneSpace.IntersectRay(PhysicsRayQueryParameters3D.Create(Vector3.Up, toW));
+            Check(hitW.Count > 0, "single door (E): ray at y=1 toward W hits the wall");
+        }
+        one.Free();
+
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

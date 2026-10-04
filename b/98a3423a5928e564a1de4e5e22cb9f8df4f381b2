@@ -1,0 +1,12 @@
+using Godot;
+
+/// A world object that reacts to being hit by a hitscan shot — e.g. a shooting-gate
+/// target. GunCombat.FireHitscan calls OnShot on any ray-hit collider that implements
+/// this, so non-damageable shootables work without going through the player-damage
+/// path (they carry no PlayerHealth, so TallyHit ignores them).
+public interface IShootable
+{
+    /// Called once per pellet that lands on this object. `hitPos` is the world-space
+    /// impact point.
+    void OnShot(Vector3 hitPos);
+}

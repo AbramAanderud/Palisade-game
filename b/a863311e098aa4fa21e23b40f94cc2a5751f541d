@@ -1,0 +1,82 @@
+using System.Collections.Generic;
+
+/// res://scripts/TrapDB.cs — Trap piece metadata and tuning.
+///
+/// Every trap declares Dir.N | Dir.S openings, so PieceDB, MazeValidator,
+/// DungeonBuilder.AddPiece and the editor's placement rules all treat a trap as an
+/// ordinary Straight corridor. A trap is corridor geometry PLUS dressing PLUS a
+/// behaviour node. That is deliberate: it is what keeps this feature from touching
+/// the fragile connection/rotation code at all.
+///
+/// DESIGN RULE: no trap in this file deals damage. They cost the opponent SECONDS.
+/// The game is a timed escape; the clock is the pressure, not HP.
+
+/// How a trap draws itself on its editor thumbnail and grid tile.
+public enum TrapGlyph
+{
+    Chevrons,    // ice   — slide direction
+    Drag,        // tar   — downward drag marks
+    Snuffed,     // dark  — a dead torch
+    DownArrow,   // door  — falls to the floor below
+    BigArrow,    // gate  — the one legal direction
+    PushArrows,  // push  — shove direction
+    Portal,      // warp  — linked ring
+    WallHatch,   // grease— hatched walls
+}
+
+public static class TrapDB
+{
+    // ── Tuning ────────────────────────────────────────────────────────────────
+    /// Slick floor: friction and ground acceleration multipliers. Near-zero friction
+    /// is what makes you overshoot a junction; the low accel stops you simply
+    /// re-accelerating out of the skid.
+    public const float IceFrictionMul = 0.06f;
+    public const float IceAccelMul    = 0.15f;
+
+    /// Slow field: top-speed and acceleration multipliers. Blunt, and the point.
+    public const float TarSpeedMul    = 0.45f;
+    public const float TarAccelMul    = 0.50f;
+
+    /// Push tile: constant acceleration, m/s², along the tile's facing direction.
+    /// Tuned below SprintAccel (45) so a sprinting player can still make headway
+    /// into it — slowly. Being unable to advance at all would be a wall, not a trap.
+    public const float PushAccel      = 14.0f;
+
+    /// Trapdoor: seconds of contact before the floor gives way, then seconds until
+    /// it re-arms. The delay is what sells the "it looked solid" beat.
+    public const float TrapdoorDelay  = 0.35f;
+    public const float TrapdoorRearm  = 4.0f;
+
+    /// Teleport pad: seconds before a pad can fire again, so arriving on the exit
+    /// pad does not immediately bounce you back.
+    public const float TeleportCooldown = 2.0f;
+
+    // ── Metadata ──────────────────────────────────────────────────────────────
+    // The active trap set. Ice, Darkness, Push and Greased-Walls were removed; the
+    // Tar/Sludge tile now also greases walls (the old Greased-Walls effect folded in).
+    // The removed PieceTypes stay in the enum + PieceDB dictionaries so old saves still
+    // load — they're simply absent here, so IsTrap is false and they build as plain
+    // corridors with no trap behaviour.
+    static readonly Dictionary<PieceType, TrapGlyph> Glyphs = new()
+    {
+        [PieceType.TrapTar]    = TrapGlyph.Drag,
+        [PieceType.TrapDoor]   = TrapGlyph.DownArrow,
+        [PieceType.TrapGate]   = TrapGlyph.BigArrow,
+        [PieceType.TrapPortal] = TrapGlyph.Portal,
+    };
+
+    /// True for any trap piece.
+    public static bool IsTrap(PieceType t) => Glyphs.ContainsKey(t);
+
+    /// True when the piece's rotation changes its BEHAVIOUR, not just its geometry.
+    /// Directional traps get a big arrow on their editor tile. Nothing is directional
+    /// now — the gate is a symmetric shoot-to-open wall, not a one-way passage.
+    public static bool IsDirectional(PieceType t) => false;
+
+    /// Editor glyph for a trap. Throws for non-traps — call IsTrap first.
+    public static TrapGlyph Glyph(PieceType t) => Glyphs[t];
+
+    /// Editor tile / thumbnail color. Mirrors PieceDB.Colors so trap code has one
+    /// place to look.
+    public static Godot.Color EditorColor(PieceType t) => PieceDB.Colors[t];
+}

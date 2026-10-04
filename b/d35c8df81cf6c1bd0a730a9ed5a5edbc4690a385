@@ -1,0 +1,35 @@
+@echo off
+REM Launches TWO game windows (Alice and Bob) against the PRODUCTION relay on
+REM Render — the real internet path, for feeling genuine online latency.
+REM No local relay is started and --local is NOT passed: release builds default
+REM to wss://palisade-relay.onrender.com (see NetworkManager.RelayUrl).
+REM
+REM NOTE: if the Render service is on the free plan it sleeps when idle — the
+REM first connect can take ~30-60 s while it wakes. Open the lobby and wait.
+
+setlocal
+
+set EXE=build\windows\Corners.exe
+if not exist "%EXE%" (
+  echo.
+  echo  [!] %EXE% not found.
+  echo      Open Godot and use Project ^> Export to build a Windows binary into build\windows\.
+  echo.
+  pause
+  exit /b 1
+)
+
+echo Launching Alice (Render relay) ...
+start "Corners - Alice (online)" "%EXE%" --account alice
+
+timeout /t 1 /nobreak >nul
+
+echo Launching Bob (Render relay) ...
+start "Corners - Bob (online)"   "%EXE%" --account bob
+
+echo.
+echo  Two windows opened, both routed through the Render relay.
+echo  Every packet goes machine -^> Render -^> machine, so you feel the real
+echo  round-trip latency even though both windows run on this PC.
+echo.
+endlocal

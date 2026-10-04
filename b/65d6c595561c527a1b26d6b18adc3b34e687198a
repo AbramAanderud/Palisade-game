@@ -1,0 +1,568 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// Headless assertion harness for trap metadata and pairing logic, plus a
+/// scene-level regression check that a Darkness Zone cell never gets a lit prop.
+public partial class TestTraps : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    static readonly PieceType[] AllTraps =
+    {
+        PieceType.TrapIce, PieceType.TrapTar, PieceType.TrapDark, PieceType.TrapDoor,
+        PieceType.TrapGate, PieceType.TrapPush, PieceType.TrapPortal, PieceType.TrapGrease,
+    };
+
+    public override void _Ready()
+    {
+        GD.Print("── TrapDB ──");
+
+        foreach (var t in AllTraps)
+        {
+            Check(TrapDB.IsTrap(t), $"{t} is a trap");
+            Check(PieceDB.CategoryOf(t) == PieceCategory.Traps, $"{t} is in the Traps tab");
+            Check(PieceDB.Colors.ContainsKey(t),      $"{t} has a Color");
+            Check(PieceDB.Labels.ContainsKey(t),      $"{t} has a Label");
+            Check(PieceDB.ShortLabels.ContainsKey(t), $"{t} has a ShortLabel");
+            Check(PieceDB.GoldCosts.ContainsKey(t),   $"{t} has a GoldCost");
+
+            // Every trap is a straight corridor as far as the rest of the codebase
+            // is concerned. That is what lets validator BFS, DungeonBuilder.AddPiece
+            // and editor placement accept traps with zero changes.
+            Dir open = PieceDB.GetOpenings(t, 0);
+            Check(open == (Dir.N | Dir.S), $"{t} at rot=0 opens N|S like a Straight");
+            Check(!PieceDB.IsStair(t),     $"{t} is not a stair");
+            Check(!PieceDB.IsMultiCell(t), $"{t} is single-cell");
+        }
+
+        Check(!TrapDB.IsTrap(PieceType.Straight), "Straight is not a trap");
+        Check(!TrapDB.IsTrap(PieceType.Cross),    "Cross is not a trap");
+
+        // Only the gate and the push tile care which way they face.
+        Check(TrapDB.IsDirectional(PieceType.TrapGate), "gate is directional");
+        Check(TrapDB.IsDirectional(PieceType.TrapPush), "push tile is directional");
+        Check(!TrapDB.IsDirectional(PieceType.TrapIce), "ice is not directional");
+        Check(!TrapDB.IsDirectional(PieceType.TrapTar), "tar is not directional");
+
+        // Every trap needs an editor glyph, and glyphs must be distinguishable —
+        // the whole point is that a maze author can read the trap at a glance.
+        var glyphs = AllTraps.Select(TrapDB.Glyph).ToArray();
+        Check(glyphs.Distinct().Count() == AllTraps.Length,
+              "every trap has a distinct editor glyph");
+
+        // Editor colors must be distinct too.
+        var colors = AllTraps.Select(t => PieceDB.Colors[t]).ToArray();
+        Check(colors.Distinct().Count() == AllTraps.Length,
+              "every trap has a distinct editor color");
+
+        // Tuning values must actually hinder, in the right direction.
+        Check(TrapDB.IceFrictionMul  < 1f && TrapDB.IceFrictionMul  > 0f, "ice reduces friction");
+        Check(TrapDB.IceAccelMul     < 1f && TrapDB.IceAccelMul     > 0f, "ice reduces accel");
+        Check(TrapDB.TarSpeedMul     < 1f && TrapDB.TarSpeedMul     > 0f, "tar reduces top speed");
+        Check(TrapDB.TarAccelMul     < 1f && TrapDB.TarAccelMul     > 0f, "tar reduces accel");
+        Check(TrapDB.PushAccel       > 0f, "push tile accelerates");
+        Check(TrapDB.TrapdoorDelay   > 0f, "trapdoor has an opening delay");
+        Check(TrapDB.TrapdoorRearm   > TrapDB.TrapdoorDelay, "trapdoor re-arms after it opens");
+        Check(TrapDB.TeleportCooldown > 0f, "teleport pad has a cooldown");
+
+        // ── Darkness Zone must never carry a lit prop ───────────────────────
+        // Regression for the reviewed bug: AddMidCorridorProp's variant==1
+        // roll spawns PropLibrary.Instance("candelabra_a", withLight: true) —
+        // a REAL OmniLight3D child — on any straight N|S/E|W corridor, and
+        // TrapDark IS one (fixed Dir.N|Dir.S). PieceVariants.ApplyVariant now
+        // guards that call for TrapDark the same way it already guarded
+        // AddSconces.
+        //
+        // Coordinates below were picked by replicating PieceVariants.Fnv/
+        // VariantIndex offline (VariantIndex hashes in (int)PieceType, so the
+        // SAME coordinate lands in different variant buckets for different
+        // piece types — do not assume otherwise):
+        //   - (3, 0, floor 0, rot 0) as TrapDark lands in variant bucket 1
+        //     (the candelabra bucket) AND its AddSconces E/W rolls (that roll
+        //     is independent of piece Type) both come out "unlit" — so if
+        //     this cell has ANY light at all after the fix, that is exactly
+        //     the bug.
+        //   - (2, 0, floor 0, rot 0) as plain Straight independently lands in
+        //     variant bucket 1 too, guaranteeing its candelabra fires — this
+        //     is the control, proving the harness actually detects a lit prop
+        //     when the GLB/light pipeline is working, instead of the TrapDark
+        //     check above passing vacuously (e.g. because the GLB failed to
+        //     load in this headless run).
+        GD.Print("── Darkness Zone: no lit prop regression ──");
+        {
+            var darkDungeon = new DungeonBuilder();
+            AddChild(darkDungeon);   // must be in the tree before Build — AddSconces' LookAt requires it
+            darkDungeon.Build(new MazeData
+            {
+                Name   = "DarkZoneLightCheck",
+                Pieces = new List<MazePiece> {
+                    new() { Type = PieceType.TrapDark, X = 3, Y = 0, Floor = 0, Rotation = 0 },
+                },
+            });
+            var darkBody = darkDungeon.GetNodeOrNull<StaticBody3D>("Cell_3_0_0");
+            Check(darkBody != null, "TrapDark cell body was built");
+            Check(darkBody != null && !HasLight(darkBody),
+                  "TrapDark cell has zero OmniLight3D descendants (no lit candelabra/sconce)");
+
+            var controlDungeon = new DungeonBuilder();
+            AddChild(controlDungeon);
+            controlDungeon.Build(new MazeData
+            {
+                Name   = "DarkZoneLightCheckControl",
+                Pieces = new List<MazePiece> {
+                    new() { Type = PieceType.Straight, X = 2, Y = 0, Floor = 0, Rotation = 0 },
+                },
+            });
+            var controlBody = controlDungeon.GetNodeOrNull<StaticBody3D>("Cell_2_0_0");
+            Check(controlBody != null, "control Straight cell body was built");
+            Check(controlBody != null && HasLight(controlBody),
+                  "control Straight cell (independently variant==1) DOES get a lit prop — harness is not vacuous");
+
+            darkDungeon.Free();
+            controlDungeon.Free();
+        }
+
+        // ── OneWayGateNode arm/shut logic ───────────────────────────────────
+        // Drives OnEnter/OnExit directly with a synthetic PlayerController and
+        // synthetic Velocity — the exact same entry points the real Area3D
+        // BodyEntered/BodyExited signals call — so this proves the gate's
+        // direction/arm/shut state machine itself, not just a screenshot of it
+        // apparently working.
+        GD.Print("── OneWayGateNode arm/shut logic ──");
+        {
+            var facing = new Vector3(0f, 0f, 1f); // arbitrary "legal" direction (south)
+
+            // OnExit (post-I3-fix) reads body.GlobalPosition and GlobalPosition on
+            // itself, and Godot's Node3D.get_global_transform() hard-errors and
+            // silently substitutes an identity transform for a node that is not
+            // inside the SceneTree (same gotcha documented on TeleportPadNode's
+            // tests below) — so both the gate and the player must be real
+            // AddChild'd children of this test node, not bare `new` instances, or
+            // every position check below would compare (0,0,0) against (0,0,0)
+            // and pass vacuously regardless of which side the player actually left.
+            (OneWayGateNode gate, StaticBody3D bars, CollisionShape3D col) MakeGateRig()
+            {
+                var bars = new StaticBody3D();
+                var col  = new CollisionShape3D { Shape = new BoxShape3D() };
+                bars.AddChild(col);
+                bars.Visible = false;   // matches AddGate's initial state
+                col.Disabled = true;
+                var gate = new OneWayGateNode { Bars = bars, Facing = facing };
+                AddChild(gate);   // gate sits at the origin — GlobalPosition == Vector3.Zero
+                return (gate, bars, col);
+            }
+
+            PlayerController MakePlayer(Vector3 velocity, Vector3 position)
+            {
+                var player = new PlayerController { Velocity = velocity };
+                AddChild(player);
+                player.GlobalPosition = position;
+                return player;
+            }
+
+            void FreeGateRig(OneWayGateNode gate, StaticBody3D bars, PlayerController player)
+            {
+                RemoveChild(player); player.Free();
+                RemoveChild(gate);   gate.Free();
+                bars.Free();
+            }
+
+            // Case 1: travelling WITH the facing, then exiting the FAR side (position
+            // has moved past the gate along Facing) — arms, then shuts and drops the
+            // bars. This is the legitimate "committed and passed through" path.
+            {
+                var (gate, bars, col) = MakeGateRig();
+                var player = MakePlayer(facing * 6f, gate.GlobalPosition);
+                gate.OnEnter(player);
+                Check(gate.DebugArmed, "legal-direction entry: gate arms");
+                Check(!gate.DebugShut, "legal-direction entry alone (still inside): not shut yet");
+
+                player.GlobalPosition = gate.GlobalPosition + facing * 5f;   // walked out the far side
+                gate.OnExit(player);
+                Check(gate.DebugShut,     "exit through the far side after arming: gate shuts");
+                Check(bars.Visible,       "shut gate: bars become visible");
+                Check(!col.Disabled,      "shut gate: bars collision re-enabled");
+
+                FreeGateRig(gate, bars, player);
+            }
+
+            // Case 1b (I3 regression): travelling WITH the facing (arms the gate),
+            // then backing OUT THE NEAR SIDE — the way they came in — must NOT shut.
+            // Before the I3 fix, OnExit shut on ANY exit once armed, so walking in,
+            // stopping, and turning around dropped the gate behind the player and
+            // locked them out of the route they were about to take, permanently
+            // (the gate is a one-shot latch with no directed-edge notion in
+            // MazeValidator's BFS).
+            {
+                var (gate, bars, col) = MakeGateRig();
+                var player = MakePlayer(facing * 6f, gate.GlobalPosition);
+                gate.OnEnter(player);
+                Check(gate.DebugArmed, "sanity: legal-direction entry arms (case 1b)");
+
+                player.GlobalPosition = gate.GlobalPosition - facing * 5f;   // backed out the near side
+                gate.OnExit(player);
+                Check(!gate.DebugShut, "armed then backed out the NEAR side: gate stays open");
+                Check(!bars.Visible,   "backed out near side: bars remain hidden");
+                Check(col.Disabled,    "backed out near side: bars collision stays disabled");
+
+                FreeGateRig(gate, bars, player);
+            }
+
+            // Case 2: entering AGAINST the facing — e.g. poking your head in from the
+            // far side — must never arm, so backing back out stays possible.
+            {
+                var (gate, bars, col) = MakeGateRig();
+                var player = MakePlayer(-facing * 6f, gate.GlobalPosition);
+                gate.OnEnter(player);
+                Check(!gate.DebugArmed, "against-facing entry: gate does not arm");
+
+                player.GlobalPosition = gate.GlobalPosition - facing * 5f;   // backs back out the far side
+                gate.OnExit(player);
+                Check(!gate.DebugShut, "against-facing entry then exit (backed out): gate stays open");
+                Check(!bars.Visible,   "gate stays open: bars remain hidden");
+                Check(col.Disabled,    "gate stays open: bars collision stays disabled");
+
+                FreeGateRig(gate, bars, player);
+            }
+
+            // Case 3: standing still (below the speed threshold) must not arm — merely
+            // poking into the trigger without committing to a direction of travel.
+            {
+                var (gate, bars, _) = MakeGateRig();
+                var player = MakePlayer(Vector3.Zero, gate.GlobalPosition);
+                gate.OnEnter(player);
+                Check(!gate.DebugArmed, "near-zero velocity entry: gate does not arm");
+                FreeGateRig(gate, bars, player);
+            }
+
+            // Case 4: a non-player body must never arm or shut the gate.
+            {
+                var (gate, bars, _) = MakeGateRig();
+                var notAPlayer = new Node3D();
+                AddChild(notAPlayer);
+                gate.OnEnter(notAPlayer);
+                Check(!gate.DebugArmed, "non-player body: does not arm");
+                notAPlayer.GlobalPosition = gate.GlobalPosition + facing * 5f;
+                gate.OnExit(notAPlayer);
+                Check(!gate.DebugShut, "non-player body: does not shut");
+                RemoveChild(notAPlayer); notAPlayer.Free();
+                RemoveChild(gate); gate.Free(); bars.Free();
+            }
+
+            // Case 5: once shut, the gate is a one-shot — poking back into the dropped
+            // bars must not change its state again, regardless of which side.
+            {
+                var (gate, bars, _) = MakeGateRig();
+                var player = MakePlayer(facing * 6f, gate.GlobalPosition);
+                gate.OnEnter(player);
+                player.GlobalPosition = gate.GlobalPosition + facing * 5f;   // far side, legally shuts it
+                gate.OnExit(player);
+                Check(gate.DebugShut, "sanity: gate is shut going into case 5");
+
+                gate.OnEnter(player);
+                Check(gate.DebugShut, "re-entering a shut gate: stays shut");
+                player.GlobalPosition = gate.GlobalPosition - facing * 5f;   // even the near side now
+                gate.OnExit(player);
+                Check(bars.Visible, "re-exiting a shut gate: bars remain down");
+
+                FreeGateRig(gate, bars, player);
+            }
+        }
+
+        // ── TeleportPadNode pairing/cooldown logic ──────────────────────────
+        // Unlike TrapdoorNode/OneWayGateNode above, TeleportPadNode's OnEnter
+        // reads/writes GlobalPosition — a Node3D whose scene tree membership
+        // Godot itself enforces (get_global_transform() errors "!is_inside_tree()"
+        // on an orphan node and silently substitutes an identity transform,
+        // confirmed while first drafting this test with unparented nodes — with
+        // that fallback the assertions below would pass vacuously against
+        // Vector3.Zero instead of testing the real position copy). So every pad
+        // and player here is a real child of this test node (AddChild, which at
+        // runtime — after the tree is already running — calls _EnterTree/_Ready
+        // synchronously, same as this project's own DungeonBuilder AddChild-then-
+        // use pattern above relies on), and "a pad exits the tree" is simulated
+        // with a real RemoveChild rather than a direct _ExitTree() call, so the
+        // registry cleanup is exercised via the exact mechanism a dungeon rebuild
+        // actually uses (QueueFree/RemoveChild), not just its name.
+        GD.Print("── TeleportPadNode pairing/cooldown ──");
+        {
+            // Case 1: paired pads teleport the player to the partner, kill horizontal
+            // velocity (preserving vertical), and cool BOTH ends down.
+            {
+                var padA = new TeleportPadNode { LinkId = 501, Position = new Vector3(10f, 0f, 0f) };
+                var padB = new TeleportPadNode { LinkId = 501, Position = new Vector3(90f, 0f, 40f) };
+                AddChild(padA); AddChild(padB);
+
+                var player = new PlayerController { Velocity = new Vector3(5f, -2f, 3f) };
+                AddChild(player);
+                player.GlobalPosition = padA.GlobalPosition;
+
+                padA.OnEnter(player);
+                Check(player.GlobalPosition.IsEqualApprox(padB.GlobalPosition),
+                      "stepping on pad A moves the player to pad B");
+                Check(player.Velocity.X == 0f && player.Velocity.Z == 0f,
+                      "horizontal momentum is killed on arrival");
+                Check(player.Velocity.Y == -2f, "vertical velocity is preserved on arrival");
+                Check(padA.DebugCooldown > 0f, "origin pad cools down");
+                Check(padB.DebugCooldown > 0f, "destination pad ALSO cools down (prevents ping-pong)");
+
+                // Case 2: arriving on the (cooling-down) destination pad must not fire —
+                // otherwise the player instantly bounces back to pad A.
+                var afterFirstWarp = player.GlobalPosition;
+                padB.OnEnter(player);
+                Check(player.GlobalPosition.IsEqualApprox(afterFirstWarp),
+                      "stepping on the cooling-down destination pad does not bounce back");
+
+                // Case 3: once the cooldown fully elapses, the pad can fire again.
+                padB._PhysicsProcess(TrapDB.TeleportCooldown + 0.1);
+                Check(padB.DebugCooldown <= 0f, "cooldown expires after TeleportCooldown seconds");
+                padB.OnEnter(player);
+                Check(player.GlobalPosition.IsEqualApprox(padA.GlobalPosition),
+                      "after cooldown expires, the pad fires and returns the player to pad A");
+
+                RemoveChild(player); player.Free();
+                RemoveChild(padA);   padA.Free();
+                RemoveChild(padB);   padB.Free();
+            }
+
+            // Case 4: an unpaired pad (LinkId 0 — the legacy-save default) must be inert:
+            // never crash, never teleport, no matter who steps on it.
+            {
+                var pad = new TeleportPadNode { LinkId = 0, Position = new Vector3(3f, 0f, 3f) };
+                AddChild(pad);
+                var player = new PlayerController();
+                AddChild(player);
+                player.GlobalPosition = pad.GlobalPosition;
+                var before = player.GlobalPosition;
+
+                pad.OnEnter(player); // must not throw
+                Check(player.GlobalPosition.IsEqualApprox(before), "unpaired pad (LinkId 0) never teleports");
+                Check(pad.DebugCooldown == 0f, "unpaired pad never starts a cooldown");
+
+                RemoveChild(player); player.Free();
+                RemoveChild(pad);    pad.Free();
+            }
+
+            // Case 5: a half-formed pair — one pad placed, its partner never placed —
+            // must be inert too, not crash by teleporting to nothing. This is exactly
+            // the "second pad never placed" scenario the task brief's self-review
+            // question is about.
+            {
+                var lonely = new TeleportPadNode { LinkId = 777, Position = new Vector3(1f, 0f, 1f) };
+                AddChild(lonely); // registers in the static registry with no partner present
+                var player = new PlayerController();
+                AddChild(player);
+                player.GlobalPosition = lonely.GlobalPosition;
+                var before = player.GlobalPosition;
+
+                lonely.OnEnter(player); // must not throw despite no partner existing
+                Check(player.GlobalPosition.IsEqualApprox(before),
+                      "half-formed pair (no partner in the maze): pad is inert, does not teleport");
+                Check(lonely.DebugCooldown == 0f, "half-formed pair: pad never starts a cooldown either");
+
+                RemoveChild(player); player.Free();
+                RemoveChild(lonely); lonely.Free();
+            }
+
+            // Case 6: a non-player body must never trigger a pad.
+            {
+                var padA = new TeleportPadNode { LinkId = 888, Position = new Vector3(0f, 0f, 0f) };
+                var padB = new TeleportPadNode { LinkId = 888, Position = new Vector3(50f, 0f, 0f) };
+                AddChild(padA); AddChild(padB);
+
+                var notAPlayer = new Node3D();
+                AddChild(notAPlayer);
+                padA.OnEnter(notAPlayer);
+                Check(padA.DebugCooldown == 0f, "non-player body does not trigger a pad");
+
+                RemoveChild(notAPlayer); notAPlayer.Free();
+                RemoveChild(padA);       padA.Free();
+                RemoveChild(padB);       padB.Free();
+            }
+
+            // Case 7: stale-registry regression. A rebuilt dungeon frees the old cell
+            // nodes; a pad that has exited the tree must no longer be resolvable as
+            // anyone's partner (the exact failure mode the task brief calls out).
+            // RemoveChild is what actually fires _ExitTree — the same mechanism
+            // DungeonBuilder/MazeEditor3D use (QueueFree ultimately removes the node
+            // from its parent too), so this exercises the real cleanup path rather
+            // than only asserting on a hand-called method of the same name.
+            {
+                var padA = new TeleportPadNode { LinkId = 999, Position = new Vector3(0f, 0f, 0f) };
+                var padB = new TeleportPadNode { LinkId = 999, Position = new Vector3(20f, 0f, 0f) };
+                AddChild(padA); AddChild(padB);
+
+                RemoveChild(padB); // simulate a dungeon rebuild freeing padB out from under padA
+                padB.Free();
+
+                var player = new PlayerController();
+                AddChild(player);
+                player.GlobalPosition = padA.GlobalPosition;
+                var before = player.GlobalPosition;
+                padA.OnEnter(player); // must not resolve to the freed padB
+                Check(player.GlobalPosition.IsEqualApprox(before),
+                      "stale registry: a pad whose partner already exited the tree stays inert");
+
+                RemoveChild(player); player.Free();
+                RemoveChild(padA);   padA.Free();
+            }
+
+            // Case 8: cross-maze collision regression. OnlineDungeonArena's primary
+            // game mode keeps TWO independently-authored mazes alive in the same
+            // scene simultaneously, at different world offsets (see
+            // scenes/OnlineDungeonArena.cs — MazeA and MazeB are both built and
+            // AddChild'd for the whole match). MazeEditor3D._nextLinkId restarts at
+            // 1 for every fresh maze, so two mazes that each contain a single
+            // teleport pair both use LinkId 1 — the common case, not an edge case.
+            // The registry is a single flat static list shared by every pad in the
+            // process, so a LinkId-only match can silently resolve a pad's
+            // "partner" to a pad built by the OTHER maze's DungeonBuilder. This
+            // sets up exactly that: two owners, each with its own self-contained
+            // LinkId=1 pair, and deliberately interleaves the OTHER owner's pads
+            // between padA1 and its real partner padA2 in registration order — so
+            // a LinkId-only linear scan finds the wrong-maze pad FIRST, proving
+            // this test would actually have caught the bug rather than passing by
+            // coincidence of list order.
+            {
+                var ownerA = new DungeonBuilder();
+                var ownerB = new DungeonBuilder();
+
+                var padA1 = new TeleportPadNode { LinkId = 1, OwnerBuilder = ownerA, Position = new Vector3(0f, 0f, 0f) };
+                AddChild(padA1);
+                var padB1 = new TeleportPadNode { LinkId = 1, OwnerBuilder = ownerB, Position = new Vector3(500f, 0f, 0f) };
+                AddChild(padB1);
+                var padB2 = new TeleportPadNode { LinkId = 1, OwnerBuilder = ownerB, Position = new Vector3(540f, 0f, 40f) };
+                AddChild(padB2);
+                var padA2 = new TeleportPadNode { LinkId = 1, OwnerBuilder = ownerA, Position = new Vector3(30f, 0f, 30f) };
+                AddChild(padA2);
+                // Registration order in the static registry is now:
+                // [padA1, padB1, padB2, padA2] — padB1 (wrong maze) sits directly
+                // after padA1, ahead of padA1's real partner padA2.
+
+                var player = new PlayerController();
+                AddChild(player);
+                player.GlobalPosition = padA1.GlobalPosition;
+
+                padA1.OnEnter(player);
+                Check(player.GlobalPosition.IsEqualApprox(padA2.GlobalPosition),
+                      "cross-maze: pad in maze A resolves to maze A's own partner");
+                Check(!player.GlobalPosition.IsEqualApprox(padB1.GlobalPosition) &&
+                      !player.GlobalPosition.IsEqualApprox(padB2.GlobalPosition),
+                      "cross-maze: pad in maze A never resolves to a pad in maze B, despite the shared LinkId");
+
+                RemoveChild(player); player.Free();
+                RemoveChild(padA1);  padA1.Free();
+                RemoveChild(padA2);  padA2.Free();
+                RemoveChild(padB1);  padB1.Free();
+                RemoveChild(padB2);  padB2.Free();
+                ownerA.Free();
+                ownerB.Free();
+            }
+        }
+
+        GD.Print("── Teleport pairing ──");
+
+        // LinkId round-trips through the serializer, and old saves default to 0.
+        var paired = new MazeData { Name = "warp", Pieces = new System.Collections.Generic.List<MazePiece>
+        {
+            new() { Type = PieceType.TrapPortal, X = 1, Y = 1, Floor = 0, Rotation = 0, LinkId = 7 },
+            new() { Type = PieceType.TrapPortal, X = 8, Y = 8, Floor = 0, Rotation = 0, LinkId = 7 },
+            new() { Type = PieceType.Straight,   X = 4, Y = 4, Floor = 0, Rotation = 0 },
+        }};
+
+        string json  = System.Text.Json.JsonSerializer.Serialize(paired);
+        var    back  = System.Text.Json.JsonSerializer.Deserialize<MazeData>(json)!;
+        var    pads  = back.Pieces.Where(p => p.Type == PieceType.TrapPortal).ToArray();
+
+        Check(pads.Length == 2, "both teleport pads survive a serialize round-trip");
+        Check(pads.All(p => p.LinkId == 7), "both pads keep LinkId 7");
+        Check(back.Pieces.First(p => p.Type == PieceType.Straight).LinkId == 0,
+              "a non-teleport piece has LinkId 0");
+
+        // A maze written before LinkId existed must still load, with LinkId 0.
+        // PieceType has no JsonStringEnumConverter registered anywhere in this
+        // project (MazeSerializer.JsonOpts is plain WriteIndented=false — see
+        // scripts/MazeSerializer.cs), so System.Text.Json's default numeric enum
+        // encoding is what every real old save actually used on disk. A string
+        // literal like "Straight" would not deserialize at all (confirmed by a
+        // JsonException during test authoring) and would not be representative
+        // of a real legacy payload, so the piece type is written as its numeric
+        // ordinal here, same as MazeSerializer always wrote it.
+        string legacy =
+            "{\"Name\":\"old\",\"Pieces\":[{\"Type\":" + (int)PieceType.Straight +
+            ",\"X\":1,\"Y\":1,\"Floor\":0,\"Rotation\":0}]}";
+        var legacyMaze = System.Text.Json.JsonSerializer.Deserialize<MazeData>(legacy)!;
+        Check(legacyMaze.Pieces.Count == 1 && legacyMaze.Pieces[0].LinkId == 0,
+              "a save with no LinkId field loads with LinkId 0");
+
+        // ── Editor glyph geometry (Task 6) ──────────────────────────────────
+        // BuildPieceInto/BuildTrapGlyph render to a 3D scene, which is exactly the
+        // kind of thing this headless suite can't "look at". But the property that
+        // matters most — pressing R on a Gate/Push tile must visibly rotate its
+        // arrow — IS checkable without eyes: the glyph's mesh-box positions must
+        // differ between rot=0 and rot=1 for those two, and must NOT differ for
+        // every other trap (rotation reorients the tile but must stay readable,
+        // which this suite can't judge, but it CAN prove those glyphs don't shift
+        // their marks around based on rotation the way Gate/Push do).
+        GD.Print("── Editor glyph geometry ──");
+        {
+            var editor = new MazeEditor3D();
+
+            HashSet<Vector3> GlyphPositions(PieceType type, int rot)
+            {
+                var parent = new Node3D();
+                editor.BuildTrapGlyph(parent, type, rot, 0f, 0f, 0f, new Color(1f, 1f, 1f), 1f);
+                var positions = parent.GetChildren()
+                    .OfType<MeshInstance3D>()
+                    .Select(m => m.Position)
+                    .ToHashSet();
+                parent.Free();
+                return positions;
+            }
+
+            foreach (var t in AllTraps)
+                Check(GlyphPositions(t, 0).Count > 0, $"{t} glyph renders at least one mesh box");
+
+            // The check that matters most: for Gate and Push, rotation IS the
+            // behaviour (legal direction / shove direction), so the arrow MUST move.
+            foreach (var t in new[] { PieceType.TrapGate, PieceType.TrapPush })
+            {
+                var p0 = GlyphPositions(t, 0);
+                var p1 = GlyphPositions(t, 1);
+                Check(!p0.SetEquals(p1),
+                      $"{t} glyph geometry differs between rot 0 and rot 1 (arrow tracks rotation)");
+            }
+
+            // Every other trap's rotation doesn't change what the trap DOES, so its
+            // glyph must not reorient either — same marks regardless of rot.
+            foreach (var t in AllTraps.Where(t => !TrapDB.IsDirectional(t)))
+            {
+                var p0 = GlyphPositions(t, 0);
+                var p1 = GlyphPositions(t, 1);
+                Check(p0.SetEquals(p1),
+                      $"{t} glyph geometry is unchanged by rotation (not directional)");
+            }
+
+            editor.Free();
+        }
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+
+    static bool HasLight(Node n)
+    {
+        if (n is OmniLight3D) return true;
+        foreach (var child in n.GetChildren())
+            if (HasLight(child)) return true;
+        return false;
+    }
+}

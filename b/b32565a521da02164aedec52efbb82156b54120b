@@ -1,0 +1,333 @@
+using Godot;
+using System;
+using System.Text;
+using System.Text.Json;
+
+/// Autoload singleton. Manages WebSocket connection to the Palisade relay server.
+/// Both peers connect outbound — no port forwarding needed.
+///
+/// Relay protocol (JSON, "type" field):
+///   create          → room_created {code}
+///   join {code}     → joined {code} | error {reason}
+///   peer_connected  ← relay notifies host when guest joins
+///   peer_disconnected ← relay notifies remaining peer on disconnect
+///   (anything else) ← forwarded verbatim to the other peer
+///
+/// Game data travels as raw JSON forwarded by the relay.
+/// Call SendGameData(json) to send; subscribe GameDataReceived to receive.
+public partial class NetworkManager : Node
+{
+    // ── Relay URL ─────────────────────────────────────────────────────────────
+    // Debug build (running from editor) → localhost relay.
+    // Release build (exported .exe)     → Render production URL.
+    // CLI overrides:
+    //   --local              → ws://localhost:3000
+    //   --relay <url>        → arbitrary URL
+    // Update ProdRelayUrl after you deploy the relay to Render.
+    const string LocalRelayUrl = "ws://localhost:3000";
+    const string ProdRelayUrl  = "wss://palisade-relay.onrender.com";
+
+    static string? _cachedRelayUrl;
+    public static string RelayUrl
+    {
+        get
+        {
+            if (_cachedRelayUrl != null) return _cachedRelayUrl;
+
+            var args = OS.GetCmdlineArgs();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--local")                              { _cachedRelayUrl = LocalRelayUrl; return _cachedRelayUrl; }
+                if (args[i] == "--relay" && i + 1 < args.Length)       { _cachedRelayUrl = args[i + 1];  return _cachedRelayUrl; }
+            }
+            _cachedRelayUrl = OS.IsDebugBuild() ? LocalRelayUrl : ProdRelayUrl;
+            return _cachedRelayUrl;
+        }
+    }
+
+    // ── Signals ───────────────────────────────────────────────────────────────
+    [Signal] public delegate void RoomCreatedEventHandler(string code);
+    [Signal] public delegate void JoinedRoomEventHandler(string code);
+    [Signal] public delegate void PeerConnectedEventHandler();
+    [Signal] public delegate void PeerDisconnectedEventHandler();
+    [Signal] public delegate void GameDataReceivedEventHandler(string json);
+    [Signal] public delegate void ConnectionFailedEventHandler(string reason);
+
+    // ── Lobby / matchmaking signals ───────────────────────────────────────────
+    [Signal] public delegate void LobbyJoinedEventHandler(string myId);
+    [Signal] public delegate void LobbyUpdatedEventHandler(string playersJson);
+    [Signal] public delegate void IncomingChallengeEventHandler(string fromId, string fromName);
+    [Signal] public delegate void ChallengeDeclinedEventHandler();
+    [Signal] public delegate void ChallengeCancelledEventHandler(string fromId);
+    [Signal] public delegate void MatchMadeEventHandler(bool isHost);
+
+    /// Relay population: total sockets connected, and how many are sitting in the
+    /// matchmaking lobby. Only ever arrives in response to RequestStats.
+    [Signal] public delegate void StatsUpdatedEventHandler(int online, int inLobby);
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    readonly WebSocketPeer _ws = new();
+    bool   _wasOpen;
+    Action? _pendingAction;  // executed once socket opens
+
+    public bool IsOpen => _ws.GetReadyState() == WebSocketPeer.State.Open;
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    /// Connect to relay and create a new room. Fires RoomCreated on success.
+    public void ConnectAndCreate()
+    {
+        _pendingAction = () => _ws.SendText("{\"type\":\"create\"}");
+        OpenSocket();
+    }
+
+    /// Connect to relay and join an existing room by code. Fires JoinedRoom on success.
+    public void ConnectAndJoin(string code)
+    {
+        _pendingAction = () => _ws.SendText($"{{\"type\":\"join\",\"code\":\"{code}\"}}");
+        OpenSocket();
+    }
+
+    /// Forward raw JSON to the other peer via the relay.
+    public void SendGameData(string json)
+    {
+        if (_ws.GetReadyState() == WebSocketPeer.State.Open)
+        {
+            // Suppress 20 Hz position spam; log everything else (truncate maze).
+            if (!json.StartsWith("{\"t\":\"pos\""))
+            {
+                string snippet = json.Length > 100 ? json.Substring(0, 100) + "…" : json;
+                GD.Print($"[NET] send: {snippet}");
+            }
+            _ws.SendText(json);
+        }
+    }
+
+    /// Close the WebSocket and reset state.
+    public void Disconnect()
+    {
+        _ws.Close();
+        _wasOpen    = false;
+        _pendingAction = null;
+    }
+
+    // ── Lobby / matchmaking API ───────────────────────────────────────────────
+
+    /// Connect to relay and join the matchmaking lobby under the given name.
+    public void ConnectAndJoinLobby(string playerName)
+    {
+        string safe = JsonSerializer.Serialize(playerName);
+        _pendingAction = () => _ws.SendText($"{{\"type\":\"lobby_join\",\"name\":{safe}}}");
+        OpenSocket();
+    }
+
+    /// Ask the relay how many people are connected and queuing. Opens the socket
+    /// if it is closed, otherwise reuses it — so polling this from the menu costs
+    /// one connection, not one per poll. Does NOT join the lobby: the answer is
+    /// read-only and leaves you invisible to challengers.
+    ///
+    /// A relay that predates the 'stats' message simply never replies (the
+    /// unknown type falls through to its peer-forward branch and finds no room),
+    /// so callers must treat "no answer" as unknown rather than as zero.
+    public void RequestStats()
+    {
+        if (_ws.GetReadyState() == WebSocketPeer.State.Open)
+            _ws.SendText("{\"type\":\"stats\"}");
+        else if (_ws.GetReadyState() == WebSocketPeer.State.Closed)
+        {
+            _pendingAction = () => _ws.SendText("{\"type\":\"stats\"}");
+            OpenSocket();
+        }
+    }
+
+    /// Send a challenge request to another lobby player.
+    public void SendChallenge(string targetId)
+    {
+        if (_ws.GetReadyState() == WebSocketPeer.State.Open)
+            _ws.SendText($"{{\"type\":\"challenge\",\"targetId\":\"{targetId}\"}}");
+    }
+
+    /// Accept or decline an incoming challenge.
+    public void RespondChallenge(string challengerId, bool accepted)
+    {
+        if (_ws.GetReadyState() == WebSocketPeer.State.Open)
+        {
+            string acc = accepted ? "true" : "false";
+            _ws.SendText($"{{\"type\":\"challenge_response\",\"challengerId\":\"{challengerId}\",\"accepted\":{acc}}}");
+        }
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    public override void _Process(double delta)
+    {
+        var state = _ws.GetReadyState();
+        if (state == WebSocketPeer.State.Closed) return;
+
+        _ws.Poll();
+
+        // Detect socket opening
+        if (!_wasOpen && _ws.GetReadyState() == WebSocketPeer.State.Open)
+        {
+            _wasOpen = true;
+            GD.Print("[NET] Socket open.");
+            _pendingAction?.Invoke();
+            _pendingAction = null;
+        }
+
+        // Detect unexpected close (connection failure before open)
+        if (_wasOpen && _ws.GetReadyState() == WebSocketPeer.State.Closed)
+        {
+            _wasOpen = false;
+            GD.Print("[NET] Socket closed unexpectedly.");
+            EmitSignal(SignalName.ConnectionFailed, "disconnected");
+            return;
+        }
+
+        // Also detect failure to open at all
+        if (!_wasOpen && _ws.GetReadyState() == WebSocketPeer.State.Closing)
+        {
+            GD.Print("[NET] Socket closing without opening — connect timeout.");
+            EmitSignal(SignalName.ConnectionFailed, "timeout");
+            return;
+        }
+
+        // Drain received packets
+        while (_ws.GetAvailablePacketCount() > 0)
+        {
+            var bytes = _ws.GetPacket();
+            var text  = Encoding.UTF8.GetString(bytes);
+            HandleMessage(text);
+        }
+    }
+
+    // ── Internal ──────────────────────────────────────────────────────────────
+
+    void OpenSocket()
+    {
+        // Close any existing connection first
+        if (_ws.GetReadyState() != WebSocketPeer.State.Closed)
+        {
+            _ws.Close();
+            // Don't carry stale _pendingAction onto the new socket — the caller
+            // that triggered this reconnect sets a fresh one below.
+        }
+        _wasOpen = false;
+
+        // Mazes can serialize to 50–150 KB; default 64 KB inbound buffer will silently drop them.
+        _ws.InboundBufferSize  = 262144; // 256 KB
+        _ws.OutboundBufferSize = 262144;
+        _ws.MaxQueuedPackets   = 64;
+
+        GD.Print($"[NET] Connecting to {RelayUrl}");
+        var err = _ws.ConnectToUrl(RelayUrl);
+        if (err != Error.Ok)
+        {
+            GD.PushError($"[NetworkManager] ConnectToUrl failed: {err}");
+            EmitSignal(SignalName.ConnectionFailed, err.ToString());
+        }
+    }
+
+    void HandleMessage(string raw)
+    {
+        JsonElement root;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            root = doc.RootElement.Clone();
+        }
+        catch { GD.PushWarning($"[NET] dropped malformed message ({raw.Length} bytes)"); return; }
+
+        // Suppress 20 Hz position chatter from logs; print everything else.
+        if (!raw.StartsWith("{\"t\":\"pos\""))
+        {
+            string snippet = raw.Length > 100 ? raw.Substring(0, 100) + "…" : raw;
+            GD.Print($"[NET] recv: {snippet}");
+        }
+
+        // Messages without "type" are game data forwarded verbatim from the peer
+        if (!root.TryGetProperty("type", out var typeProp))
+        {
+            EmitSignal(SignalName.GameDataReceived, raw);
+            return;
+        }
+        var t = typeProp.GetString() ?? "";
+
+        switch (t)
+        {
+            case "room_created":
+                EmitSignal(SignalName.RoomCreated,
+                    root.GetProperty("code").GetString() ?? "");
+                break;
+
+            case "joined":
+                EmitSignal(SignalName.JoinedRoom,
+                    root.GetProperty("code").GetString() ?? "");
+                break;
+
+            case "stats":
+                EmitSignal(SignalName.StatsUpdated,
+                    root.TryGetProperty("online", out var onlineProp) ? onlineProp.GetInt32() : 0,
+                    root.TryGetProperty("lobby",  out var lobbyProp)  ? lobbyProp.GetInt32()  : 0);
+                break;
+
+            case "peer_connected":
+                EmitSignal(SignalName.PeerConnected);
+                break;
+
+            case "peer_disconnected":
+                EmitSignal(SignalName.PeerDisconnected);
+                break;
+
+            case "error":
+                EmitSignal(SignalName.ConnectionFailed,
+                    root.TryGetProperty("reason", out var r) ? r.GetString() ?? "" : "unknown");
+                break;
+
+            // ── Lobby / matchmaking ───────────────────────────────────────────
+            case "lobby_joined":
+                OnlineGameState.MyPlayerId = root.GetProperty("playerId").GetString() ?? "";
+                EmitSignal(SignalName.LobbyJoined, OnlineGameState.MyPlayerId);
+                break;
+
+            case "lobby_update":
+                EmitSignal(SignalName.LobbyUpdated, raw);
+                break;
+
+            case "incoming_challenge":
+                EmitSignal(SignalName.IncomingChallenge,
+                    root.GetProperty("fromId").GetString() ?? "",
+                    root.GetProperty("fromName").GetString() ?? "");
+                break;
+
+            case "challenge_declined":
+            case "challenge_failed":
+                EmitSignal(SignalName.ChallengeDeclined);
+                break;
+
+            case "challenge_cancelled":
+                EmitSignal(SignalName.ChallengeCancelled,
+                    root.TryGetProperty("fromId", out var fId) ? fId.GetString() ?? "" : "");
+                break;
+
+            case "match_made":
+            {
+                bool   mIsHost = root.GetProperty("isHost").GetBoolean();
+                string mCode   = root.GetProperty("code").GetString() ?? "";
+                OnlineGameState.IsHost   = mIsHost;
+                OnlineGameState.RoomCode = mCode;
+                // Optional — a relay that predates the field just leaves it "".
+                OnlineGameState.OpponentName =
+                    root.TryGetProperty("opponentName", out var oppN)
+                        ? oppN.GetString() ?? "" : "";
+                EmitSignal(SignalName.MatchMade, mIsHost);
+                break;
+            }
+
+            default:
+                // Unrecognised relay message — treat as game data
+                EmitSignal(SignalName.GameDataReceived, raw);
+                break;
+        }
+    }
+}

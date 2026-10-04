@@ -1,0 +1,38 @@
+using Godot;
+
+/// res://scripts/TrapZone.cs — An Area3D that modulates player movement while inside it.
+///
+/// The zone owns no logic of its own: it is a bag of multipliers that registers with
+/// PlayerController on entry and deregisters on exit. The player combines every zone
+/// it is currently inside, so overlapping traps stack multiplicatively (ice inside a
+/// darkness zone behaves like both) without any zone needing to know about the others.
+public sealed partial class TrapZone : Area3D
+{
+    /// Multiplies GroundFriction. < 1 = slippery.
+    public float FrictionMul = 1f;
+    /// Multiplies the walk/sprint target speed. < 1 = slow.
+    public float SpeedMul = 1f;
+    /// Multiplies ground acceleration. < 1 = sluggish to get moving.
+    public float AccelMul = 1f;
+    /// True while this zone forbids starting a wall-run.
+    public bool BlocksWallRun = false;
+    /// Constant world-space acceleration applied while inside, m/s².
+    public Vector3 PushAccel = Vector3.Zero;
+
+    public override void _Ready()
+    {
+        Monitoring  = true;
+        BodyEntered += OnBodyEntered;
+        BodyExited  += OnBodyExited;
+    }
+
+    void OnBodyEntered(Node3D body)
+    {
+        if (body is PlayerController p) p.EnterTrapZone(this);
+    }
+
+    void OnBodyExited(Node3D body)
+    {
+        if (body is PlayerController p) p.ExitTrapZone(this);
+    }
+}

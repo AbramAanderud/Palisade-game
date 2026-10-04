@@ -1,0 +1,231 @@
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// res://test/TestTask.cs — per-task harness (overwritten each task).
+/// ─────────────────────────────────────────────────────────────────────────────
+/// 2026-09-27 fix pass. Scenario picked by a user arg (`-- scene=<name>`):
+///   pits   — two/three adjacent Pits; camera inside one, facing the shared walls.
+///   stairs — StairsUp whose low end opens into a Room and whose high end opens
+///            into a Room one floor up, plus a stair whose low end opens into a Pit;
+///            cameras face the room/pit wall the stair's end abuts.
+///   arena  — the editor's "Test Maze" path (DungeonArena, both slots = slot N via
+///            `slot=N`), camera parked in the arena; dumps an omni-light census
+///            per arena mesh. `flair=1` also applies VisualFlair.ApplyEnvironment
+///            (what OnlineDungeonArena, the normal launch path, does).
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTask : Node3D
+{
+    Camera3D _cam = null!;
+    int _frame = 0;
+    const float CS = DungeonBuilder.CellSize;
+    const float FH = DungeonBuilder.FloorHeight;
+    const int HoldFrames = 3;
+
+    readonly List<(Vector3 pos, float yaw, float pitch, string note)> _waypoints = new();
+    readonly Dictionary<string, string> _args = new();
+
+    public override void _Ready()
+    {
+        foreach (var a in OS.GetCmdlineUserArgs())
+        {
+            var kv = a.Split('=', 2);
+            _args[kv[0]] = kv.Length > 1 ? kv[1] : "1";
+        }
+        string scene = _args.GetValueOrDefault("scene", "pits");
+        GD.Print($"[TestTask] scene={scene}");
+
+        if (scene == "arena") { SetupArena(); return; }
+
+        AddTestEnvironment();
+        var pieces = scene == "stairs" ? StairPieces() : PitPieces();
+        var dungeon = new DungeonBuilder();
+        AddChild(dungeon);
+        dungeon.Build(new MazeData { Name = "TestTask_" + scene, Pieces = pieces });
+
+        // Bisection aid: `hide=<substr>` hides every mesh whose name contains it.
+        if (_args.TryGetValue("hide", out var hide))
+        {
+            void Hide(Node n) { foreach (var ch in n.GetChildren()) { if (ch is MeshInstance3D m && m.Name.ToString().Contains(hide)) { m.Visible = false; GD.Print($"[hide] {m.GetPath()}"); } Hide(ch); } }
+            Hide(dungeon);
+        }
+        if (_args.TryGetValue("only", out var only)) { var keep = _waypoints[int.Parse(only)]; _waypoints.Clear(); _waypoints.Add(keep); }
+
+        _cam = new Camera3D { Fov = 75f, Current = true, Far = 500f };
+        AddChild(_cam);
+        Place(0);
+    }
+
+    // ── pits ──────────────────────────────────────────────────────────────────
+    // Pit A anchored (3,4) → footprint x 2..4, y 3..5. Pit B (6,4) → x 5..7: the
+    // A|B boundary is the plane x = 50. Pit C (3,7) → y 6..8: A|C boundary z = 60.
+    List<MazePiece> PitPieces()
+    {
+        _waypoints.Add((new(36f, 4f, 45f), -90f, 8f,  "inside pit A, facing E at the A|B shared wall (x=50)"));
+        _waypoints.Add((new(35f, 4f, 44f), 180f, 8f,  "inside pit A, facing S at the A|C shared wall (z=60)"));
+        _waypoints.Add((new(24f, 20f, 34f), -125f, -15f, "pit A high corner, diagonal over both shared walls"));
+        _waypoints.Add((new(46f, 4f, 45f), 90f, 8f,   "inside pit A, facing W at a lone outer wall (x=20) for comparison"));
+        return new List<MazePiece>
+        {
+            new() { Type = PieceType.Pit, X = 3, Y = 4, Floor = 0 },
+            new() { Type = PieceType.Pit, X = 6, Y = 4, Floor = 0 },
+            new() { Type = PieceType.Pit, X = 3, Y = 7, Floor = 0 },
+        };
+    }
+
+    // ── stairs ────────────────────────────────────────────────────────────────
+    List<MazePiece> StairPieces()
+    {
+        // Room (4..6 × 7..8, F0). StairsUp rot0 at (5,6): low end S opens into room
+        // cell (5,7) at z=70; high end N lands on floor 1 at z=60 into the upper room
+        // (4..6 × 4..5, F1).
+        _waypoints.Add((new(55f, 5f, 84f), 0f, 12f,     "lower room facing N at the stair's low-end doorway wall (z=70)"));
+        _waypoints.Add((new(46f, 6f, 76f), -35f, 18f,   "lower room, oblique on the doorway's west flank"));
+        _waypoints.Add((new(55f, FH + 5f, 46f), 180f, 12f, "upper room (F1) facing S at the stair's high-end wall (z=60)"));
+        // Pit P (15,5) → x 14..16, y 4..6. StairsUp rot2 at (15,7): low end N opens
+        // at z=70 into pit cell (15,6).
+        _waypoints.Add((new(155f, 5f, 52f), 180f, 12f,  "inside pit, facing S at the stair's low-end wall (z=70)"));
+        // Single-cell Room (5,5,F0) north of the stair's HIGH end on the stair's own floor:
+        // RoomBuilder skips its wall there (NeighborIsStair), so the stair's own outer faces show.
+        _waypoints.Add((new(55f, 5f, 52f), 180f, 12f,   "same-floor room N of the stair's high end, facing S (z=60)"));
+
+        var pieces = new List<MazePiece>
+        {
+            new() { Type = PieceType.StairsUp, X = 5, Y = 6, Floor = 0, Rotation = 0 },
+            new() { Type = PieceType.Pit,      X = 15, Y = 5, Floor = 0 },
+            new() { Type = PieceType.StairsUp, X = 15, Y = 7, Floor = 0, Rotation = 2 },
+            new() { Type = PieceType.Room,     X = 5, Y = 5, Floor = 0 },
+        };
+        for (int x = 4; x <= 6; x++)
+        {
+            for (int y = 7; y <= 8; y++) pieces.Add(new() { Type = PieceType.Room, X = x, Y = y, Floor = 0 });
+            for (int y = 4; y <= 5; y++) pieces.Add(new() { Type = PieceType.Room, X = x, Y = y, Floor = 1 });
+        }
+        return pieces;
+    }
+
+    // ── arena ─────────────────────────────────────────────────────────────────
+    void SetupArena()
+    {
+        int slot = int.Parse(_args.GetValueOrDefault("slot", "0"));
+        // Survey every slot so the chosen one can be picked with evidence.
+        for (int s = 0; s < 5; s++)
+        {
+            var d = MazeSerializer.Load(s);
+            if (d == null) continue;
+            var ex = d.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+            var st = d.Pieces.FirstOrDefault(p => p.Type == PieceType.Start);
+            GD.Print($"[survey] slot{s} '{d.Name}' pieces={d.Pieces.Count} " +
+                     $"exit=({ex?.X},{ex?.Y},F{ex?.Floor},r{ex?.Rotation}) startF={st?.Floor} " +
+                     $"floors={d.Pieces.Min(p => p.Floor)}..{d.Pieces.Max(p => p.Floor)} ready={d.IsGameReady}");
+        }
+
+        GameState.IsArenaMode = true;
+        GameState.ArenaSlotA  = slot;
+        GameState.ArenaSlotB  = _args.ContainsKey("slotb") ? int.Parse(_args["slotb"]) : slot;
+        DungeonArena.ChosenSpawn = DungeonArena.SpawnPoint.MazeA;
+        var arenaScene = GD.Load<PackedScene>("res://scenes/DungeonArena.tscn").Instantiate<Node3D>();
+        AddChild(arenaScene);
+
+        if (_args.ContainsKey("flair"))
+        {
+            var we = arenaScene.GetChildren().OfType<WorldEnvironment>().FirstOrDefault();
+            if (we != null) VisualFlair.ApplyEnvironment(we.Environment);
+        }
+
+        var arena = arenaScene.GetNodeOrNull<Node3D>("Arena");
+        Vector3 c = arena?.GlobalPosition ?? Vector3.Zero;
+        _cam = new Camera3D { Fov = 75f, Current = true, Far = 800f };
+        AddChild(_cam);
+        _waypoints.Add((c + new Vector3(0f, 2f, -18f), 180f, 5f, "arena, near north door, facing S across the floor"));
+        _waypoints.Add((c + new Vector3(0f, 2f, 18f), 0f, 12f,  "arena, near south door, facing N"));
+        _waypoints.Add((c + new Vector3(-15f, 3f, 0f), -90f, 20f, "arena, west side, facing E and up at the tiers"));
+        Place(0);
+
+        // `player=1`: render through the spawned player's own camera instead,
+        // teleporting the player body to each waypoint.
+        if (_args.ContainsKey("player"))
+            _player = arenaScene.GetChildren().OfType<PlayerController>().FirstOrDefault();
+        GD.Print($"[TestTask] player camera mode: {_player != null}");
+
+        CallDeferred(nameof(LightCensus), arenaScene);
+    }
+
+    PlayerController? _player;
+
+    void LightCensus(Node3D root)
+    {
+        var omnis = new List<OmniLight3D>();
+        void Walk(Node n) { foreach (var ch in n.GetChildren()) { if (ch is OmniLight3D o && o.Visible) omnis.Add(o); Walk(ch); } }
+        Walk(root);
+        GD.Print($"[census] total visible omnis in scene: {omnis.Count}");
+        foreach (var grp in omnis.GroupBy(o => o.GetParent().Name.ToString()))
+            GD.Print($"[census]   under '{grp.Key}': {grp.Count()}");
+
+        var arena = root.GetNodeOrNull<Node3D>("Arena");
+        if (arena == null) { GD.Print("[census] no Arena node"); return; }
+        var meshes = new List<MeshInstance3D>();
+        void WalkM(Node n) { foreach (var ch in n.GetChildren()) { if (ch is MeshInstance3D m) meshes.Add(m); WalkM(ch); } }
+        WalkM(arena);
+        foreach (var m in meshes.OrderByDescending(m => m.GetAabb().Size.Length()).Take(12))
+        {
+            var aabb = m.GlobalTransform * m.GetAabb();
+            var touching = omnis.Where(o => SphereHitsAabb(o.GlobalPosition, o.OmniRange, aabb)).ToList();
+            int arenaOwn = touching.Count(o => o.GetParent() == arena);
+            GD.Print($"[census] mesh {m.Name,-28} size={aabb.Size.X:F0}x{aabb.Size.Y:F0}x{aabb.Size.Z:F0} " +
+                     $"lightsTouching={touching.Count} (arena {arenaOwn}, other {touching.Count - arenaOwn})");
+        }
+    }
+
+    static bool SphereHitsAabb(Vector3 c, float r, Aabb b)
+    {
+        var p = new Vector3(Mathf.Clamp(c.X, b.Position.X, b.End.X),
+                            Mathf.Clamp(c.Y, b.Position.Y, b.End.Y),
+                            Mathf.Clamp(c.Z, b.Position.Z, b.End.Z));
+        return p.DistanceSquaredTo(c) <= r * r;
+    }
+
+    // ── shared ────────────────────────────────────────────────────────────────
+    void AddTestEnvironment()
+    {
+        var worldEnv = new WorldEnvironment();
+        worldEnv.Environment = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.02f, 0.02f, 0.04f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.30f, 0.28f, 0.28f),
+            AmbientLightEnergy = 0.6f,
+            TonemapMode        = Godot.Environment.ToneMapper.Filmic,
+            TonemapExposure    = 1.3f,
+        };
+        AddChild(worldEnv);
+    }
+
+    void Place(int i)
+    {
+        var (pos, yaw, pitch, note) = _waypoints[i];
+        _cam.GlobalPosition = pos;
+        _cam.GlobalRotation = new Vector3(Mathf.DegToRad(pitch), Mathf.DegToRad(yaw), 0f);
+        if (_frame % HoldFrames == 0) GD.Print($"[frame {_frame}] wp{i}: {note}  pos={pos}");
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+        int idx = _frame / HoldFrames;
+        if (idx >= _waypoints.Count) { GetTree().Quit(); return; }
+        if (_player != null)
+        {
+            var (pos, yaw, _, note) = _waypoints[idx];
+            _player.GlobalPosition = pos - new Vector3(0f, 1.6f, 0f);
+            _player.Velocity = Vector3.Zero;
+            _player.GlobalRotation = new Vector3(0f, Mathf.DegToRad(yaw), 0f);
+            if (_frame % HoldFrames == 0) GD.Print($"[frame {_frame}] player wp{idx}: {note} cam={_player.ActiveCamera.GlobalPosition}");
+            return;
+        }
+        // The arena scene spawns a player with its own Current camera — keep ours.
+        if (!_cam.Current) _cam.MakeCurrent();
+        Place(idx);
+    }
+}

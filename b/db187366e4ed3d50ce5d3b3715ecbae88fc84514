@@ -1,0 +1,151 @@
+# FFA Phase 6: Rematch Vote — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** From the FFA end screen, remaining players vote "Rematch: same mazes" or "Rematch: rotate". The rematch starts when every remaining player has voted. The majority wins, and a tie goes to the host's vote. "Rotate" advances the runner offset (never landing on "own maze"). If fewer than 3 players remain, rematch is disabled. With exactly 3 remaining, the layout is recomputed for 3 seats.
+
+**Architecture:**
+- **Tally:** a pure `FfaRematch` tally/decision helper (tested headless).
+- **End screen:** gains two vote buttons plus live tallies.
+- **Messages:** `rematch_vote {mode}` (every voter → all), and `rematch_go {mode, offset, seats}` (host → all) once every remaining seat has voted.
+- **Reload:**
+  - everyone updates `OnlineGameState.FfaRoster` (remaining seats), `FfaRotationOffset` and `RematchPending`, then reloads `OnlineFfaArena`;
+  - the relay party is still open (started), so routing keeps working;
+  - leavers arrive as `peer_left` and shrink the remaining set.
+
+Spec: `docs/superpowers/specs/2026-09-28-ffa-4p-design.md` §2 End screen / Rematch.
+
+## Global Constraints
+
+- Worktree `C:\Users\Abe\Documents\corners-ffa`, branch `feat/ffa-4p`. Never `cd`. Never touch `C:\Users\Abe\Documents\palisade-godot`.
+- 1v1 untouched (`OnlineDungeonArena`, `PreGameLobby`, `DungeonArena`). Shared files may only get additive changes.
+- **League rule:** before EVERY Godot launch run PowerShell `Get-Process | Where-Object { $_.ProcessName -like "League*" }`. If it returns anything, don't launch; report BLOCKED. Headless only. Never open Blender.
+- Build: `dotnet build /c/Users/Abe/Documents/corners-ffa/Palisade.csproj -v q`. Run: `G=/c/Godot_v4.6.2-stable_mono_win64/Godot_v4.6.2-stable_mono_win64_console.exe`. Each multi-client test uses its own free relay port, waits only on the Godot PIDs, and kills its relay afterwards.
+- **Offset rule** (n = remaining seat count; the offset is always in 1..n−1):
+  - `same`: `o = offset % n; if (o == 0) o = 1;`
+  - `rotate`: `o = offset % n + 1; if (o >= n) o = 1;`
+- `MinPlayers = 3`. The vote window has no timeout. Anyone who doesn't want to play presses Exit, which removes them from the remaining set via `peer_left`.
+- Commits end with a blank line, then `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+
+---
+
+### Task 0: Phase 5 review fixes (groundwork)
+
+From the Phase 5 whole-phase review. **Files:** `scenes/OnlineFfaArena.cs`, `scenes/OnlineFfaArena.Combat.cs`, `test/TestFfaMatchFlow.cs`, `test/TestFfaLoadLeave.cs`.
+
+1. **(Important) The maze retry timer outlives an early end.** `_mazeRetryTimer` only stops on `_arenaBuilt || _leaving`. After a pre-world "Match cancelled", the 60 s absolute give-up yanks the player from the end screen to PlayGameScreen. Stop the timer in `DetectEnd`/`FinishMatch`, and add an ended guard in its callback.
+2. **World build failure:** `_arenaBuilt = true` is set before `FfaWorld.Build`. If `PlusLayout.Compute` throws, the client is stuck forever. Wrap the build in try/catch: on failure, log it, `ReturnToLobbyAfter("Couldn't build the arena")`, and don't set `_arenaBuilt`.
+3. **Host-authority checks:** accept `end`, `loadout` and `pickup_awarded` only from `from == OnlineGameState.FfaHostSeat`, consistent with `go`, `world` and `drop`. Keep the existing buffer and handover logic intact.
+4. **Invariant number formatting** in every FFA message this arena builds (`pos`, `shot`, `hit`, `dmg`, …): use `CultureInfo.InvariantCulture` (e.g. `FormattableString.Invariant`). Otherwise a comma-decimal locale breaks the JSON. 1v1 has the same latent bug, but it stays untouched by owner decision; note it in JOURNAL.
+5. Remove the unused `_famePreview`. Reset the static TEST-ONLY hooks (`TestWithholdMaze`, `TestIgnoreMazeFromSeat`) in the arena's `_ExitTree`, so a scene reload inside one test process starts clean.
+6. **Test strengthening:**
+   - TestFfaMatchFlow: assert `DamageBy(host) == 130` (±0.5) instead of `>= 100`.
+   - TestFfaLoadLeave A: c3 asserts it was dropped (a read-only `WasDropped` hook), not merely that it ended up at PlayGameScreen, which its 60 s give-up would also satisfy.
+   - TestFfaLoadLeave B: make it deterministic. Add a test-only hook so c1 delays its world-maze requests until c3's seat has left, AND make the host also ignore c3's maze (`TestIgnoreMazeFromSeat` on the host too). c1 must then get it from c2 via the "owner has left → broadcast" branch. Assert c1's log line shows the `of` source seat is c2's.
+   - **New scenario C** in TestFfaMatchFlow (or a new role arg): the host disconnects mid-match after GO. The remaining 3 agree on the new `FfaHostSeat` (the lowest remaining), the host's seat is in `EliminationOrder`, and the match continues to an end decided by the NEW host's `end`: the new host kills the other two.
+
+Verification: all the Phase 5 suites ALL PASS (MatchFlow, including C, ×4; LoadLeave A/B ×4; LobbyFlow ×4; OnlineFlow ×2; the headless suites).
+
+Commit: `fix(ffa): phase 5 review — retry timer after end, build failure path, host checks, invariant formatting; stronger tests`.
+
+---
+
+### Task 1: `FfaRematch` pure helper + test
+
+**Files:** `scripts/FfaRematch.cs`, `test/TestFfaRematch.cs/.tscn` (headless, TestFfaMatch style).
+
+```csharp
+public enum RematchMode { Same, Rotate }
+public static class FfaRematch
+{
+    public const int MinPlayers = 3;
+    /// Winning mode given votes (seat → mode) from the remaining seats; majority, tie → host's vote.
+    /// Returns null if any remaining seat hasn't voted, or remaining.Count < MinPlayers.
+    public static RematchMode? Decide(IReadOnlyCollection<int> remaining, IReadOnlyDictionary<int, RematchMode> votes, int hostSeat);
+    public static int NextOffset(int offset, int n, RematchMode mode);   // Global Constraints rule
+    public static (int same, int rotate) Tally(IReadOnlyCollection<int> remaining, IReadOnlyDictionary<int, RematchMode> votes);
+}
+```
+Tests:
+- a 4-seat majority for each mode;
+- a 2–2 tie resolved by the host's vote, in both directions;
+- one seat not voted → null;
+- 2 remaining → null;
+- votes from seats not in `remaining` are ignored;
+- NextOffset:
+  - n=4: same keeps 1/2/3; rotate goes 1→2→3→1;
+  - n=3: same maps 3→1 (3 % 3 = 0) and keeps 1 and 2; rotate goes 1→2→1;
+  - the result is never 0 and never ≥ n.
+
+Commit: `feat(ffa): FfaRematch vote tally/decision + offset rule`.
+
+---
+
+### Task 2: End-screen voting + `rematch_go` + reload
+
+**Files:** `scenes/OnlineFfaArena.Combat.cs` (end screen), `scenes/OnlineFfaArena.cs` (message routing / reload), possibly a new partial `OnlineFfaArena.Rematch.cs`.
+
+Behaviour:
+- **End screen:** below the placements, add two buttons, "Rematch: same mazes" and "Rematch: rotate", plus a status line with the live tally "Same {a} · Rotate {b} · waiting for {names}".
+  - Hidden when the match was cancelled, the connection was lost, or fewer than 3 seats remain.
+  - Pressing one records the local vote (it can be changed), and broadcasts `{"t":"rematch_vote","mode":"same"|"rotate"}`.
+  - Exit to Menu stays: `PartyLeave(); Disconnect();`.
+- **After the end:** the arena must accept `rematch_vote` and `rematch_go`. Today, gameplay messages are dropped after the end (`DropAfterEnd`, Combat.cs ~L90); add exceptions for these two.
+- **No relay change** (the owner avoids another deploy). The roster is pruned by `rematch_go.seats`, which is built from the live set: seats that left, or were dropped and so called `PartyLeave`, are excluded. Seat numbers are never reused after start (the relay never re-seats a started party), so stale leaves are safe to discard.
+- **Host leaving during the vote:** `OnSeatLeft`'s ended branch must call the re-tally/decide hook on the (possibly new) host.
+- **Remaining set:** live roster seats (not left). A seat that leaves during the vote is removed, and the tally re-evaluates. If fewer than 3 remain, hide the buttons with "Not enough players for a rematch".
+- **Host:**
+  - after each vote or leave, `FfaRematch.Decide(...)`;
+  - if non-null, broadcast `{"t":"rematch_go","mode":…,"offset":NextOffset(FfaRotationOffset, remaining.Count, mode),"seats":[…remaining sorted…]}` and apply it locally.
+  - If the host leaves during the vote, the new host re-evaluates with the votes it already holds. Every client keeps the full vote map.
+- **Apply `rematch_go`** (only from the current host):
+  - `OnlineGameState.FfaRoster` = the roster entries for `seats`;
+  - `FfaRotationOffset = offset`;
+  - `RematchPending = true`;
+  - keep `FfaSeat` and `FfaHostSeat` (the host stays unless it left);
+  - after 0.4 s, `ChangeSceneToFile("res://scenes/OnlineFfaArena.tscn")`.
+  - Clear `NetworkManager.PendingPeerLefts` before the reload. Leaves that happen during the reload still land in `PendingPeerLefts` and are replayed by the new scene.
+- **The new arena on `RematchPending`:**
+  - clears the flag;
+  - builds with the new roster and offset;
+  - the host re-rolls the loadout, avoiding the last starter like 1v1;
+  - mazes are re-exchanged, with nothing cached across scenes, so the same path as a first match is used.
+- **Test hooks:**
+  - `void DebugVoteRematch(bool rotate)`: the same handler as the buttons;
+  - `bool RematchAvailable`;
+  - `(int same, int rotate) RematchTally`.
+
+Verification (League check first): build; TestFfaMatchFlow ×4 and TestFfaLobbyFlow ×4 still ALL PASS.
+
+Commit: `feat(ffa): rematch vote (same/rotate, host tie-break, drop to 3 seats)`.
+
+---
+
+### Task 3: `TestFfaRematch` e2e (two scenarios) + docs
+
+**Files:** `test/TestFfaRematch.cs/.tscn`, modelled on `TestFfaMatchFlow`. Accounts `__test_ffa_r_<role>`, arg `--scenario A|B`, a separate relay port per scenario.
+
+Each scenario first plays a short match to its end by the host killing the others through `DebugDamageSeat`. Players who are killed stay connected and see the end screen after the host's `end`.
+
+- **A (drop to 3, rotate majority):**
+  - after the end, c3 presses Exit;
+  - host, c1 and c2 wait until `RematchAvailable` and three remaining seats;
+  - votes: host Rotate, c1 Rotate, c2 Same;
+  - all three reload into a new `OnlineFfaArena`;
+  - assert `FfaRoster.Count == 3`, `FfaRotationOffset == 2` (1 → rotate with n=3), and `MatchLive` with `PuppetCount == 2`;
+  - `LocalMazeSeat` follows the runner rule with offset 2 over the 3 seats.
+- **B (tie → host):**
+  - all 4 stay; votes: host Same, c1 Same, c2 Rotate, c3 Rotate;
+  - everyone reloads with `FfaRotationOffset == 1` ("same" keeps 1);
+  - 4 roster seats, `MatchLive` with `PuppetCount == 3`.
+- Also in B: before the last vote lands, every client's `RematchTally` shows (2, 1). Each client checks it after the third vote.
+
+Regression gate:
+- TestFfaRematch A and B ×4;
+- TestFfaMatchFlow ×4, TestFfaLoadLeave A/B ×4, TestFfaLobbyFlow ×4, TestOnlineFlow ×2;
+- TestFfaRematch/Match/World/Party headless;
+- relay node tests.
+
+Docs: JOURNAL "FFA Phase 6: rematch vote" and the BUILD recipe.
+
+Commits: `test(ffa): rematch e2e (drop-to-3 rotate, tie → host)`, `docs(ffa): phase 6 notes`.

@@ -1,0 +1,80 @@
+using Godot;
+
+/// test/TestRocketHit.cs
+/// Proves the rocket's sphere-sweep actually widens the hit, and still misses
+/// what it should.
+///
+/// The old code raycast a zero-thickness line while drawing a 0.17 m capsule,
+/// so a rocket could pass visually THROUGH a target and do nothing. Two lanes,
+/// identical except for how far the target sits off the flight line:
+///
+///   NEAR lane — target 0.35 m off-axis, its near face only 0.10 m from the
+///               line. A hairline ray misses it; a 0.48 m sphere must not.
+///   FAR lane  — target 2.0 m off-axis, near face 1.75 m out. Well beyond the
+///               sphere, so it must still sail past. Without this half the
+///               test would pass just as well if the rocket hit everything.
+///
+/// Rockets are CosmeticOnly so no GunCombat damage plumbing is needed; the
+/// assertion is purely "did it detonate", read as the node being freed.
+public partial class TestRocketHit : Node3D
+{
+    const float LaneGap  = 100f;   // lanes far apart so they cannot interact
+    const float TargetZ  = -8f;
+    const int   Frames   = 45;     // 0.75 s at 60 Hz; flight to target is ~0.24 s
+
+    Rocket? _near, _far;
+    int _tick;
+
+    static StaticBody3D Target(Node parent, Vector3 at, string name)
+    {
+        var b = new StaticBody3D { Name = name, Position = at };
+        b.AddChild(new CollisionShape3D
+        {
+            Shape = new BoxShape3D { Size = new Vector3(0.5f, 2f, 0.5f) },
+        });
+        parent.AddChild(b);
+        return b;
+    }
+
+    public override void _Ready()
+    {
+        var def = GunCombat.Defs["rocketlaucher"];
+
+        // Owner is never added to the tree: Rocket only touches it for damage,
+        // which CosmeticOnly skips, and GetParent() on an orphan is null.
+        var owner = new GunCombat();
+
+        Target(this, new Vector3(0.35f, 0f, TargetZ), "NearTarget");
+        Target(this, new Vector3(LaneGap + 2.0f, 0f, TargetZ), "FarTarget");
+
+        _near = Rocket.Spawn(this, Vector3.Zero, Vector3.Forward, def, owner);
+        _far  = Rocket.Spawn(this, new Vector3(LaneGap, 0f, 0f), Vector3.Forward, def, owner);
+        _near.CosmeticOnly = true;
+        _far.CosmeticOnly  = true;
+
+        GD.Print($"[RocketHit] radius={def.ProjRadius:F2}m speed={def.ProjSpeed:F0}m/s");
+        GD.Print("[RocketHit] near target face is 0.10m off the flight line " +
+                 "(a hairline ray misses it); far target face is 1.75m out.");
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (++_tick < Frames) return;
+
+        bool nearGone = _near == null || !IsInstanceValid(_near);
+        bool farAlive = _far  != null &&  IsInstanceValid(_far);
+
+        int fail = 0;
+        void Check(bool ok, string label)
+        {
+            GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+            if (!ok) fail++;
+        }
+
+        Check(nearGone, "0.35m-offset target DETONATES the rocket (ray would have missed)");
+        Check(farAlive, "2.0m-offset target does NOT — the sweep is a radius, not a magnet");
+
+        GD.Print(fail == 0 ? "RESULT OK" : $"RESULT {fail} FAILURE(S)");
+        GetTree().Quit(fail == 0 ? 0 : 1);
+    }
+}

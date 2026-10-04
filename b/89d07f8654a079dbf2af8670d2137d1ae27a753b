@@ -1,0 +1,90 @@
+using Godot;
+
+/// res://test/TestGunHold.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Hand-alignment sweep. Spawns one character per candidate rotation, all frozen
+/// in the gun-aim pose, and labels each with the rotation that produced it. One
+/// screenshot then tells you which value seats the grip correctly.
+///
+/// The humanoid rig's RightHand bone axes are not documented anywhere we control,
+/// so this is measured rather than derived. Copy the winning value into
+/// PlayerController.TpHandRot.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestGunHold : Node3D
+{
+    const string Gun = "ak47";   // long gun — misalignment is most obvious
+
+    static readonly Vector3[] Candidates =
+    {
+        new(  0f,   0f,   0f),
+        new(  0f,   0f,  90f),
+        new(  0f,   0f, -90f),
+        new( 90f,   0f,   0f),
+        new(-90f,   0f,   0f),
+        new(  0f, 180f,   0f),
+    };
+
+    readonly PlayerController[] _players = new PlayerController[Candidates.Length];
+
+    public override void _Ready()
+    {
+        var env = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.07f, 0.07f, 0.09f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(1f, 0.97f, 0.92f),
+            AmbientLightEnergy = 0.9f,
+        };
+        AddChild(new WorldEnvironment { Environment = env });
+
+        var key = new DirectionalLight3D { LightEnergy = 1.4f };
+        key.RotationDegrees = new Vector3(-35f, 30f, 0f);
+        AddChild(key);
+
+        var floor = new StaticBody3D();
+        floor.AddChild(new CollisionShape3D
+        { Shape = new BoxShape3D { Size = new Vector3(60f, 1f, 60f) } });
+        AddChild(floor);
+        floor.GlobalPosition = new Vector3(0f, -0.5f, 0f);
+
+        float x = -(Candidates.Length - 1) * 1.7f / 2f;
+        for (int i = 0; i < Candidates.Length; i++)
+        {
+            // TpHandRot is read inside RebuildTpGun, which runs during Spawn's
+            // equip — so it must be set BEFORE each spawn.
+            PlayerController.TpHandRot = Candidates[i];
+
+            var p = PlayerController.Spawn(this, new Vector3(x, 0.2f, 0f), 0f);
+            p.Frozen = true;
+            p.EquipStarterGun(Gun);
+            _players[i] = p;
+
+            AddChild(new Label3D
+            {
+                Text      = $"{Candidates[i].X:0},{Candidates[i].Y:0},{Candidates[i].Z:0}",
+                FontSize  = 60,
+                Position  = new Vector3(x, 2.3f, 0f),
+                Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+                Modulate  = new Color(1f, 0.88f, 0.5f),
+                PixelSize = 0.0028f,
+            });
+            x += 1.7f;
+        }
+        PlayerController.TpHandRot = Vector3.Zero;   // leave the default alone
+
+        var cam = new Camera3D { Fov = 60f, CullMask = ~4u };
+        AddChild(cam);
+        cam.Position = new Vector3(0f, 1.5f, 6.2f);
+        cam.LookAt(new Vector3(0f, 1.1f, 0f), Vector3.Up);
+        cam.MakeCurrent();
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        // Hold every character in the gun-aim idle so the pose is identical and
+        // only the hand rotation differs.
+        foreach (var p in _players)
+            p?.DebugDriveThirdPerson("IDLE", (float)delta);
+    }
+}

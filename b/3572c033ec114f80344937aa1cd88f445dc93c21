@@ -1,0 +1,191 @@
+using System.Collections.Generic;
+using Godot;
+
+/// Headless assertion harness for TrapdoorNode's delay/re-arm state machine,
+/// plus TrapBehaviours.AddTrapdoor's bottom-floor guard (fix for a trapdoor
+/// dropping the player into open space at the world's lowest floor).
+/// Drives _PhysicsProcess with synthetic deltas — no player, no physics frame,
+/// no scene geometry — so this proves the timing logic itself rather than
+/// relying on a screenshot of the drop happening at roughly the right moment.
+public partial class TestTrapdoor : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    // Builds a trapdoor node with its own throwaway hatch, matching the shape
+    // TrapBehaviours.AddTrapdoor builds (StaticBody3D + one CollisionShape3D +
+    // one MeshInstance3D), but standalone — never added under a DungeonBuilder,
+    // so this only exercises TrapdoorNode's own bookkeeping.
+    static (TrapdoorNode node, StaticBody3D hatch, CollisionShape3D col) MakeRig()
+    {
+        var hatch = new StaticBody3D();
+        var col   = new CollisionShape3D { Shape = new BoxShape3D() };
+        hatch.AddChild(col);
+
+        var node = new TrapdoorNode { Hatch = hatch };
+        return (node, hatch, col);
+    }
+
+    public override void _Ready()
+    {
+        GD.Print("── TrapdoorNode delay/re-arm timing ──");
+
+        // ── Case 1: untriggered hatch never moves, no matter how much time passes ──
+        {
+            var (node, hatch, col) = MakeRig();
+            node._PhysicsProcess(100.0); // absurdly large delta — should be a pure no-op
+            Check(hatch.Visible,   "untriggered: hatch stays visible");
+            Check(!col.Disabled,   "untriggered: hatch collision stays enabled");
+            Check(!node.DebugTriggered, "untriggered: DebugTriggered stays false");
+            node.Free();
+            hatch.Free(); // cascades to free the child CollisionShape3D too
+        }
+
+        // ── Case 2: a non-player body must not trigger it ──────────────────────
+        {
+            var (node, hatch, _) = MakeRig();
+            var notAPlayer = new Node3D();
+            node.OnBodyEntered(notAPlayer);
+            Check(!node.DebugTriggered, "non-player body: does not trigger");
+            notAPlayer.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 3: entering starts the timer; the hatch survives right up to
+        //    (but not including) TrapdoorDelay — the "it looked solid" beat. ──
+        {
+            var (node, hatch, col) = MakeRig();
+            var player = new PlayerController();
+            node.OnBodyEntered(player);
+            Check(node.DebugTriggered, "on enter: DebugTriggered becomes true");
+
+            float justUnder = TrapDB.TrapdoorDelay - 0.05f;
+            node._PhysicsProcess(justUnder);
+            Check(hatch.Visible, $"at t={justUnder:F2}s (< delay {TrapDB.TrapdoorDelay}): hatch still visible");
+            Check(!col.Disabled, $"at t={justUnder:F2}s (< delay): collision still enabled");
+
+            // Cross the delay threshold.
+            node._PhysicsProcess(0.10f); // total elapsed now > TrapdoorDelay
+            Check(!hatch.Visible, "past delay: hatch becomes invisible");
+            Check(col.Disabled,   "past delay: collision becomes disabled");
+            Check(node.DebugTriggered, "past delay, before rearm: still marked triggered");
+
+            player.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 4: re-arm restores the hatch and resets the trigger, so the
+        //    tile is walkable (and able to fire) again. ─────────────────────────
+        {
+            var (node, hatch, col) = MakeRig();
+            var player = new PlayerController();
+            node.OnBodyEntered(player);
+
+            node._PhysicsProcess(TrapDB.TrapdoorDelay + 0.05f); // drop it
+            Check(!hatch.Visible, "pre-rearm: hatch confirmed down");
+
+            float justUnder = TrapDB.TrapdoorRearm - TrapDB.TrapdoorDelay - 0.10f;
+            node._PhysicsProcess(justUnder);
+            Check(!hatch.Visible,      "just before rearm: hatch still down");
+            Check(node.DebugTriggered, "just before rearm: still triggered (not yet reset)");
+
+            node._PhysicsProcess(0.20f); // cross TrapdoorRearm
+            Check(hatch.Visible,        "past rearm: hatch visible again");
+            Check(!col.Disabled,        "past rearm: collision re-enabled");
+            Check(!node.DebugTriggered, "past rearm: trigger flag reset (re-armed, refireable)");
+            Check(node.DebugTimer == 0f, "past rearm: timer reset to zero");
+
+            player.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 5: re-triggering is a no-op while already triggered — a second
+        //    body walking in mid-drop must not restart the clock. ───────────────
+        {
+            var (node, hatch, _) = MakeRig();
+            var playerA = new PlayerController();
+            var playerB = new PlayerController();
+            node.OnBodyEntered(playerA);
+            node._PhysicsProcess(TrapDB.TrapdoorDelay * 0.5f);
+            float timerBefore = node.DebugTimer;
+            node.OnBodyEntered(playerB); // should be ignored — already triggered
+            Check(node.DebugTimer == timerBefore, "re-entry mid-drop: timer not reset");
+            playerA.Free();
+            playerB.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 6: drop-trap two-floor semantics ───────────────────────────────
+        //    A trapdoor now builds its OWN landing one floor below (so a fall always
+        //    terminates on a solid floor) and ARMS only when that landing is connected
+        //    to a neighbour it can walk out to. No room for a landing (world bottom) or
+        //    an unconnected landing is inert: the floor stays solid, no hatch. Exercises
+        //    the real TrapBehaviours.Decorate entry point with throwaway owner/body
+        //    never added to a SceneTree. ─────────────────────────────────────────────
+        {
+            int Fmin = DungeonBuilder.FloorMin, Fmax = DungeonBuilder.FloorMax;
+
+            bool HasHatch(DungeonBuilder o)
+            {
+                foreach (var child in o.GetChildren())
+                    if (child.Name.ToString().StartsWith("TrapdoorHatch_")) return true;
+                return false;
+            }
+
+            void Decorate(DungeonBuilder o, MazePiece trap, List<MazePiece> all)
+                => TrapBehaviours.Decorate(o, new StaticBody3D(), trap, 0f,
+                       MazeLookup.Build(all, Fmin, Fmax));
+
+            // 6a: world's bottom floor — no room for a landing below → inert.
+            var o1 = new DungeonBuilder();
+            var bottom = new List<MazePiece> {
+                new() { Type = PieceType.TrapDoor, X = 0, Y = 0, Floor = Fmin, Rotation = 0 } };
+            Decorate(o1, bottom[0], bottom);
+            Check(!HasHatch(o1), "TrapDoor at world bottom: no room for a landing -> inert, no hatch");
+            o1.Free();
+
+            // 6b: landing has no neighbour to walk out to → inert.
+            var o2 = new DungeonBuilder();
+            var lonely = new List<MazePiece> {
+                new() { Type = PieceType.TrapDoor, X = 0, Y = 0, Floor = Fmin + 2, Rotation = 0 } };
+            Decorate(o2, lonely[0], lonely);
+            Check(!HasHatch(o2), "TrapDoor with an unconnected landing: inert, no hatch");
+            o2.Free();
+
+            // 6c: a corridor beside the landing, opening toward it, arms the trap. The
+            //     trapdoor is N|S at (0,0); a Straight at the landing's south neighbour
+            //     (0,1) on Floor-1 opens N back at it -> connected -> hatch builds.
+            var o3 = new DungeonBuilder();
+            var conn = new List<MazePiece> {
+                new() { Type = PieceType.TrapDoor, X = 0, Y = 0, Floor = Fmin + 2, Rotation = 0 },
+                new() { Type = PieceType.Straight, X = 0, Y = 1, Floor = Fmin + 1, Rotation = 0 },
+            };
+            Decorate(o3, conn[0], conn);
+            Check(HasHatch(o3), "TrapDoor with a connected landing: arms, hatch builds");
+            o3.Free();
+
+            // 6d: a neighbour on the trapdoor's CLOSED axis (east of an N|S trapdoor)
+            //     doesn't connect the landing -> still inert.
+            var o4 = new DungeonBuilder();
+            var offAxis = new List<MazePiece> {
+                new() { Type = PieceType.TrapDoor, X = 0, Y = 0, Floor = Fmin + 2, Rotation = 0 },
+                new() { Type = PieceType.Straight, X = 1, Y = 0, Floor = Fmin + 1, Rotation = 1 },
+            };
+            Decorate(o4, offAxis[0], offAxis);
+            Check(!HasHatch(o4), "TrapDoor landing neighbour on the closed axis: not connected, inert");
+            o4.Free();
+        }
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+}

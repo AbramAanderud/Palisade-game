@@ -1,0 +1,78 @@
+using Godot;
+
+/// test/TestKnifeInGame.cs
+/// Windowed repro for "I don't see the knife in hand": loads the REAL
+/// TrainingArena and DungeonArena, presses the real key-3 input, then logs
+/// where the FP knife mesh actually is (visibility, layers, size, distance to
+/// camera) and screenshots to screenshots/knife_ingame/. Rendered-frame timed.
+public partial class TestKnifeInGame : Node
+{
+    public override void _Ready()
+    {
+        GetTree().Root.CallDeferred(Node.MethodName.AddChild, new KnifeInGameWatcher());
+        GetTree().CallDeferred(SceneTree.MethodName.ChangeSceneToFile,
+                               "res://scenes/TrainingArena.tscn");
+    }
+}
+
+public partial class KnifeInGameWatcher : Node
+{
+    static readonly string[] Scenes =
+    {
+        "res://scenes/TrainingArena.tscn",
+        "res://scenes/DungeonArena.tscn",
+    };
+    const string Out = "res://screenshots/knife_ingame/";
+    int _scene, _frame;
+
+    public override void _Ready() =>
+        DirAccess.MakeDirRecursiveAbsolute(ProjectSettings.GlobalizePath(Out));
+
+    static void Key3(bool on) =>
+        Input.ParseInputEvent(new InputEventAction { Action = "weapon_melee", Pressed = on });
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+        string name = Scenes[_scene].GetFile().GetBaseName();
+        if (_frame == 150) Key3(true);
+        if (_frame == 153) Key3(false);
+        if (_frame != 220) return;
+
+        var p   = Find(GetTree().CurrentScene);
+        var cam = GetViewport().GetCamera3D();
+        GD.Print($"[InGame] {name}: player={p != null} held={p?.Gun?.Def.Id} knifeOut={p?.KnifeOut} " +
+                 $"cam={cam?.Name} camPos={cam?.GlobalPosition} cullMask={cam?.CullMask}");
+        if (p != null && p.FindChild("HeldWeapon", true, false) is Node3D held)
+        {
+            GD.Print($"[InGame]   HeldWeapon vis={held.IsVisibleInTree()} self={held.Visible} parent={held.GetParent()?.Name}");
+            Walk(held, cam);
+        }
+        var img = GetViewport().GetTexture().GetImage();
+        img.SavePng(ProjectSettings.GlobalizePath(Out + name + ".png"));
+
+        if (++_scene < Scenes.Length) { _frame = 0; GetTree().ChangeSceneToFile(Scenes[_scene]); return; }
+        GetTree().Quit();
+    }
+
+    static void Walk(Node n, Camera3D? cam)
+    {
+        if (n is MeshInstance3D mi)
+        {
+            var box = mi.GlobalTransform * mi.GetAabb();
+            GD.Print($"[InGame]   mesh {mi.Name} vis={mi.IsVisibleInTree()} layers={mi.Layers} " +
+                     $"size={box.Size} dist={cam?.GlobalPosition.DistanceTo(box.GetCenter()):F2} " +
+                     $"inFront={(cam != null && !cam.IsPositionBehind(box.GetCenter()))}");
+        }
+        foreach (Node c in n.GetChildren()) Walk(c, cam);
+    }
+
+    static PlayerController? Find(Node? root)
+    {
+        if (root == null) return null;
+        if (root is PlayerController { IsRemotePuppet: false } pc) return pc;
+        foreach (var c in root.GetChildren())
+            if (Find(c) is { } hit) return hit;
+        return null;
+    }
+}

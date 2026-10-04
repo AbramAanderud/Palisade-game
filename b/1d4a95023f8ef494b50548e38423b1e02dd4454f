@@ -1,0 +1,55 @@
+using Godot;
+
+/// res://test/TestTask.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Wallhack beacon verification: a marked puppet stands BEHIND a solid wall,
+/// one floor BELOW the camera — exactly the "they're below you somewhere" case
+/// the beacon exists for. Frames at 2fps catch different strobe phases, so
+/// comparing two frames proves the flash; the column must punch through both
+/// the wall and the floor plane.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTask : Node3D
+{
+    public override void _Ready()
+    {
+        var env = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.10f, 0.11f, 0.14f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(1f, 1f, 1f),
+            AmbientLightEnergy = 0.7f,
+        };
+        AddChild(new WorldEnvironment { Environment = env });
+        var sun = new DirectionalLight3D { LightEnergy = 1.2f };
+        sun.RotationDegrees = new Vector3(-45f, 30f, 0f);
+        AddChild(sun);
+
+        // Ground for the puppet (lower level) and a big wall between it and us.
+        AddBox(new Vector3(0f, -9f, -10f), new Vector3(30f, 1f, 30f), new Color(0.25f, 0.26f, 0.25f));
+        AddBox(new Vector3(0f, 0f, -6f),  new Vector3(24f, 24f, 0.5f), new Color(0.35f, 0.33f, 0.30f));
+
+        var puppet = PlayerController.Spawn(this, new Vector3(0f, -8.3f, -14f), 0f);
+        puppet.IsRemotePuppet = true;
+        puppet.ShowWallhackOutline(float.PositiveInfinity);
+
+        // Spectator camera on OUR side of the wall, a floor above the puppet.
+        var cam = new Camera3D { Fov = 70f, CullMask = ~4u };
+        AddChild(cam);
+        cam.Position = new Vector3(0f, 2.0f, 4f);
+        cam.LookAt(new Vector3(0f, -4f, -14f), Vector3.Up);
+        cam.MakeCurrent();
+    }
+
+    void AddBox(Vector3 pos, Vector3 size, Color col)
+    {
+        var body = new StaticBody3D();
+        body.AddChild(new CollisionShape3D { Shape = new BoxShape3D { Size = size } });
+        var mi = new MeshInstance3D { Mesh = new BoxMesh { Size = size } };
+        mi.SetSurfaceOverrideMaterial(0,
+            new StandardMaterial3D { AlbedoColor = col, Roughness = 1f, Metallic = 0f });
+        body.AddChild(mi);
+        AddChild(body);
+        body.GlobalPosition = pos;
+    }
+}

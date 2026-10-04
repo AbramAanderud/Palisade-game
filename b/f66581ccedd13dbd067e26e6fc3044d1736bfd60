@@ -1,0 +1,51 @@
+using System.Collections.Generic;
+
+/// res://scripts/MazeLookup.cs — the ONE shared implementation of the multi-cell
+/// piece lookup contract: "which MazePiece occupies (x, y, floor)?"
+///
+/// Most pieces occupy exactly the cell they're placed in, but a Pit claims a 3x3
+/// footprint across up to three floors (see PieceDB.Footprint/FloorSpan). Any
+/// lookup built ANCHOR-ONLY (i.e. `lookup[(p.X, p.Y, p.Floor)] = p`) can never be
+/// found by a piece adjacent to one of the pit's PERIMETER cells — the anchor's
+/// own four neighbours are all pit-owned cells themselves, so nothing outside the
+/// pit can ever resolve it through the anchor key. Every real connection to a pit
+/// runs through a perimeter cell, so an anchor-only lookup makes every pit
+/// unreachable from geometry generation and validation alike (see JOURNAL.md,
+/// 2026-08-28 "every Pit is sealed off from the maze" fix).
+///
+/// DungeonBuilder.Build and MazeValidator.IsGameReady both used to hand-roll
+/// their own version of this lookup — one anchor-only (the bug), one
+/// footprint-aware (correct) — which is exactly how they drifted apart. Both now
+/// call this helper so the multi-cell contract has one implementation, not two.
+///
+/// Deliberately routes through PieceDB.Footprint/FloorSpan instead of
+/// special-casing PieceType.Pit by name, so a future multi-cell piece type is
+/// picked up automatically.
+///
+/// Note on canonicalisation: this lookup registers a multi-cell piece under
+/// EVERY cell it occupies — callers that need "one visited node per piece"
+/// semantics (MazeValidator's BFS) must canonicalise their own visited-set keys
+/// back to the anchor cell; this helper only builds the raw cell -> piece map.
+public static class MazeLookup
+{
+    /// Builds a footprint-aware (x, y, floor) -> MazePiece lookup from `pieces`,
+    /// clipping any floor span to [floorMin, floorMax] (a pit anchored near the
+    /// top or bottom of the world loses the clipped floor but stays valid).
+    public static Dictionary<(int, int, int), MazePiece> Build(
+        IEnumerable<MazePiece> pieces, int floorMin, int floorMax)
+    {
+        var lookup = new Dictionary<(int, int, int), MazePiece>();
+        foreach (var p in pieces)
+        {
+            var footprint = PieceDB.Footprint(p.Type);
+            foreach (int floorOffset in PieceDB.FloorSpan(p.Type))
+            {
+                int f = p.Floor + floorOffset;
+                if (f < floorMin || f > floorMax) continue;
+                foreach (var (dx, dy) in footprint)
+                    lookup[(p.X + dx, p.Y + dy, f)] = p;
+            }
+        }
+        return lookup;
+    }
+}

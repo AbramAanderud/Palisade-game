@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://chalmu6h8fp0w"]
+
+[ext_resource type="Script" path="res://test/TestArenaPerf.cs" id="1_s"]
+
+[node name="TestArenaPerf" type="Node3D"]
+script = ExtResource("1_s")

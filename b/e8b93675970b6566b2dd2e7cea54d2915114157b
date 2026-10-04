@@ -1,0 +1,71 @@
+using Godot;
+
+/// res://scripts/OneHandArmPose.cs
+/// First-person only: collapses the viewmodel arm that is NOT holding the
+/// weapon while a one-handed weapon (GunDef.OneHanded — the knife) is out, so
+/// it reads as held in one hand. The FP arms only have two-handed weapon
+/// clips, so rather than author a new clip this runs as a SkeletonModifier3D:
+/// Godot applies it AFTER the AnimationPlayer every frame, so the clip can
+/// never overwrite it. Toggle with the built-in `Active`.
+///
+/// Which arm is "free" is decided from `WeaponHandBone` (the bone the
+/// viewmodel weapon is attached to), NOT assumed to be the left: this rig
+/// names its bones hand_l / hand_r and the weapon attach resolves to hand_l,
+/// so collapsing a hard-coded left arm shrank the knife itself to nothing.
+///
+/// The free arm is scaled to ~0 at the upper arm (forearm and hand shrink into
+/// the shoulder, behind the camera). The opponent's third-person body is a
+/// different skeleton and is not affected.
+public partial class OneHandArmPose : SkeletonModifier3D
+{
+    /// Name of the bone the FP weapon hangs from; the OTHER side collapses.
+    public string WeaponHandBone = "";
+
+    int  _bone     = -2;   // -2 = not looked up yet, -1 = not found
+    bool _reported = false;
+
+    static bool IsLeft(string n)
+    {
+        n = n.ToLowerInvariant();
+        return n.Contains("left") || n.EndsWith("_l") || n.EndsWith(".l");
+    }
+
+    static bool IsRight(string n)
+    {
+        n = n.ToLowerInvariant();
+        return n.Contains("right") || n.EndsWith("_r") || n.EndsWith(".r");
+    }
+
+    int FindFreeUpperArm(Skeleton3D skel)
+    {
+        // Weapon in the left hand → the right arm is free, and vice versa.
+        // Unknown side: fall back to collapsing the left.
+        bool freeIsRight = IsLeft(WeaponHandBone);
+        for (int i = 0; i < skel.GetBoneCount(); i++)
+        {
+            var name = skel.GetBoneName(i);
+            var n    = name.ToLowerInvariant().Replace("_", "").Replace(".", "");
+            if (!n.Contains("upperarm")) continue;
+            if (freeIsRight ? IsRight(name) : IsLeft(name)) return i;
+        }
+        return -1;
+    }
+
+    public override void _ProcessModificationWithDelta(double delta)
+    {
+        var skel = GetSkeleton();
+        if (skel == null) return;
+
+        if (_bone == -2) _bone = FindFreeUpperArm(skel);
+        if (!_reported)
+        {
+            _reported = true;
+            GD.Print(_bone >= 0
+                ? $"[OneHand] weapon on '{WeaponHandBone}', collapsing '{skel.GetBoneName(_bone)}'"
+                : "[OneHand] no free upper-arm bone found — one-handed pose disabled");
+        }
+        if (_bone < 0) return;
+
+        skel.SetBonePoseScale(_bone, Vector3.One * 0.001f);
+    }
+}

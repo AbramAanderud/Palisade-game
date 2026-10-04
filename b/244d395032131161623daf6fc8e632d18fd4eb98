@@ -1,0 +1,99 @@
+using System.Collections.Generic;
+using Godot;
+
+/// test/TestRoomStairLanding.cs
+/// Bug: a room one floor up at a stair's top end built a solid wall across
+/// the landing, although MazeValidator counts the two as connected.
+///
+/// A stair's CROSS face exits onto stair.Floor + StairFloorDelta, not its own
+/// floor. MazeValidator steps onto that floor, and AddStairGeometry skips its
+/// own cap wall when it finds the room there — but RoomBuilder only looked for
+/// neighbours on the room's own floor, found none, and sealed the face.
+public partial class TestRoomStairLanding : Node
+{
+    int _fail;
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    const float CS = DungeonBuilder.CellSize;
+    const float FH = DungeonBuilder.FloorHeight;
+
+    /// True when some triangle lying in the plane z=`z` covers the point (x, y).
+    static bool WallAtZCovers(Mesh? mesh, float z, float x, float y, float eps = 0.05f)
+    {
+        if (mesh == null) return false;
+        var f = mesh.GetFaces();
+        for (int i = 0; i + 2 < f.Length; i += 3)
+        {
+            Vector3 a = f[i], b = f[i + 1], c = f[i + 2];
+            if (Mathf.Abs(a.Z - z) > eps || Mathf.Abs(b.Z - z) > eps || Mathf.Abs(c.Z - z) > eps)
+                continue;
+            if (PointInTri(new(x, y), new(a.X, a.Y), new(b.X, b.Y), new(c.X, c.Y))) return true;
+        }
+        return false;
+    }
+
+    static bool PointInTri(Vector2 p, Vector2 a, Vector2 b, Vector2 c)
+    {
+        float d1 = (p - b).Cross(a - b), d2 = (p - c).Cross(b - c), d3 = (p - a).Cross(c - a);
+        bool neg = d1 < 0 || d2 < 0 || d3 < 0, pos = d1 > 0 || d2 > 0 || d3 > 0;
+        return !(neg && pos);
+    }
+
+    /// Builds `pieces` and reports whether the room cell's wall seals the point
+    /// (doorway centre, `yFeet` + 2 m) on plane z=`z`.
+    bool RoomWallBlocks(string name, List<MazePiece> pieces, int rx, int ry, int rFloor, float z, float yFeet)
+    {
+        var dungeon = new DungeonBuilder();
+        AddChild(dungeon);
+        dungeon.Build(new MazeData { Name = name, Pieces = pieces });
+        var wall = dungeon.GetNodeOrNull<MeshInstance3D>($"Cell_{rx}_{ry}_{rFloor}/WallRoom_{rx}_{ry}");
+        Check(wall != null, $"{name}: room cell built a WallRoom mesh");
+        bool blocked = WallAtZCovers(wall?.Mesh, z, rx * CS + CS * 0.5f, yFeet + 2f);
+        dungeon.QueueFree();
+        return blocked;
+    }
+
+    public override void _Ready()
+    {
+        GD.Print("── Room at a stair's cross-floor end ──");
+
+        // StairsUp (4,5) F0 rot 0 → cross face N, lands on F1. Room (4,4) F1,
+        // its S face is z=50. A corridor off the stair's low end keeps the maze sane.
+        var up = new List<MazePiece>
+        {
+            new() { Type = PieceType.Straight, X = 4, Y = 6, Floor = 0 },
+            new() { Type = PieceType.StairsUp, X = 4, Y = 5, Floor = 0, Rotation = 0 },
+            new() { Type = PieceType.Room,     X = 4, Y = 4, Floor = 1 },
+        };
+        Check(!RoomWallBlocks("UpTop", up, 4, 4, 1, 5 * CS, 1 * FH),
+              "StairsUp top end: room above leaves the landing open");
+
+        // StairsDown (4,5) F1 rot 0 → cross face S, lands on F0. Room (4,6) F0,
+        // its N face is z=60.
+        var down = new List<MazePiece>
+        {
+            new() { Type = PieceType.Straight,   X = 4, Y = 4, Floor = 1 },
+            new() { Type = PieceType.StairsDown, X = 4, Y = 5, Floor = 1, Rotation = 0 },
+            new() { Type = PieceType.Room,       X = 4, Y = 6, Floor = 0 },
+        };
+        Check(!RoomWallBlocks("DownBottom", down, 4, 6, 0, 6 * CS, 0 * FH),
+              "StairsDown bottom end: room below leaves the landing open");
+
+        // Control: StairsUp rot 2 (cross face S) — its N face is the low end on
+        // F0, so the room above on F1 has nothing arriving and must stay sealed.
+        var away = new List<MazePiece>
+        {
+            new() { Type = PieceType.StairsUp, X = 4, Y = 5, Floor = 0, Rotation = 2 },
+            new() { Type = PieceType.Room,     X = 4, Y = 4, Floor = 1 },
+        };
+        Check(RoomWallBlocks("UpAway", away, 4, 4, 1, 5 * CS, 1 * FH),
+              "control: stair not arriving at the room keeps the room's wall");
+
+        GD.Print(_fail == 0 ? "RESULT OK" : $"RESULT {_fail} FAILURE(S)");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

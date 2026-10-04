@@ -1,0 +1,781 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.Json;
+using Godot;
+
+/// res://scenes/OnlineFfaArena.cs — the online 3–4 player FFA arena (core).
+///
+/// Per-peer logic mirrors the 1v1 scenes/OnlineDungeonArena.cs; each mirrored
+/// method names its 1v1 counterpart in its doc comment. Flow:
+///   _Ready → send own "maze" → collect every roster seat's maze (re-requesting
+///   missing ones with a directed "ready_for_maze") → FfaWorld.Build → spawn the
+///   local player in the maze it runs + one RemotePeer puppet per other seat →
+///   frozen behind MatchCountdown, "arena_ready" → the HOST broadcasts "go" once
+///   every current roster seat is ready → 3-2-1 → GO: unfreeze, combat live,
+///   480 s clock.
+///
+/// Seats vs layout index: roster seats may be non-contiguous; FfaWorld owns the
+/// layout-index maths (MazeSeatRunBy, LayoutIndexOf). Every body fights on
+/// CombatTeam 100 + seat.
+///
+/// Task 4 seams (combat, pickups, end screen) are the partial methods declared
+/// under "Match-rule seams" below; implement them in OnlineFfaArena.Combat.cs.
+public partial class OnlineFfaArena : Node3D
+{
+    const double MatchClockSeconds = 480.0;
+    const string BuiltInMazeAuthor = "Corners";
+    const double ZoneCheckInterval = 0.2;
+    const int    MaxMazeRetries    = 15;       // 2 s apart → ~30 s
+    const int    ZoneUnknown       = int.MinValue;
+
+    // ── Nodes / services ─────────────────────────────────────────────────────
+    NetworkManager    _nm = null!;
+    FontFile?         _font;
+    CanvasLayer?      _loadingCanvas;
+    Label?            _loadingLabel;
+    PlayerController? _localPlayer;
+    FfaWorld?         _world;
+    MatchCountdown?   _countdown;
+    CanvasLayer?      _leaveDialog;
+    Timer?            _mazeRetryTimer;
+    Timer?            _matchClock;
+    Label?            _clockLabel;
+
+    int _mySeat;
+    int _localMazeSeat = -1;
+    readonly Dictionary<int, string> _nameBySeat = new();
+
+    // ── Maze exchange ────────────────────────────────────────────────────────
+    readonly Dictionary<int, MazeData> _mazes       = new();
+    readonly Dictionary<int, string>   _mazeAuthors = new();
+    string? _ownMazeJsonEscaped;
+    string  _ownMazeAuthor = "";
+    int     _mazeRetries;
+    bool    _arenaBuilt;
+    bool    _leaving;
+
+    // ── Peers / roster ───────────────────────────────────────────────────────
+    readonly Dictionary<int, RemotePeer> _peers     = new();
+    readonly HashSet<int>                _leftSeats = new();
+
+    // ── Start gate ───────────────────────────────────────────────────────────
+    readonly HashSet<int> _readySeats = new();
+    bool _goSent;             // host: already broadcast "go"
+    bool _goPending;          // "go" arrived before our own build finished
+    bool _countdownStarted;
+    bool _matchLive;
+
+    // ── Zones / signs ────────────────────────────────────────────────────────
+    readonly Dictionary<int, int>            _zoneBySeat  = new();
+    readonly Dictionary<int, List<MazeSign>> _signsByMaze = new();
+    int    _localZone = ZoneUnknown;
+    double _zoneCheckAccum;
+
+    // ── Test hooks (TEST-ONLY: read by the FFA tests; not gameplay API) ──────
+    /// TEST-ONLY. Number of PeerLeft events handled (replayed pending ones included).
+    public int PeerLeftCount { get; private set; }
+    /// TEST-ONLY. Remote puppets currently in the match.
+    public int PuppetCount => _peers.Count;
+    /// TEST-ONLY. True from the GO beat onward.
+    public bool MatchLive => _matchLive;
+    /// TEST-ONLY. Seat of the maze the local player runs (−1 before the build).
+    public int LocalMazeSeat => _localMazeSeat;
+    /// TEST-ONLY. Local player's world position (zero before spawn).
+    public Vector3 LocalPosition => _localPlayer != null && IsInstanceValid(_localPlayer)
+        ? _localPlayer.GlobalPosition : Vector3.Zero;
+    /// TEST-ONLY. seat → maze seat it is in (−1 = arena/hall-less area), as last reported.
+    public IReadOnlyDictionary<int, int> ZoneBySeat => _zoneBySeat;
+
+    bool IsHost => OnlineGameState.FfaHostSeat == _mySeat;
+    IEnumerable<int> LiveSeats =>
+        OnlineGameState.FfaRoster.Select(e => e.Seat).Where(s => !_leftSeats.Contains(s));
+
+    string NameOf(int seat) =>
+        _nameBySeat.TryGetValue(seat, out var n) && n.Length > 0 ? n : $"Player {seat + 1}";
+
+    // ── Match-rule seams (Task 4: OnlineFfaArena.Combat.cs) ──────────────────
+    /// After the world is built and every body spawned (before arena_ready is sent).
+    partial void OnArenaSpawned();
+    /// At the GO beat, after combat unlocks and the clock starts.
+    partial void OnMatchGo();
+    /// The 480 s clock ran out.
+    partial void OnMatchClockExpired();
+    /// A seat left the party (after the core removed its puppet and readiness).
+    partial void OnSeatLeft(int seat);
+    /// Every game-data message the core does not handle (hit, dmg, die,
+    /// loadout, pickup_*, end, ...). `from` is the relay-stamped sender seat.
+    partial void OnMatchData(string t, JsonElement root, int from);
+
+    // ── Ready ────────────────────────────────────────────────────────────────
+    /// Mirrors OnlineDungeonArena._Ready.
+    public override void _Ready()
+    {
+        _nm = GetNode<NetworkManager>("/root/NetworkManager");
+        if (!OnlineGameState.IsFfa)
+        {
+            GD.PushError("[FFA] OnlineFfaArena opened outside an FFA match — back to title.");
+            _leaving = true;
+            CallDeferred(nameof(GoToTitle));
+            return;
+        }
+        _font   = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
+        _mySeat = OnlineGameState.FfaSeat;
+        foreach (var e in OnlineGameState.FfaRoster) _nameBySeat[e.Seat] = e.Name;
+        if (!_nameBySeat.TryGetValue(_mySeat, out var myName) || myName.Length == 0)
+            _nameBySeat[_mySeat] = OnlineGameState.PlayerName.Length > 0 ? OnlineGameState.PlayerName : "You";
+
+        _nm.GameDataReceived += OnGameData;
+        // Replay peer_lefts that arrived before this scene loaded, then subscribe.
+        foreach (var (seat, hostSeat) in _nm.PendingPeerLefts.ToArray()) OnPeerLeft(seat, hostSeat);
+        _nm.PendingPeerLefts.Clear();
+        _nm.PeerLeft += OnPeerLeft;
+        SubscribeConnectionLoss(true);
+
+        BuildEnvironment();
+
+        // Position broadcast at 30 Hz — the same timer as the 1v1 arena.
+        var timer = new Timer { WaitTime = 0.033f, Autostart = true, Name = "BroadcastTimer" };
+        timer.Timeout += BroadcastPosition;
+        AddChild(timer);
+
+        SetupShared();
+        if (_leaving) return;
+
+        var canvas = new CanvasLayer();
+        AddChild(canvas);
+        var hint = new Label { Text = "ESC = leave match", Position = new Vector2(10, 10) };
+        if (_font != null) hint.AddThemeFontOverride("font", _font);
+        hint.AddThemeFontSizeOverride("font_size", 13);
+        hint.AddThemeColorOverride("font_color", new Color(0.7f, 0.7f, 0.7f));
+        canvas.AddChild(hint);
+    }
+
+    public override void _ExitTree()
+    {
+        if (_nm != null)
+        {
+            _nm.GameDataReceived -= OnGameData;
+            _nm.PeerLeft         -= OnPeerLeft;
+            SubscribeConnectionLoss(false);
+        }
+        // Safety net: never leave the cursor captured when the arena unloads.
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+    }
+
+    void GoToTitle()      => GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
+    void GoToPlayScreen() => GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
+
+    /// Mirrors OnlineDungeonArena._Process (clock label + zone poll).
+    public override void _Process(double delta)
+    {
+        if (_matchClock != null && !_matchClock.IsStopped() && _clockLabel != null)
+        {
+            int secs = (int)Math.Ceiling(_matchClock.TimeLeft);
+            _clockLabel.Text = $"{secs / 60}:{secs % 60:00}";
+        }
+
+        _zoneCheckAccum += delta;
+        if (_zoneCheckAccum >= ZoneCheckInterval)
+        {
+            _zoneCheckAccum = 0;
+            UpdateLocalZone();
+        }
+    }
+
+    /// Mirrors OnlineDungeonArena.BuildEnvironment.
+    void BuildEnvironment()
+    {
+        var worldEnv = new WorldEnvironment();
+        var env      = new Godot.Environment();
+        env.BackgroundMode     = Godot.Environment.BGMode.Color;
+        env.BackgroundColor    = new Color(0f, 0f, 0f);
+        env.AmbientLightSource = Godot.Environment.AmbientSource.Color;
+        env.AmbientLightColor  = new Color(0.10f, 0.07f, 0.04f);
+        env.AmbientLightEnergy = 0.25f;
+        env.TonemapMode        = Godot.Environment.ToneMapper.Filmic;
+        env.TonemapExposure    = 1.3f;
+        VisualFlair.ApplyEnvironment(env);
+        worldEnv.Environment   = env;
+        AddChild(worldEnv);
+    }
+
+    // ── Maze exchange ────────────────────────────────────────────────────────
+
+    /// Mirrors OnlineDungeonArena.SetupShared: load own maze (DefaultMaze
+    /// sentinel included), broadcast it with `by`, show the loading screen and
+    /// start the 2 s retry timer.
+    void SetupShared()
+    {
+        int slot = OnlineGameState.SelectedMazeSlot;
+        var data = slot == DefaultMaze.SentinelSlot ? DefaultMaze.Build() : MazeSerializer.Load(slot);
+        if (data == null || data.Pieces.Count == 0)
+        {
+            GD.PushError("[FFA] Missing own maze data — leaving the party.");
+            _leaving = true;
+            _nm.PartyLeave();
+            _nm.Disconnect();
+            CallDeferred(nameof(GoToPlayScreen));
+            return;
+        }
+
+        _mazes[_mySeat]       = data;
+        _ownMazeAuthor        = slot == DefaultMaze.SentinelSlot ? BuiltInMazeAuthor : NameOf(_mySeat);
+        _mazeAuthors[_mySeat] = _ownMazeAuthor;
+        _ownMazeJsonEscaped   = JsonSerializer.Serialize(JsonSerializer.Serialize(data));
+        _nm.SendGameData(MazePayload(null));
+
+        ShowLoadingScreen();
+
+        _mazeRetryTimer = new Timer { WaitTime = 2.0, Autostart = true, Name = "MazeRetry" };
+        _mazeRetryTimer.Timeout += OnMazeRetry;
+        AddChild(_mazeRetryTimer);
+
+        GD.Print($"[FFA] Seat {_mySeat} sent own maze (slot {slot}). Waiting for " +
+                 $"{LiveSeats.Count() - 1} other maze(s)…");
+    }
+
+    /// Own "maze" message (1v1 shape); `to` = directed reply, null = broadcast.
+    string MazePayload(int? to)
+    {
+        string safeBy = JsonSerializer.Serialize(_ownMazeAuthor);
+        string toPart = to.HasValue ? $"\"to\":{to.Value}," : "";
+        return $"{{\"t\":\"maze\",{toPart}\"json\":{_ownMazeJsonEscaped},\"by\":{safeBy}}}";
+    }
+
+    /// Mirrors OnlineDungeonArena.ShowLoadingScreen.
+    void ShowLoadingScreen()
+    {
+        _loadingCanvas = new CanvasLayer { Name = "LoadingCanvas" };
+        var bg = new ColorRect { Color = new Color(0.04f, 0.04f, 0.06f) };
+        bg.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        _loadingCanvas.AddChild(bg);
+
+        _loadingLabel = new Label
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment   = VerticalAlignment.Center,
+        };
+        _loadingLabel.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        if (_font != null) _loadingLabel.AddThemeFontOverride("font", _font);
+        _loadingLabel.AddThemeFontSizeOverride("font_size", 28);
+        _loadingLabel.AddThemeColorOverride("font_color", Colors.White);
+        _loadingCanvas.AddChild(_loadingLabel);
+        AddChild(_loadingCanvas);
+        UpdateLoadingLabel();
+    }
+
+    void UpdateLoadingLabel()
+    {
+        if (_loadingLabel == null) return;
+        var live = LiveSeats.ToList();
+        _loadingLabel.Text = $"Exchanging mazes… ({live.Count(_mazes.ContainsKey)}/{live.Count})";
+    }
+
+    /// Mirrors OnlineDungeonArena.OnOpponentMazeRetry, per seat: a directed
+    /// ready_for_maze to each live seat whose maze is still missing; gives up
+    /// after 15 tries (~30 s) → leave the party → PlayGameScreen.
+    void OnMazeRetry()
+    {
+        if (_arenaBuilt || _leaving) return;
+        _mazeRetries++;
+        if (_mazeRetries > MaxMazeRetries)
+        {
+            GD.PushError("[FFA] Gave up waiting for the other mazes after 30 s.");
+            _mazeRetryTimer?.Stop();
+            _leaving = true;
+            if (_loadingLabel != null) _loadingLabel.Text = "Could not receive every maze.\nReturning to lobby…";
+            GetTree().CreateTimer(3.0).Timeout += () =>
+            {
+                if (!IsInstanceValid(this)) return;
+                _nm.PartyLeave();
+                _nm.Disconnect();
+                GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
+            };
+            return;
+        }
+        foreach (int seat in LiveSeats.Where(s => !_mazes.ContainsKey(s)))
+        {
+            GD.Print($"[FFA] Re-requesting seat {seat}'s maze (attempt {_mazeRetries})");
+            _nm.SendGameData($"{{\"t\":\"ready_for_maze\",\"to\":{seat}}}");
+        }
+    }
+
+    /// Mirrors OnlineDungeonArena.OnGameData `case "maze"`, keyed by sender seat.
+    void OnMazeReceived(JsonElement root, int from)
+    {
+        if (_mazes.ContainsKey(from) || _leftSeats.Contains(from)) return;
+        if (!OnlineGameState.FfaRoster.Any(e => e.Seat == from)) return;
+        try
+        {
+            if (root.TryGetProperty("by", out var byProp) && byProp.GetString() is string by && by.Length > 0)
+                _mazeAuthors[from] = by;
+            string mazeJson = root.GetProperty("json").GetString()!;
+            var data = JsonSerializer.Deserialize<MazeData>(mazeJson)!;
+            // Raw JSON never touches MazeSerializer, so it needs the same
+            // (deterministic) normalisation on every peer.
+            int fixedPads = data.NormalizeTeleporters();
+            if (fixedPads > 0) GD.Print($"[FFA] seat {from} maze: re-paired {fixedPads} teleport pad(s)");
+            if (data.Pieces.Count == 0) throw new InvalidOperationException("empty maze");
+            _mazes[from] = data;
+            GD.Print($"[FFA] Received seat {from}'s maze ({mazeJson.Length} chars).");
+            UpdateLoadingLabel();
+            TryBuildArenaAndSpawn();
+        }
+        catch (Exception ex)
+        {
+            GD.PushError($"[FFA] Bad maze JSON from seat {from} — {ex.Message}");
+        }
+    }
+
+    // ── World build + spawn ──────────────────────────────────────────────────
+
+    /// Mirrors OnlineDungeonArena.TryBuildArenaAndSpawn: builds once every live
+    /// roster seat's maze is in hand, spawns the local player in the maze it
+    /// runs and one puppet per other seat, then raises the start gate.
+    void TryBuildArenaAndSpawn()
+    {
+        if (_arenaBuilt || _leaving) return;
+        var live = LiveSeats.ToList();
+        if (!live.All(_mazes.ContainsKey)) return;
+        _arenaBuilt = true;
+
+        _mazeRetryTimer?.Stop();
+        _loadingCanvas?.QueueFree();
+        _loadingCanvas = null;
+        _loadingLabel  = null;
+
+        // Every maze in hand goes into the world: a seat that left AFTER its maze
+        // arrived keeps its (empty) maze, so the layout does not depend on when
+        // each client heard the leave. One that left before sending is dropped.
+        _world = FfaWorld.Build(this, Vector3.Zero, _mazes, OnlineGameState.FfaRotationOffset);
+        SpawnMazeSigns();
+
+        _localMazeSeat = _world.MazeSeatRunBy(_mySeat);
+        var localStart = _world.StartPosition(_localMazeSeat);
+        _localPlayer = PlayerController.Spawn(this, localStart, _world.StartYaw(_localMazeSeat));
+        if (_localPlayer.Gun != null) _localPlayer.Gun.CombatTeam = 100 + _mySeat;
+
+        foreach (int seat in live.Where(s => s != _mySeat))
+        {
+            var puppet = PlayerController.Spawn(this, _world.StartPosition(_world.MazeSeatRunBy(seat)), 0f);
+            puppet.IsRemotePuppet = true;
+            puppet.EnableWorldBars();
+            // Distinct team per body, or GunCombat's friendly-fire check eats PvP shots.
+            if (puppet.Gun != null) puppet.Gun.CombatTeam = 100 + seat;
+            _peers[seat] = new RemotePeer(seat, NameOf(seat), puppet);
+        }
+
+        // Every PlayerController grabs the camera on spawn: MakeActive AFTER the last one.
+        _localPlayer.MakeActive();
+        // Hold-R resets into YOUR maze (every DungeonBuilder.Build overwrote it).
+        DungeonBuilder.MazeStartPosition = localStart;
+
+        WireCosmeticRelay();
+        WireGateRelay();
+        SetCombatLocked(true);
+        OnArenaSpawned();
+
+        // Start gate: frozen behind the overlay until the host's "go".
+        _localPlayer.Frozen = true;
+        _countdown = new MatchCountdown
+        {
+            Font           = _font,
+            WaitingText    = "WAITING FOR PLAYERS",
+            WaitingSubText = "the countdown starts when everyone is in",
+        };
+        AddChild(_countdown);
+        _readySeats.Add(_mySeat);
+        _nm.SendGameData("{\"t\":\"arena_ready\"}");
+        GD.Print($"[FFA] Arena built ({_mazes.Count} mazes). Seat {_mySeat} runs maze {_localMazeSeat}; " +
+                 $"{_peers.Count} puppet(s).");
+        TryHostGo();
+        if (_goPending) StartCountdown();
+    }
+
+    /// Mirrors OnlineDungeonArena.SpawnMazeSigns: one plaque at each maze's
+    /// Start opening (facing down the maze) and one at the arena end of its
+    /// hallway (facing along DoorOutward).
+    void SpawnMazeSigns()
+    {
+        if (_world == null) return;
+        const float cell = DungeonBuilder.CellSize;
+        for (int i = 0; i < _world.SeatsInLayoutOrder.Count; i++)
+        {
+            int mazeSeat  = _world.SeatsInLayoutOrder[i];
+            var placement = _world.Layout.Seats[i];
+            var list      = new List<MazeSign>(2);
+            _signsByMaze[mazeSeat] = list;
+
+            var start = _world.RotatedMaze(mazeSeat).Pieces.FirstOrDefault(p => p.Type == PieceType.Start);
+            if (start != null)
+            {
+                Vector3 outward = DirToVector(PieceDB.GetOpenings(PieceType.Start, start.Rotation));
+                var centre = _world.ArenaCentre + placement.Offset +
+                             new Vector3((start.X + 0.5f) * cell, start.Floor * DungeonBuilder.FloorHeight,
+                                         (start.Y + 0.5f) * cell);
+                list.Add(MazeSign.Spawn(this, $"Sign{mazeSeat}Start", centre + outward * (cell * 0.5f), outward, _font));
+            }
+            list.Add(MazeSign.Spawn(this, $"Sign{mazeSeat}Hall", _world.ArenaCentre + placement.HallStart,
+                                    _world.DoorOutward(mazeSeat), _font));
+
+            string author = _mazeAuthors.TryGetValue(mazeSeat, out var a) ? a : NameOf(mazeSeat);
+            foreach (var s in list) s.SetAuthor(author);
+        }
+        RefreshSignOccupants();
+    }
+
+    static Vector3 DirToVector(Dir dir) =>
+        (dir & Dir.N) != 0 ? Vector3.Forward
+      : (dir & Dir.E) != 0 ? Vector3.Right
+      : (dir & Dir.S) != 0 ? Vector3.Back
+      :                      Vector3.Left;
+
+    /// Mirrors OnlineDungeonArena.SetCombatLocked, over every body.
+    void SetCombatLocked(bool locked)
+    {
+        foreach (var body in AllBodies())
+        {
+            var hp = body.GetNodeOrNull<PlayerHealth>("PlayerHealth");
+            if (hp != null) hp.Invulnerable = locked;
+        }
+        GD.Print($"[FFA] Combat {(locked ? "LOCKED" : "UNLOCKED")}");
+    }
+
+    IEnumerable<PlayerController> AllBodies()
+    {
+        if (_localPlayer != null && IsInstanceValid(_localPlayer)) yield return _localPlayer;
+        foreach (var p in _peers.Values)
+            if (IsInstanceValid(p.Puppet)) yield return p.Puppet;
+    }
+
+    // ── Start gate ───────────────────────────────────────────────────────────
+
+    /// Host only: broadcast "go" once every current roster seat is arena_ready.
+    /// Re-run on every arena_ready, on our own build and on PeerLeft (a leaver
+    /// can complete the set, and a handover can make us the host).
+    void TryHostGo()
+    {
+        if (!IsHost || _goSent || !_arenaBuilt || _leaving) return;
+        if (!LiveSeats.All(_readySeats.Contains)) return;
+        _goSent = true;
+        _nm.SendGameData("{\"t\":\"go\"}");
+        GD.Print("[FFA] Host: every seat ready — go.");
+        StartCountdown();
+    }
+
+    /// Mirrors OnlineDungeonArena.TryStartCountdown: 3-2-1, and at GO unfreeze,
+    /// unlock combat and start the match clock. Idempotent.
+    void StartCountdown()
+    {
+        if (!_arenaBuilt) { _goPending = true; return; }
+        if (_countdownStarted || _countdown == null || _localPlayer == null) return;
+        _countdownStarted = true;
+        _countdown.BeginCountdown(() =>
+        {
+            _countdown = null;
+            _matchLive = true;
+            if (_localPlayer != null && IsInstanceValid(_localPlayer) && _leaveDialog == null)
+                _localPlayer.Frozen = false;
+            SetCombatLocked(false);
+            StartMatchClock();
+            OnMatchGo();
+            GD.Print("[FFA] GO — match live.");
+        });
+    }
+
+    /// Mirrors OnlineDungeonArena.ShowCombatHud's timer label, for the 480 s clock.
+    void StartMatchClock()
+    {
+        var canvas = new CanvasLayer { Name = "ClockHud" };
+        AddChild(canvas);
+        _clockLabel = new Label
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            AnchorLeft          = 0.5f, AnchorRight = 0.5f,
+            AnchorTop           = 0f,
+            GrowHorizontal      = Control.GrowDirection.Both,
+        };
+        _clockLabel.OffsetLeft  = -80f;
+        _clockLabel.OffsetRight =  80f;
+        _clockLabel.OffsetTop   =  40f;
+        if (_font != null) _clockLabel.AddThemeFontOverride("font", _font);
+        _clockLabel.AddThemeFontSizeOverride("font_size", 34);
+        _clockLabel.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.2f));
+        canvas.AddChild(_clockLabel);
+
+        _matchClock = new Timer { WaitTime = MatchClockSeconds, OneShot = true, Name = "MatchClock" };
+        _matchClock.Timeout += () => OnMatchClockExpired();
+        AddChild(_matchClock);
+        _matchClock.Start();
+    }
+
+    // ── Zones ────────────────────────────────────────────────────────────────
+
+    /// Mirrors OnlineDungeonArena.UpdateLocalZone, with FfaWorld.MazeAt.
+    void UpdateLocalZone()
+    {
+        if (_world == null || _localPlayer == null || !IsInstanceValid(_localPlayer)) return;
+        int zone = _world.MazeAt(_localPlayer.GlobalPosition);
+        if (zone == _localZone) return;
+        _localZone = zone;
+        _zoneBySeat[_mySeat] = zone;
+        _nm.SendGameData($"{{\"t\":\"zone\",\"m\":{zone}}}");
+        RefreshSignOccupants();
+    }
+
+    /// Mirrors OnlineDungeonArena.RefreshSignOccupants, for every maze.
+    void RefreshSignOccupants()
+    {
+        foreach (var (mazeSeat, signs) in _signsByMaze)
+        {
+            var names = _zoneBySeat.Where(kv => kv.Value == mazeSeat && !_leftSeats.Contains(kv.Key))
+                                   .OrderBy(kv => kv.Key).Select(kv => NameOf(kv.Key));
+            string text = string.Join(" & ", names);
+            foreach (var s in signs) s.SetOccupants(text);
+        }
+    }
+
+    // ── Outgoing relays ──────────────────────────────────────────────────────
+
+    /// Mirrors the cosmetic half of OnlineDungeonArena.WireHitRelay (shot,
+    /// reload, dryfire, gunsel). The damage/death half is Task 4's.
+    void WireCosmeticRelay()
+    {
+        if (_localPlayer == null) return;
+        _localPlayer.AddShotEndpointListener(end =>
+            _nm.SendGameData($"{{\"t\":\"shot\",\"x\":{end.X:F2},\"y\":{end.Y:F2},\"z\":{end.Z:F2}}}"));
+        _localPlayer.AddReloadListener(() => _nm.SendGameData("{\"t\":\"reload\"}"));
+        _localPlayer.AddDryFireListener(() => _nm.SendGameData("{\"t\":\"dryfire\"}"));
+        _localPlayer.WeaponSwitched += id => _nm.SendGameData($"{{\"t\":\"gunsel\",\"id\":\"{id}\"}}");
+    }
+
+    /// Mirrors OnlineDungeonArena.WireGateRelay: builders (Maze{seat}) are
+    /// direct children of this node and gates direct children of a builder.
+    void WireGateRelay()
+    {
+        foreach (var side in GetChildren())
+            foreach (var child in side.GetChildren())
+                if (child is ShootingGateNode gate)
+                    gate.Destroyed += id => _nm.SendGameData($"{{\"t\":\"gate_down\",\"id\":\"{id}\"}}");
+    }
+
+    /// Mirrors OnlineDungeonArena.BroadcastPosition (same fields, 30 Hz).
+    void BroadcastPosition()
+    {
+        if (_localPlayer == null || !IsInstanceValid(_localPlayer) || !_nm.IsOpen || _localDead) return;
+        var pos  = _localPlayer.GlobalPosition;
+        var vel  = _localPlayer.Velocity;
+        int anim = _localPlayer.CurrentAnimStateIndex;
+        _nm.SendGameData(
+            $"{{\"t\":\"pos\",\"x\":{pos.X:F3},\"y\":{pos.Y:F3},\"z\":{pos.Z:F3}," +
+            $"\"vx\":{vel.X:F2},\"vy\":{vel.Y:F2},\"vz\":{vel.Z:F2}," +
+            $"\"yaw\":{_localPlayer.Yaw:F4},\"pitch\":{_localPlayer.Pitch:F4}," +
+            $"\"stam\":{_localPlayer.PlayerStamina:F1}," +
+            $"\"ex\":{(_localPlayer.IsExhausted ? 1 : 0)}," +
+            $"\"spr\":{(_localPlayer.IsSprintCarrying ? 1 : 0)}," +
+            $"\"aim\":{(_localPlayer.IsAimingNow ? 1 : 0)}," +
+            $"\"as\":{anim}}}");
+    }
+
+    // ── Incoming ─────────────────────────────────────────────────────────────
+
+    /// Mirrors OnlineDungeonArena.OnGameData, routed by the relay's `from` seat.
+    void OnGameData(string json)
+    {
+        if (_leaving) return;
+        JsonElement root;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            root = doc.RootElement.Clone();
+        }
+        catch { return; }
+
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("t", out var tProp)) return;
+        if (!root.TryGetProperty("from", out var fromProp) || fromProp.ValueKind != JsonValueKind.Number) return;
+        string t    = tProp.GetString() ?? "";
+        int    from = fromProp.GetInt32();
+        if (from == _mySeat || DropAfterEnd(t)) return;   // stop reacting once the match ended
+        _peers.TryGetValue(from, out var peer);
+
+        try
+        {
+            switch (t)
+            {
+                case "maze": OnMazeReceived(root, from); break;
+                case "ready_for_maze":
+                    if (_ownMazeJsonEscaped != null)
+                    {
+                        GD.Print($"[FFA] Re-sending own maze to seat {from}.");
+                        _nm.SendGameData(MazePayload(from));
+                    }
+                    break;
+                case "arena_ready":
+                    // Safe before OUR build: the set waits for it (TryHostGo checks _arenaBuilt).
+                    _readySeats.Add(from);
+                    TryHostGo();
+                    break;
+                case "go": StartCountdown(); break;
+                case "zone":
+                    if (root.TryGetProperty("m", out var zp) && zp.ValueKind == JsonValueKind.Number &&
+                        !_leftSeats.Contains(from))
+                    {
+                        _zoneBySeat[from] = zp.GetInt32();
+                        RefreshSignOccupants();
+                    }
+                    break;
+                case "pos":     peer?.ApplyPos(root);    break;
+                case "shot":    peer?.ApplyShot(root);   break;
+                case "reload":  peer?.ApplyReload();     break;
+                case "dryfire": peer?.ApplyDryFire();    break;
+                case "gunsel":  peer?.ApplyGunSel(root); break;
+                case "gate_down":
+                    if (root.TryGetProperty("id", out var gateId) && gateId.GetString() is string gid)
+                        OnlineDungeonArena.ApplyRemoteGateDown(this, gid);
+                    break;
+                default: OnMatchData(t, root, from); break;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Malformed fields from one peer must not take the arena down.
+            GD.PushWarning($"[FFA] dropped bad '{t}' from seat {from}: {ex.Message}");
+        }
+    }
+
+    /// Relay peer_left, which is also the host handover (the relay names the
+    /// new host). Mirrors the leave half of OnlineDungeonArena.OnPeerDisconnected;
+    /// scoring the leave is Task 4's (OnSeatLeft).
+    void OnPeerLeft(int seat, int hostSeat)
+    {
+        PeerLeftCount++;
+        OnlineGameState.FfaHostSeat = hostSeat;
+        if (seat == _mySeat || !_leftSeats.Add(seat)) return;
+        GD.Print($"[FFA] Seat {seat} left; host is now seat {hostSeat}.");
+
+        if (_peers.Remove(seat, out var peer)) peer.Remove();
+        _readySeats.Remove(seat);
+        _zoneBySeat.Remove(seat);
+        RefreshSignOccupants();
+        OnSeatLeft(seat);
+
+        if (!_arenaBuilt)
+        {
+            // A leaver whose maze never arrived must not stall the build.
+            UpdateLoadingLabel();
+            TryBuildArenaAndSpawn();
+        }
+        TryHostGo();
+    }
+
+    // ── Leave (ESC) ──────────────────────────────────────────────────────────
+
+    /// Mirrors OnlineDungeonArena._Input: ESC bails straight out while loading,
+    /// otherwise toggles the leave dialog. Consuming ESC here keeps PauseMenu
+    /// (an _UnhandledInput autoload) from also opening — same as the 1v1 arena.
+    public override void _Input(InputEvent ev)
+    {
+        if (!ev.IsActionPressed("pause") || _leaving) return;
+        if (ev is InputEventKey { Echo: true }) return;
+        if (EndingOrEnded) { GetViewport().SetInputAsHandled(); return; }   // end screen owns the UI
+
+        if (_localPlayer == null) { LeaveMatch(); GetViewport().SetInputAsHandled(); return; }
+
+        if (_leaveDialog != null) DismissLeaveDialog();
+        else                      ShowLeaveDialog();
+        GetViewport().SetInputAsHandled();
+    }
+
+    /// Mirrors OnlineDungeonArena.ShowSurrenderDialog.
+    void ShowLeaveDialog()
+    {
+        if (_leaveDialog != null) return;
+        if (_localPlayer != null && IsInstanceValid(_localPlayer))
+        {
+            _localPlayer.Frozen = true;
+            _localPlayer.ReleaseMouse();
+        }
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+
+        _leaveDialog = new CanvasLayer { Layer = 90 };
+        AddChild(_leaveDialog);
+
+        var bg = new ColorRect { Color = new Color(0f, 0f, 0f, 0.72f), MouseFilter = Control.MouseFilterEnum.Stop };
+        bg.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        _leaveDialog.AddChild(bg);
+
+        var vbox = new VBoxContainer();
+        vbox.AnchorLeft = 0.5f; vbox.AnchorRight  = 0.5f;
+        vbox.AnchorTop  = 0.5f; vbox.AnchorBottom = 0.5f;
+        vbox.GrowHorizontal = Control.GrowDirection.Both;
+        vbox.GrowVertical   = Control.GrowDirection.Both;
+        vbox.OffsetLeft = -240; vbox.OffsetRight  = 240;
+        vbox.OffsetTop  = -120; vbox.OffsetBottom = 120;
+        vbox.AddThemeConstantOverride("separation", 16);
+        _leaveDialog.AddChild(vbox);
+
+        vbox.AddChild(MakeLabel("Leave match?", 44, new Color(1f, 0.4f, 0.4f)));
+        vbox.AddChild(MakeLabel("The match carries on without you.", 18, new Color(0.85f, 0.85f, 0.85f)));
+
+        var btnRow = new HBoxContainer { Alignment = BoxContainer.AlignmentMode.Center };
+        btnRow.AddThemeConstantOverride("separation", 24);
+        vbox.AddChild(btnRow);
+
+        var keepBtn = MakeButton("Keep Fighting", new Color(0.6f, 0.95f, 0.6f));
+        keepBtn.Pressed += DismissLeaveDialog;
+        btnRow.AddChild(keepBtn);
+
+        var leaveBtn = MakeButton("Leave match", new Color(1f, 0.45f, 0.45f));
+        leaveBtn.Pressed += LeaveMatch;
+        btnRow.AddChild(leaveBtn);
+
+        keepBtn.GrabFocus();
+    }
+
+    /// Mirrors OnlineDungeonArena.DismissSurrenderDialog. Never unfreezes
+    /// before GO — the start gate owns the freeze until then.
+    void DismissLeaveDialog()
+    {
+        if (_leaveDialog == null) return;
+        _leaveDialog.QueueFree();
+        _leaveDialog = null;
+        if (_localPlayer != null && IsInstanceValid(_localPlayer))
+        {
+            if (_matchLive) _localPlayer.Frozen = false;
+            _localPlayer.MakeActive();   // re-capture mouse + re-assert camera
+            RestoreView();               // …or the spectated body's camera
+        }
+    }
+
+    /// Mirrors OnlineDungeonArena.ConfirmSurrender, minus the match result:
+    /// leave the party (the relay tells everyone peer_left and hands over host).
+    void LeaveMatch()
+    {
+        if (_leaving) return;
+        _leaving = true;
+        GD.Print("[FFA] Leaving the match.");
+        _nm.GameDataReceived -= OnGameData;
+        _nm.PartyLeave();
+        _nm.Disconnect();
+        GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
+    }
+
+    Label MakeLabel(string text, int size, Color color)
+    {
+        var lbl = new Label { Text = text, HorizontalAlignment = HorizontalAlignment.Center };
+        if (_font != null) lbl.AddThemeFontOverride("font", _font);
+        lbl.AddThemeFontSizeOverride("font_size", size);
+        lbl.AddThemeColorOverride("font_color", color);
+        return lbl;
+    }
+
+    Button MakeButton(string text, Color color)
+    {
+        var btn = new Button { Text = text, CustomMinimumSize = new Vector2(200, 52), FocusMode = Control.FocusModeEnum.All };
+        if (_font != null) btn.AddThemeFontOverride("font", _font);
+        btn.AddThemeFontSizeOverride("font_size", 18);
+        btn.AddThemeColorOverride("font_color", color);
+        return btn;
+    }
+}

@@ -1,0 +1,482 @@
+using Godot;
+using System.Collections.Generic;
+
+/// res://scripts/TitleWordmark.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// The main-menu "CORNERS" wordmark, spelled out in map-editor pieces and laid
+/// out flat like a maze floor plan, so dragging it orbits the view the way the
+/// editor's camera does.
+///
+/// Each letter cell is a real editor CORRIDOR piece, not a plain square: a
+/// central square plus an arm reaching toward every connected neighbour, with
+/// cutaway walls lining the passage. "Connected" just means the neighbouring
+/// cell is part of the same glyph, so every letter comes out as an actual
+/// corridor network shaped like the letter. Geometry mirrors MazeEditor3D:
+///   • centre + arms — BuildPieceInto (CentW square, ArmW × ArmLen arms)
+///   • walls         — AddCutawayWalls (side walls along each open arm, caps on
+///                     closed directions, normals facing INTO the corridor with
+///                     cull_back so near walls drop out and you see inside)
+///   • gesture       — HandleVpInput / UpdateCamera (0.005 rad/px, wheel zoom)
+///
+/// Two deliberate departures from the editor, both requested:
+///   • Pieces are inset more than the editor's 0.1 hairline so the seams between
+///     pieces stay readable as grid lines against the black page.
+///   • Colour is a starry night sky instead of jade — vivid cerulean nebula over
+///     navy void with a dense white-cyan starfield, matched to a reference
+///     image. Procedural, keyed off WORLD position so the sky is continuous
+///     across the whole word rather than repeating per piece, and animated:
+///     stars drift and twinkle while the nebula creeps the other way. Letter
+///     sides use a flat edge tint so silhouettes survive the dark patches.
+///
+/// Lives directly under the TitleScreen Control: the root viewport renders its
+/// World3D BEHIND the 2D canvas, so no SubViewport is needed and the title
+/// screen must not paint an opaque full-rect background over it.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TitleWordmark : Node3D
+{
+    // ── Glyphs — 5 wide × 7 tall, '#' is one maze cell ────────────────────────
+    static readonly string[] GlyphC = { ".###.", "#...#", "#....", "#....", "#....", "#...#", ".###." };
+    static readonly string[] GlyphO = { ".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###." };
+    static readonly string[] GlyphR = { "####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#" };
+    static readonly string[] GlyphN = { "#...#", "##..#", "##..#", "#.#.#", "#..##", "#..##", "#...#" };
+    static readonly string[] GlyphE = { "#####", "#....", "#....", "####.", "#....", "#....", "#####" };
+    static readonly string[] GlyphS = { ".####", "#....", "#....", ".###.", "....#", "....#", "####." };
+
+    static readonly string[][] FullWord = { GlyphC, GlyphO, GlyphR, GlyphN, GlyphE, GlyphR, GlyphS };
+
+    /// The single C, for anything that wants the mark rather than the wordmark
+    /// (the dev-tools glyph view). Exposed so callers reuse THIS glyph instead
+    /// of copying the pattern and letting the two drift apart.
+    public static readonly string[][] LetterC = { GlyphC };
+
+    /// Which letters to build. Defaults to the full title; set before the node
+    /// enters the tree to render a subset.
+    public string[][] Word = FullWord;
+
+    // ── Piece geometry — the editor's own corridor proportions ────────────────
+    const float CS     = DungeonBuilder.CellSize;   // 10 m per cell
+    // FATTER than the editor's 0.50 / 0.40. Those proportions are tuned for a
+    // 10 m hallway a player runs down; applied to these single-cell letter
+    // strokes they carved each stroke into a ~45% ribbon and the letters read as
+    // thin broken outlines. These keep the editor's shape LANGUAGE — corner
+    // notches at every junction, capped dead ends, arms only toward connected
+    // neighbours — with strokes solid enough to read as letters.
+    /// Multiplies the stroke weight. 1.0 is the title screen's tuning; higher
+    /// fattens the corridors. Clamped because the arm length is what is LEFT of
+    /// a cell after the centre square takes its share — push the centre past
+    /// the cell and the arms invert and the pieces come apart.
+    public float StrokeScale = 1f;
+
+    float StrokeK => Mathf.Clamp(StrokeScale, 0.5f, 1.25f);
+    float CentW   => CS * 0.70f * StrokeK;          // central square
+    float ArmW    => CS * 0.62f * StrokeK;          // corridor arm width
+    float ArmLen  => (CS - CentW) * 0.5f;           // arm length, derived
+
+    /// The editor insets each box by 0.1 — a hairline. Wider here so the seams
+    /// between pieces read as grid lines at menu scale, but not so wide that it
+    /// eats back into the stroke weight.
+    const float Inset    = 0.4f;
+    const float FlrT     = 1.6f;   // piece thickness — chunky, reads at a tilt
+    const float WallRise = 4.2f;   // corridor wall height above the floor
+
+    const int   GlyphW    = 5;
+    const int   GlyphH    = 7;
+    const int   LetterGap = 1;      // empty columns between letters
+    int         Cols      => Word.Length * GlyphW + (Word.Length - 1) * LetterGap;
+
+    /// How strongly the letter SIDES replace the sky with the flat edge tint.
+    /// Not a brightness multiplier: the sky goes near-black in places, and a
+    /// dimmed copy of a dark patch leaves the silhouette invisible against the
+    /// black page. A fixed dim blue edge always reads.
+    const float WallEdgeMix = 0.85f;
+
+    // ── Orbit — same numbers as MazeEditor3D.HandleVpInput ────────────────────
+    const float DragSens = 0.005f;
+    // Pitch floor is readability: too flat and the word squashes into a sliver.
+    // Ceiling stops SHORT of vertical on purpose — near 1.5 rad the +Y up hint
+    // runs nearly parallel to the view, LookAt degenerates, and the whole word
+    // renders mirrored.
+    const float MinPitch = 0.40f, MaxPitch = 1.25f;
+    // Yaw is clamped (the editor's is free) because this word is wide: it sweeps
+    // vertically by sin(yaw) × width, so the bigger the word the tighter this
+    // must be to stay clear of the menu column.
+    /// Instance, not const: the clamp exists to keep a 41-column word clear of
+    /// the title's menu column. A single glyph has neither constraint, so the
+    /// dev view opens it up.
+    /// Where to sample the sky, in world units. See the shader's sky_offset.
+    public Vector3 SkyOffset = Vector3.Zero;
+
+    /// The SkyOffset that makes a subset word sample the sky exactly where it
+    /// sits inside the full title — so a lone letter keeps the colour it has on
+    /// the menu instead of whatever patch the origin happens to land on.
+    public static Vector3 SkyOffsetForLetter(int letterIndex, int subsetLetters)
+    {
+        int fullCols   = FullWord.Length * GlyphW + (FullWord.Length - 1) * LetterGap;
+        int subCols    = subsetLetters   * GlyphW + (subsetLetters   - 1) * LetterGap;
+        float fullOx   = -fullCols * CS * 0.5f + letterIndex * (GlyphW + LetterGap) * CS;
+        float subOx    = -subCols  * CS * 0.5f;
+        return new Vector3(fullOx - subOx, 0f, 0f);
+    }
+
+    public float MaxYaw   = 0.15f;
+    // Zoom floor is framing: the word scales as DefDist/dist, and letting it
+    // past ~1200 px crops the C and S off the screen edges. Tied to DefDist —
+    // resize the word and this has to move with it.
+    public float MinDist  = 310f,  MaxDist  = 900f;
+    const float ZoomStep = 22f;
+
+    /// How far up-screen the word rides, as a fraction of the orbit distance.
+    /// Applied along the CAMERA's own up axis (see ApplyOrbit) so the shift is a
+    /// constant ~200 px of a 720-tall frame at any pitch or zoom level.
+    public float ScreenLiftFrac = 0.25f;
+
+    // Lower default pitch = the word lies back at a stronger oblique angle,
+    // which is also what shows off the piece thickness. Tilt costs legibility
+    // though: vertical extent scales with sin(pitch), so at 0.62 the 7-row
+    // glyphs squashed to ~4 rows' worth and the carved corridors stopped
+    // reading as letters. 0.78 keeps ~86% of the upright height (vs 71% at
+    // 0.62) while still being clearly more tilted than the old 0.95. Drag goes
+    // down to MinPitch if you want it flatter in the moment.
+    /// DefDist is framing for the FULL word, whose 41 columns are what the
+    /// camera has to fit. Render fewer letters and this must come down with
+    /// them or the glyph sits marooned in the middle of the frame.
+    public float DefYaw = 0f, DefPitch = 0.78f, DefDist = 340f;
+
+    // ── Starry night sky ──────────────────────────────────────────────────────
+    const string SkyShaderSrc = @"
+shader_type spatial;
+render_mode unshaded, cull_back;
+
+// Palette read off the reference: near-black navy void, deep blue, vivid
+// cerulean nebula, hot blue-white cores, white-cyan stars.
+uniform vec3  sky_void    = vec3(0.02, 0.05, 0.16);
+uniform vec3  sky_mid     = vec3(0.03, 0.13, 0.40);
+uniform vec3  neb_blue    = vec3(0.10, 0.45, 0.95);
+uniform vec3  neb_core    = vec3(0.55, 0.82, 1.00);
+uniform vec3  star_col    = vec3(0.92, 0.98, 1.00);
+// Letter SIDES use this flat dim blue rather than a dimmed copy of the sky
+// above them: the sky goes properly dark in places, and without a fixed edge
+// the silhouette of a dark letter would vanish into the black page.
+uniform vec3  edge_col    = vec3(0.09, 0.15, 0.30);
+uniform float edge_mix    = 0.0;
+// Big features on purpose: one noise unit is 1/noise_scale world units, and the
+// word is only ~410 across. At 0.020 that was ~8 noise cells and the nebula
+// saturated the whole word to one flat blue; this gives ~3 masses with real
+// void between them, like the reference.
+uniform float noise_scale = 0.008;
+uniform float star_scale  = 0.22;
+uniform float cloud_drift = 0.008;
+uniform float star_drift  = 0.55;
+uniform float brightness  = 1.0;
+// Shifts where the sky is SAMPLED without moving the geometry. The nebula is
+// keyed off world position so it stays continuous across the whole word;
+// rendering a subset centred at the origin therefore lands on a different
+// patch. Default 0 = the title screen is untouched.
+uniform vec3  sky_offset  = vec3(0.0);
+
+varying vec3 world_pos;
+varying vec3 world_norm;
+
+void vertex() {
+    world_pos  = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz + sky_offset;
+    // Piece transforms are pure translation, so the model matrix is safe to use
+    // directly on the normal here (no non-uniform scale to invert).
+    world_norm = normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz);
+}
+
+float hash12(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = hash12(i);
+    float b = hash12(i + vec2(1.0, 0.0));
+    float c = hash12(i + vec2(0.0, 1.0));
+    float d = hash12(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p) {
+    float v = 0.0;
+    float amp = 0.5;
+    for (int i = 0; i < 5; i++) {
+        v += amp * vnoise(p);
+        p *= 2.03;
+        amp *= 0.5;
+    }
+    return v;
+}
+
+// One candidate star per lattice cell, most cells empty. Each star carries its
+// own size and twinkle phase so the field never pulses in unison. Translating
+// the argument translates the whole pattern, so drifting p slides the stars
+// smoothly rather than popping them between cells.
+float starLayer(vec2 p, float thresh, float t) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    if (hash12(i) > thresh) return 0.0;
+    vec2 pos = vec2(hash12(i + vec2(11.3, 5.7)), hash12(i + vec2(23.7, 17.1)));
+    float d = length(f - pos);
+    float size = mix(0.05, 0.15, hash12(i + vec2(7.1, 3.3)));
+    float core = 1.0 - smoothstep(0.0, size, d);
+    float glow = (1.0 - smoothstep(0.0, size * 4.0, d)) * 0.30;
+    float ph   = hash12(i + vec2(31.4, 2.7)) * 6.2831;
+    float tw   = 0.5 + 0.5 * sin(t * 2.2 + ph);
+    return (core + glow) * (0.40 + 0.60 * tw);
+}
+
+void fragment() {
+    // World XZ, so the sky is continuous across every piece instead of
+    // restarting on each box.
+    vec2 wp = world_pos.xz;
+
+    // Nebula creeps one way, stars drift the other: the parallax is what makes
+    // this read as sky with depth instead of one scrolling texture.
+    vec2 cuv = wp * noise_scale + vec2(TIME * cloud_drift, TIME * cloud_drift * 0.3);
+    float n = fbm(cuv);
+
+    // Ramps sit high so only the noise PEAKS glow and the rest stays navy —
+    // fbm hovers near 0.5, so a low threshold turns everything into nebula.
+    float neb  = smoothstep(0.48, 0.80, n);
+    float core = pow(smoothstep(0.62, 0.95, n), 1.6);
+    vec3 col = mix(sky_void, sky_mid, smoothstep(0.26, 0.60, n));
+    col = mix(col, neb_blue, neb  * 0.90);
+    col = mix(col, neb_core, core * 0.60);
+
+    // Stars ONLY on up-facing surfaces. World XZ is constant down a vertical
+    // face, so a star on a corridor wall would smear into a bright stripe.
+    // Two densities, and deliberately NOT occluded by the nebula — in the
+    // reference the stars sit over the bright blue, not behind it.
+    float upness = clamp(world_norm.y, 0.0, 1.0);
+    float s1 = starLayer(wp * star_scale       + vec2(-TIME * star_drift,       0.0), 0.40, TIME);
+    float s2 = starLayer(wp * star_scale * 1.8 + vec2(-TIME * star_drift * 1.6, 3.0), 0.45, TIME * 1.35);
+    float starfield = (s1 + s2 * 0.80) * upness;
+
+    col += star_col * starfield;
+
+    // Flat edge tint for the letter sides (see edge_col).
+    col = mix(col, edge_col, edge_mix);
+
+    ALBEDO = col * brightness;
+}
+";
+
+    Camera3D? _cam;
+    float _yaw;
+    float _pitch;
+    float _dist;
+    bool  _dragging = false;
+    int   _tileCount = 0;
+
+    public override void _Ready()
+    {
+        // Paints the black the title screen's removed ColorRect used to provide.
+        AddChild(new WorldEnvironment
+        {
+            Environment = new Godot.Environment
+            {
+                BackgroundMode  = Godot.Environment.BGMode.Color,
+                BackgroundColor = Colors.Black,
+            },
+        });
+
+        _cam = new Camera3D { Fov = 48f, Current = true };
+        AddChild(_cam);
+
+        // Orbit defaults are instance fields now, so seed them here rather
+        // than in the field initialisers, which cannot see them.
+        _yaw = DefYaw; _pitch = DefPitch; _dist = DefDist;
+
+        BuildWordmark();
+        ApplyOrbit();
+    }
+
+    // ── Build ─────────────────────────────────────────────────────────────────
+    void BuildWordmark()
+    {
+        // One Shader compiled once, two materials sharing it: tops full
+        // brightness, sides flattened to the edge tint.
+        var shader  = new Shader { Code = SkyShaderSrc };
+        var topMat  = new ShaderMaterial { Shader = shader };
+        var wallMat = new ShaderMaterial { Shader = shader };
+        topMat .SetShaderParameter("brightness", 1.0f);
+        topMat .SetShaderParameter("edge_mix",   0.0f);
+        wallMat.SetShaderParameter("brightness", 1.0f);
+        wallMat.SetShaderParameter("edge_mix",   WallEdgeMix);
+        topMat .SetShaderParameter("sky_offset", SkyOffset);
+        wallMat.SetShaderParameter("sky_offset", SkyOffset);
+
+        // Occupied cells for the whole word. Letters are separated by a blank
+        // column so they never touch — so a letter's corridors never run into
+        // its neighbour's, and each letter is its own closed network.
+        var cells = new HashSet<(int col, int row)>();
+        for (int li = 0; li < Word.Length; li++)
+        {
+            var glyph   = Word[li];
+            int colBase = li * (GlyphW + LetterGap);
+            for (int row = 0; row < GlyphH; row++)
+            {
+                string line = glyph[row];
+                for (int c = 0; c < GlyphW; c++)
+                    if (line[c] == '#') cells.Add((colBase + c, row));
+            }
+        }
+        _tileCount = cells.Count;
+
+        // Centre the word on the origin so it IS the orbit pivot.
+        float ox = -Cols   * CS * 0.5f;
+        float oz = -GlyphH * CS * 0.5f;
+
+        var tiles = new Node3D { Name = "Tiles" };
+        AddChild(tiles);
+
+        // Three shared meshes cover every piece: the centre square and the two
+        // arm orientations.
+        var centreMesh = new BoxMesh { Size = new Vector3(CentW  - Inset, FlrT, CentW  - Inset) };
+        var armNSMesh  = new BoxMesh { Size = new Vector3(ArmW   - Inset, FlrT, ArmLen - Inset) };
+        var armEWMesh  = new BoxMesh { Size = new Vector3(ArmLen - Inset, FlrT, ArmW   - Inset) };
+
+        float y   = FlrT * 0.5f;
+        float y0w = FlrT, y1w = FlrT + WallRise;
+        float hw  = ArmW * 0.5f;
+        var   st  = DungeonBuilder.MakeST();
+
+        foreach (var (c, row) in cells)
+        {
+            float wx = ox + c   * CS, x1 = wx + CS;
+            float wz = oz + row * CS, z1 = wz + CS;
+            float cx = wx + CS * 0.5f, cz = wz + CS * 0.5f;
+
+            // An "opening" is simply a neighbouring cell that is also part of
+            // the glyph — that is what turns each letter into a corridor run.
+            bool hasN = cells.Contains((c, row - 1));
+            bool hasS = cells.Contains((c, row + 1));
+            bool hasW = cells.Contains((c - 1, row));
+            bool hasE = cells.Contains((c + 1, row));
+
+            // ── Floor: centre square + an arm toward each opening ────────────
+            tiles.AddChild(Box(centreMesh, topMat, new Vector3(cx, y, cz)));
+            if (hasN) tiles.AddChild(Box(armNSMesh, topMat, new Vector3(cx, y, wz + ArmLen * 0.5f)));
+            if (hasS) tiles.AddChild(Box(armNSMesh, topMat, new Vector3(cx, y, wz + CS - ArmLen * 0.5f)));
+            if (hasE) tiles.AddChild(Box(armEWMesh, topMat, new Vector3(wx + CS - ArmLen * 0.5f, y, cz)));
+            if (hasW) tiles.AddChild(Box(armEWMesh, topMat, new Vector3(wx + ArmLen * 0.5f,      y, cz)));
+
+            // ── Walls: line each open arm, cap each closed direction ─────────
+            // Normal signs chosen so every normal points INTO the corridor.
+            if (hasN) { DungeonBuilder.NSWall(st, cx - hw, wz, cz - hw, y0w, y1w, +1);
+                        DungeonBuilder.NSWall(st, cx + hw, wz, cz - hw, y0w, y1w, -1); }
+            if (hasS) { DungeonBuilder.NSWall(st, cx - hw, cz + hw, z1, y0w, y1w, +1);
+                        DungeonBuilder.NSWall(st, cx + hw, cz + hw, z1, y0w, y1w, -1); }
+            if (hasE) { DungeonBuilder.EWWall(st, cz - hw, cx + hw, x1, y0w, y1w, +1);
+                        DungeonBuilder.EWWall(st, cz + hw, cx + hw, x1, y0w, y1w, -1); }
+            if (hasW) { DungeonBuilder.EWWall(st, cz - hw, wx, cx - hw, y0w, y1w, +1);
+                        DungeonBuilder.EWWall(st, cz + hw, wx, cx - hw, y0w, y1w, -1); }
+
+            if (!hasN) DungeonBuilder.EWWall(st, cz - hw, cx - hw, cx + hw, y0w, y1w, +1);
+            if (!hasS) DungeonBuilder.EWWall(st, cz + hw, cx - hw, cx + hw, y0w, y1w, -1);
+            if (!hasE) DungeonBuilder.NSWall(st, cx + hw, cz - hw, cz + hw, y0w, y1w, -1);
+            if (!hasW) DungeonBuilder.NSWall(st, cx - hw, cz - hw, cz + hw, y0w, y1w, +1);
+        }
+
+        var wallMesh = DungeonBuilder.Commit(st);
+        if (wallMesh != null)
+        {
+            wallMesh.SurfaceSetMaterial(0, wallMat);
+            tiles.AddChild(new MeshInstance3D { Mesh = wallMesh });
+        }
+    }
+
+    static MeshInstance3D Box(Mesh mesh, Material mat, Vector3 pos) =>
+        new() { Mesh = mesh, MaterialOverride = mat, Position = pos };
+
+    // ── Camera ────────────────────────────────────────────────────────────────
+    void ApplyOrbit()
+    {
+        if (_cam == null) return;
+
+        float cp = Mathf.Cos(_pitch), sp = Mathf.Sin(_pitch);
+        float cy = Mathf.Cos(_yaw),   sy = Mathf.Sin(_yaw);
+
+        // Orbit the word ITSELF, so camera-to-word is exactly _dist at every
+        // pitch. Aiming at a lowered target instead (the obvious way to push the
+        // word up-screen) also drags the camera down: at top-down that left the
+        // camera barely above the pieces and the word overflowed the frame, and
+        // near edge-on it sank BELOW the floor plane and left the screen.
+        _cam.Position = new Vector3(sy * cp, sp, cy * cp) * _dist;
+
+        // MaxPitch stays below vertical, so +Y is always a well-conditioned up
+        // hint and no special case is needed here.
+        var up = Vector3.Up;
+        _cam.LookAt(Vector3.Zero, up);
+
+        // Re-aim slightly below the word along the camera's OWN up axis. The
+        // camera does not move, so this only tilts the view: the word rides up
+        // the frame by a fixed fraction of screen height at any pitch or zoom.
+        var camUp = _cam.GlobalTransform.Basis.Y;
+        _cam.LookAt(-camUp * (ScreenLiftFrac * _dist), up);
+    }
+
+    /// Snap back to the framing the menu layout was designed around.
+    public void ResetView()
+    {
+        _yaw = DefYaw; _pitch = DefPitch; _dist = DefDist;
+        ApplyOrbit();
+    }
+
+    // ── Input ─────────────────────────────────────────────────────────────────
+    // _UnhandledInput, not _Input: a menu Button that consumed the click has
+    // already won, so dragging only happens on empty background. This relies on
+    // TitleScreen's root Control, containers and spacers all being
+    // MouseFilter.Ignore — Control defaults to Stop and silently eats drags.
+    public override void _UnhandledInput(InputEvent ev)
+    {
+        if (ev is InputEventMouseButton mb)
+        {
+            if (mb.ButtonIndex == MouseButton.Left || mb.ButtonIndex == MouseButton.Right)
+            {
+                _dragging = mb.Pressed;
+                if (mb.Pressed && mb.DoubleClick) ResetView();
+            }
+            else if (mb.Pressed && mb.ButtonIndex == MouseButton.WheelUp)
+            {
+                _dist = Mathf.Max(_dist - ZoomStep, MinDist);
+                ApplyOrbit();
+            }
+            else if (mb.Pressed && mb.ButtonIndex == MouseButton.WheelDown)
+            {
+                _dist = Mathf.Min(_dist + ZoomStep, MaxDist);
+                ApplyOrbit();
+            }
+        }
+        else if (ev is InputEventMouseMotion mm && _dragging)
+        {
+            _yaw    = Mathf.Clamp(_yaw   - mm.Relative.X * DragSens, -MaxYaw,  MaxYaw);
+            _pitch  = Mathf.Clamp(_pitch + mm.Relative.Y * DragSens, MinPitch, MaxPitch);
+            ApplyOrbit();
+        }
+    }
+
+    // ── Test / harness hooks ──────────────────────────────────────────────────
+    public void DebugDrag(float dx, float dy)
+    {
+        _yaw    = Mathf.Clamp(_yaw   - dx * DragSens, -MaxYaw,  MaxYaw);
+        _pitch  = Mathf.Clamp(_pitch + dy * DragSens, MinPitch, MaxPitch);
+        ApplyOrbit();
+    }
+
+    public void DebugSetView(float yaw, float pitch, float dist)
+    {
+        _yaw   = Mathf.Clamp(yaw,   -MaxYaw,  MaxYaw);
+        _pitch = Mathf.Clamp(pitch, MinPitch, MaxPitch);
+        _dist  = Mathf.Clamp(dist,  MinDist,  MaxDist);
+        ApplyOrbit();
+    }
+
+    public float Yaw       => _yaw;
+    public float Pitch     => _pitch;
+    public float Dist      => _dist;
+    public int   TileCount => _tileCount;
+}

@@ -1,0 +1,117 @@
+using System.Collections.Generic;
+using Godot;
+
+/// res://test/TestTask.cs — per-task harness (overwritten each task).
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Visual verification for the thickened pit doorway lip (PitBuilder.LipThickness
+/// 0.15 -> 0.4, plus real side faces). Builds a Pit whose west doorway (floor 0,
+/// not the shaft's bottom floor, so it gets a lip) opens onto an adjacent Room.
+/// Bright point lights sit right at the lip so its thickness reads clearly
+/// against the otherwise-dark shaft — this is a close-up detail shot, not a
+/// scene-lighting test. Camera holds three waypoints: side profile (thickness
+/// silhouette), from-below (underside + front edge), and a 3/4 close-up.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTask : Node3D
+{
+    Camera3D _cam = null!;
+    int _frame = 0;
+    const float CS = DungeonBuilder.CellSize;
+    const float FH = DungeonBuilder.FloorHeight;
+
+    // Pit anchored at (6,5,0): footprint x=5..7, y=4..6, floors -1/0/1. West
+    // perimeter cell (5,5) opens onto the Room at (4,5) — floor 0 isn't the
+    // shaft's bottom floor (-1), so this doorway gets a landing lip.
+    // Lip world position: west wall at x=50, jutting east to x=51.6 (LipDepth),
+    // centred at z=55 (perimeter cell (5,5)'s own centre row), y top=0.02.
+    static readonly (Vector3 pos, float yaw, float pitch, string note)[] Waypoints =
+    {
+        // Side profile, level with the lip, just north of it — silhouettes the
+        // slab's thickness (top, bottom, and the near side face) against the
+        // dark shaft interior beyond.
+        (new(53f, 0.3f, 48f), 200f, -5f, "lip side profile (thickness silhouette)"),
+        // From below and slightly east (inside the shaft, under the lip),
+        // looking up-and-back at its underside and front edge.
+        (new(56f, -3f, 55f), 250f, 35f, "lip underside + front edge, from below"),
+        // 3/4 close-up standing near the doorway on the floor-0 landing.
+        (new(58f, 0.5f, 51f), 210f, -10f, "lip 3/4 close-up from the landing"),
+    };
+
+    public override void _Ready()
+    {
+        var worldEnv = new WorldEnvironment();
+        worldEnv.Environment = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0f, 0f, 0f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.10f, 0.09f, 0.08f),
+            AmbientLightEnergy = 0.5f,
+            TonemapMode        = Godot.Environment.ToneMapper.Filmic,
+            TonemapExposure    = 1.4f,
+        };
+        AddChild(worldEnv);
+
+        var maze = new MazeData { Name = "PitLipGeo", Pieces = BuildPieces() };
+        var dungeon = new DungeonBuilder();
+        AddChild(dungeon);
+        dungeon.Build(maze);
+
+        // Bright lights right at the lip — a close-up detail shot needs local
+        // light, not scene ambience, to actually show the new thickness/side
+        // faces instead of a silhouette.
+        AddChild(new OmniLight3D
+        {
+            Position = new Vector3(52f, 1.5f, 55f),
+            LightColor = new Color(1f, 0.92f, 0.75f),
+            LightEnergy = 18f, OmniRange = 20f, OmniAttenuation = 0.6f,
+        });
+        AddChild(new OmniLight3D
+        {
+            Position = new Vector3(55f, -1f, 55f),
+            LightColor = new Color(0.8f, 0.9f, 1f),
+            LightEnergy = 16f, OmniRange = 18f, OmniAttenuation = 0.6f,
+        });
+        AddChild(new OmniLight3D
+        {
+            Position = new Vector3(58f, 0.5f, 51f),
+            LightColor = new Color(1f, 1f, 0.95f),
+            LightEnergy = 14f, OmniRange = 16f, OmniAttenuation = 0.6f,
+        });
+
+        _cam = new Camera3D { Fov = 70f, Current = true, Far = 200f };
+        AddChild(_cam);
+        Place(0);
+    }
+
+    static List<MazePiece> BuildPieces()
+    {
+        var list = new List<MazePiece>();
+        void P(PieceType t, int x, int y, int rot = 0, int floor = 0)
+            => list.Add(new MazePiece { Type = t, X = x, Y = y, Floor = floor, Rotation = rot });
+
+        P(PieceType.Start, 4, 0);
+        for (int y = 1; y <= 4; y++) P(PieceType.Straight, 4, y);
+        P(PieceType.Room, 4, 5);   // adjacent to the pit's west perimeter cell (5,5)
+        P(PieceType.Pit,  6, 5);
+        P(PieceType.Exit, 4, 9);
+        for (int y = 6; y <= 8; y++) P(PieceType.Straight, 4, y);
+
+        return list;
+    }
+
+    void Place(int i)
+    {
+        var (pos, yaw, pitch, note) = Waypoints[i];
+        _cam.Position = pos;
+        _cam.Rotation = new Vector3(Mathf.DegToRad(pitch), Mathf.DegToRad(yaw), 0f);
+        GD.Print($"[frame {i}] {note}  pos={pos}");
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+        int idx = Mathf.Min(_frame / 3, Waypoints.Length - 1);
+        Place(idx);
+        if (_frame / 3 >= Waypoints.Length) GetTree().Quit();
+    }
+}

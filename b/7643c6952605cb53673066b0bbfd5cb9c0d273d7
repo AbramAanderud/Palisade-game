@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://bjpomdvh1k8x1"]
+
+[ext_resource type="Script" path="res://test/TestRocketFlight.cs" id="1_s"]
+
+[node name="TestRocketFlight" type="Node3D"]
+script = ExtResource("1_s")

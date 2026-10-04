@@ -1,0 +1,96 @@
+using Godot;
+
+/// Headless assertion harness for PlayerController's trap-zone modifier combination.
+/// Exercises EnterTrapZone/ExitTrapZone directly (bypassing Area3D body-entered signals,
+/// which need a running physics frame) to check the pure bookkeeping in isolation:
+/// stacking multiplies, removing one restores, and an empty set is the identity.
+public partial class TestTrapZone : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    void CheckApprox(float actual, float expected, string label)
+    {
+        Check(Mathf.Abs(actual - expected) < 0.0001f, $"{label} (got {actual}, want {expected})");
+    }
+
+    public override void _Ready()
+    {
+        GD.Print("── TrapZone modifier combination ──");
+
+        var player = new PlayerController();
+
+        // Empty set — every multiplier must be the identity so movement is
+        // bit-for-bit unchanged with no traps in the scene.
+        CheckApprox(player.TrapFrictionMul, 1f, "empty: friction mul");
+        CheckApprox(player.TrapSpeedMul,    1f, "empty: speed mul");
+        CheckApprox(player.TrapAccelMul,    1f, "empty: accel mul");
+        Check(player.TrapPush == Vector3.Zero,  "empty: push is zero");
+        Check(!player.WallRunBlocked,           "empty: wall-run not blocked");
+
+        // One zone (ice-like: slippery, sluggish accel).
+        var ice = new TrapZone { FrictionMul = 0.06f, AccelMul = 0.15f };
+        player.EnterTrapZone(ice);
+        CheckApprox(player.TrapFrictionMul, 0.06f, "ice only: friction mul");
+        CheckApprox(player.TrapAccelMul,    0.15f, "ice only: accel mul");
+        CheckApprox(player.TrapSpeedMul,    1f,    "ice only: speed mul untouched");
+
+        // A second, overlapping zone (tar-like: slows speed and accel) must
+        // combine multiplicatively with the first, not replace it.
+        var tar = new TrapZone { SpeedMul = 0.45f, AccelMul = 0.50f };
+        player.EnterTrapZone(tar);
+        CheckApprox(player.TrapFrictionMul, 0.06f,          "ice+tar: friction mul unaffected by tar");
+        CheckApprox(player.TrapSpeedMul,    0.45f,          "ice+tar: speed mul from tar");
+        CheckApprox(player.TrapAccelMul,    0.15f * 0.50f,  "ice+tar: accel muls multiply");
+
+        // A push zone adds its vector on top; wall-run block ORs across zones.
+        var push = new TrapZone { PushAccel = new Vector3(0, 0, 14f), BlocksWallRun = true };
+        player.EnterTrapZone(push);
+        Check(player.TrapPush == new Vector3(0, 0, 14f), "ice+tar+push: push accumulates");
+        Check(player.WallRunBlocked,                     "ice+tar+push: wall-run blocked");
+
+        // Removing one zone recombines the rest — it does not just reset to 1.
+        player.ExitTrapZone(tar);
+        CheckApprox(player.TrapFrictionMul, 0.06f, "ice+push: friction mul still from ice");
+        CheckApprox(player.TrapSpeedMul,    1f,    "ice+push: speed mul restored (tar gone)");
+        CheckApprox(player.TrapAccelMul,    0.15f, "ice+push: accel mul restored to ice-only");
+        Check(player.WallRunBlocked,               "ice+push: wall-run still blocked by push");
+
+        // Removing the rest returns to the identity — verifies ExitTrapZone drains
+        // cleanly rather than leaving stale contributions behind.
+        player.ExitTrapZone(ice);
+        player.ExitTrapZone(push);
+        CheckApprox(player.TrapFrictionMul, 1f, "all removed: friction mul back to 1");
+        CheckApprox(player.TrapSpeedMul,    1f, "all removed: speed mul back to 1");
+        CheckApprox(player.TrapAccelMul,    1f, "all removed: accel mul back to 1");
+        Check(player.TrapPush == Vector3.Zero,  "all removed: push back to zero");
+        Check(!player.WallRunBlocked,           "all removed: wall-run unblocked");
+
+        // Freeing a zone while the player still thinks it is inside it (e.g. the
+        // zone's node is destroyed without OnBodyExited firing first) must not
+        // leave a dangling entry that gets dereferenced on the next recompute.
+        var doomed = new TrapZone { SpeedMul = 0.5f };
+        player.EnterTrapZone(doomed);
+        CheckApprox(player.TrapSpeedMul, 0.5f, "doomed: contributes before being freed");
+        doomed.Free();
+        var another = new TrapZone { AccelMul = 0.8f };
+        player.EnterTrapZone(another); // triggers RecomputeTrapModifiers — must not throw
+        CheckApprox(player.TrapSpeedMul, 1f,  "doomed: purged after Free(), speed mul restored");
+        CheckApprox(player.TrapAccelMul, 0.8f, "doomed: 'another' still contributes normally");
+
+        player.ExitTrapZone(another);
+        another.Free();
+        ice.Free();
+        tar.Free();
+        push.Free();
+        player.Free();
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+}

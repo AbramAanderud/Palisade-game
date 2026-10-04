@@ -1,0 +1,104 @@
+using Godot;
+using System.Collections.Generic;
+
+/// Verifies the standable column tops:
+///   - a body dropped onto a TIER 0 column top comes to rest on it (~Y 29)
+///   - a body dropped at a TIER 1 / TIER 2 column top falls straight past it
+///     (proving only the first ring got collision) and lands on the tier 0 top
+/// Also frames a camera on a capital so the platform height can be eyeballed
+/// against the visual geometry.
+public partial class TestColumnTop : Node3D
+{
+    const float BallR = 0.35f;          // ~player capsule radius
+    readonly List<(string tag, RigidBody3D body, float expect)> _balls = new();
+    readonly Dictionary<string, bool> _standable = new();
+    int _frame;
+    Camera3D _cam = null!;
+
+    public override void _Ready()
+    {
+        var worldEnv = new WorldEnvironment();
+        worldEnv.Environment = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.02f, 0.02f, 0.03f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.5f, 0.45f, 0.4f),
+            AmbientLightEnergy = 1.0f,
+            TonemapMode        = Godot.Environment.ToneMapper.Filmic,
+        };
+        AddChild(worldEnv);
+        AddChild(new DirectionalLight3D { LightEnergy = 1.6f, Rotation = new(-0.7f, 0.6f, 0f) });
+
+        var arena = new ArenaBuilder { Name = "Arena" };
+        AddChild(arena);
+        arena.Build(Vector3.Zero, openNorth: true, openSouth: true);
+
+        // Column ring geometry, mirrored from ArenaBuilder.AddSecondTier.
+        const int Sides = 32;
+        const float ringR = ArenaBuilder.Radius - 0.8f;
+        const float tierY = ArenaBuilder.ShelfBandH;      // 22
+        // Bay 8 = due east: a column bay (i % 2 == 0) and 90 degrees from BOTH
+        // doorways. Bay 0 is the north doorway, where arch/jamb geometry sits in
+        // the fall path and makes a "did it fall through?" test ambiguous.
+        float a = 2f * Mathf.Pi * 8 / Sides;
+        float cx = Mathf.Sin(a) * ringR, cz = -Mathf.Cos(a) * ringR;
+
+        // For each tier, drop from just 1.5m above where THAT tier's capital is.
+        // The claim under test is per-tier and local: "is there a surface at this
+        // tier's column top?" Only tier 0 should answer yes. Where a ball ends up
+        // afterwards is irrelevant, so it is not asserted.
+        for (int t = 0; t < ArenaBuilder.Tiers; t++)
+        {
+            float topY = t * ArenaBuilder.TierUnitH + tierY + 7f;
+            Drop($"tier{t}", new Vector3(cx, topY + 1.5f, cz), expect: topY, standable: t == 0);
+        }
+
+        // Camera off the inner face of that capital, level with it.
+        var inward = new Vector3(-cx, 0, -cz).Normalized();
+        _cam = new Camera3D
+        {
+            Fov = 70f, Near = 0.05f, Far = 600f,
+            Position = new Vector3(cx, 29f + 1.5f, cz) + inward * 11f,
+        };
+        AddChild(_cam);
+        _cam.LookAt(new Vector3(cx, 29f, cz));
+        _cam.MakeCurrent();
+    }
+
+    void Drop(string tag, Vector3 at, float expect, bool standable)
+    {
+        _standable[tag] = standable;
+        var rb = new RigidBody3D { Name = $"Ball_{tag}", Position = at };
+        rb.AddChild(new CollisionShape3D { Shape = new SphereShape3D { Radius = BallR } });
+        rb.AddChild(new MeshInstance3D
+        {
+            Mesh = new SphereMesh { Radius = BallR, Height = BallR * 2f },
+            MaterialOverride = new StandardMaterial3D { AlbedoColor = new Color(1f, 0.2f, 0.1f) },
+        });
+        AddChild(rb);
+        _balls.Add((tag, rb, expect));
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        _frame++;
+        if (_frame != 240) return;                 // ~4s at 60Hz — settled
+        GD.Print("[ColTop] --- did each tier's capital catch the ball? ---");
+        bool allOk = true;
+        foreach (var (tag, body, expect) in _balls)
+        {
+            float y = body.GlobalPosition.Y;
+            // Resting ON that capital means sphere centre = capital top + radius.
+            float want   = expect + BallR;
+            bool caught  = Mathf.Abs(y - want) < 0.35f;
+            bool wantStand = _standable[tag];
+            bool ok      = caught == wantStand;
+            allOk &= ok;
+            GD.Print($"[ColTop] {tag,-6} capitalTop={expect,7:F2}  restY={y,8:F3}  " +
+                     $"caught={caught,-5} expected={wantStand,-5}  {(ok ? "OK" : "WRONG")}");
+        }
+        GD.Print($"[ColTop] VERDICT {(allOk ? "PASS" : "FAIL")} " +
+                 "(tier0 must catch; tier1/tier2 must NOT — that is \"just the first set\")");
+    }
+}

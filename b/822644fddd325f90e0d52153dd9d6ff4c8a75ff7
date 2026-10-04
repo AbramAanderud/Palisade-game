@@ -1,0 +1,4 @@
+[gd_scene format=3 uid="uid://kbsjv1h2xsy3"]
+[ext_resource type="Script" path="res://test/TestLightProbe.cs" id="1_s"]
+[node name="TestLightProbe" type="Node3D"]
+script = ExtResource("1_s")

@@ -1,0 +1,452 @@
+# Engineering Journal
+
+## 2026-05-17 — Online Multiplayer: Play Game / Matchmaking Flow
+
+### What was built
+
+**Full matchmaking lobby** replacing the manual room-code create/join flow with a browseable player list.
+
+**Relay server (`server/relay.js`)** — extended with a lobby pool:
+- `lobby_join` → assigns player ID, broadcasts updated list to all lobby members
+- `challenge` / `challenge_response` → challenge flow; relay creates room and sends `match_made` to both on accept
+- Lobby cleaned up on disconnect; pending challenges auto-declined
+
+**New `PlayGameScreen.cs` / `.tscn`**:
+- Shows online players with Challenge buttons
+- Incoming challenge dialog (Accept / Decline)
+- Outgoing challenge dialog with Cancel
+- Maze selection via `OptionButton` at the bottom (positioned low so popup opens upward naturally)
+- Displays total gold
+
+**`TitleScreen.cs`** — added "Play Game" button above "Online Maze" in centre column.
+
+**`OnlineDungeonArena.cs`** — complete game-end loop:
+- `WeaponPickup.PickedUp` event wired; sword pickup awards 100 gold and starts 40 s combat timer
+- Peer sword pickup detected via `{t: "sword_taken"}` message; same timer started on both sides
+- `{t: "die"}` message handled: receiver awards self 100 gold (kill) and calls EndMatch("Victory!")
+- `PlayerHealth.OnDied` wired locally: sends `die` to peer, calls EndMatch("Defeated!")
+- Timer expiry: survivor (non-sword-holder) gets 100 gold, EndMatch("Time's Up!")
+- Post-match overlay shows result, match gold earned, total gold, and "Return to Lobby" button
+- Auto-returns to `PlayGameScreen` after 8 s
+
+**`NetworkManager.cs`** — bug fix + lobby signals:
+- **Bug fixed**: `HandleMessage` was dropping all game-data messages (those with `t` not `type`). Fixed: if no `type` field, emit `GameDataReceived` directly.
+- New signals: `LobbyJoined`, `LobbyUpdated`, `IncomingChallenge`, `ChallengeDeclined`, `MatchMade`
+- New methods: `ConnectAndJoinLobby`, `SendChallenge`, `RespondChallenge`
+
+**`OnlineGameState.cs`** — added `Gold` (persists across matches), `PlayerName`, `MyPlayerId`.
+
+**`WeaponPickup.cs`** — added `PickedUp` event; fixed puppet erroneously blocking pickup detection.
+
+### Gold rules
+| Condition | Gold |
+|---|---|
+| First player to pick up the sword | +100 |
+| Killing the opponent | +100 |
+| Surviving the 40 s timer (didn't have the sword) | +100 |
+
+---
+
+## 2026-05-07 — Stair Physics: Final Solution
+
+### Problem
+Walking down stairs caused the player to arc outward ("fly off") regardless of how `FloorSnapLength` or gravity were tuned. Per-tread collision let the capsule briefly step off each tread edge and become airborne; once airborne, horizontal momentum dominated.
+
+### Solution
+Adopted the industry-standard pattern: **visual steps with no physics collision, invisible diagonal ramp for physics**.
+
+**`DungeonBuilder.cs`** stair branch in `BuildFloor`:
+- `AddMeshVisual` for treads (`floorST`) and risers (`riserST`) — rendered but no collision shapes
+- `AddStairRamp(body, p, geomBase)` — invisible ramp spanning full stair cell, `BackfaceCollision = true`
+
+**`PlayerController.cs`**:
+- `FloorMaxAngle = 68° * Pi/180` — must exceed ramp angle `atan(FloorHeight / CellSize)`. With `FloorHeight=18, CellSize=10` the ramp is ~61°; 68° gives 7° margin
+- `FloorSnapLength = 1.5f`
+- `TryStepUp` kept for non-stair obstacles; it never fires on the smooth ramp
+
+### Why it's robust
+The ramp provides continuous floor contact at all times. There is no tread edge to step off, no airborne moment, and no asymmetry between ascending and descending. `FloorMaxAngle` is the only value to watch: if `FloorHeight` or `CellSize` ever changes, recalculate `atan(FloorHeight / CellSize)` and keep `FloorMaxAngle` at least 5° above it.
+
+---
+
+## 2026-05-05 18:05
+
+### Stair Step Geometry Fix
+- **What**: Removed the diagonal stair-center panels and central under-floor from stair cells, then increased generated stair count from 20 to 48 shallow steps.
+- **Why**: The stairwell was presenting a ramp-like surface under the stairs, while the visible steps lacked a convincing front lip and were too coarse for normal walking feel.
+- **How**: Updated `scripts/DungeonBuilder.cs` so stair treads and risers are the actual visible/collidable stair surface. Left side/wing floors and walls intact so the stairwell remains sealed without a hidden diagonal walk plane.
+- **Issues**: `godot` is not on PATH in this shell, so visual capture of `test/StairInspect.tscn` was not available from here.
+- **Result**: `dotnet build Palisade.csproj` succeeds with 0 warnings and 0 errors.
+
+## 2026-05-05 16:20
+
+### Claude Chat Exporter
+- **What**: Added a local PowerShell exporter for Claude Code JSONL transcripts into Obsidian-readable Markdown.
+- **Why**: Let Obsidian act as a cheap cross-project second brain without spending Claude tokens on logging or summaries.
+- **How**: Added `tools/export-claude-chats.ps1` with source/output parameters, transcript-path export, project filtering, dry-run support, and an idempotent manifest. Added `tools/export-claude-hook.ps1` for Claude `SessionEnd` hook automation.
+- **Issues**: Claude CLI helper produced the wrong implementation direction, so the exporter was implemented directly. Direct script execution was blocked by PowerShell policy, so docs use per-command `ExecutionPolicy Bypass`.
+- **Result**: Project can now archive local Claude Code chats into `AI Chats/Claude Code` from the project root. A global Claude `SessionEnd` hook was installed in `C:\Users\Abe\.claude\settings.json` so future Claude sessions auto-export into this vault.
+
+---
+
+## 2026-05-05 17:25
+
+### NoBrainer Central Vault Setup
+- **What**: Created `C:\Users\Abe\Documents\NoBrainer` as the main personal Obsidian vault and copied Claude exporter scripts to `C:\Users\Abe\.claude\tools`.
+- **Why**: Keep a separate general second-brain vault while allowing individual project vaults like Palisade and LetsGitaJob to remain project-specific.
+- **How**: Updated the global Claude `SessionEnd` hook to run the global hook script and export to `NoBrainer\AI Chats\Claude Code`.
+- **Issues**: Initial backfill needed elevated filesystem access because `NoBrainer` is outside the Palisade workspace. Some older Claude project folders map to generic names like `Abe` or `Documents` because those sessions were started from broad directories.
+- **Result**: Backfilled 59 Claude transcripts into NoBrainer, including folders for `palisade-godot` and `LetsGitaJob`.
+
+---
+
+## 2026-05-05 17:35
+
+### Obsidian Stability Fix
+- **What**: Updated the Claude transcript exporter to skip thinking blocks, tool-use entries, and tool results by default, with a smaller per-entry truncation limit.
+- **Why**: Raw Claude transcripts produced multi-megabyte Markdown files that caused Obsidian to open to a black screen or hang during indexing.
+- **How**: Added `-IncludeThinking`, `-IncludeToolResults`, and `-MaxEntryChars` controls, then regenerated NoBrainer exports in lightweight conversation mode.
+- **Issues**: Existing NoBrainer export had files as large as 12 MB before cleanup.
+- **Result**: NoBrainer chat archive dropped to about 2.3 MB total, with the largest note under 1 MB.
+
+---
+
+## 2026-05-02 01:05
+
+### Documentation Framework Implementation
+- **What**: Implemented Claude Conductor modular documentation system
+- **Why**: Improve AI navigation and code maintainability
+- **How**: Used `npx claude-conductor` to initialize framework
+- **Issues**: None - clean implementation
+- **Result**: Documentation framework successfully initialized
+
+---
+
+## 2026-06-23 — Spawn-overlap fling bug (player "spawned at the arena edge")
+
+- **Symptom**: In TrainingArena the player spawned at centre (0,1.5,0) but was
+  flung ~29m to the arena wall within the first physics tick.
+- **Root cause**: `EnemyController.Spawn` (and `PlayerController.Spawn`) called
+  `parent.AddChild(e)` BEFORE `e.Position = pos`. The physics body therefore
+  existed at the origin for its first tick — overlapping the player — and when
+  it snapped to its real position, Godot's moving-platform logic dragged the
+  player (standing on it) along until the wall stopped them.
+- **Fix**: set `Position` (local, valid outside the tree) BEFORE `AddChild` in
+  both Spawn methods. Rule of thumb: never AddChild a physics body at a
+  placeholder position.
+- **Also fixed**: TrainingArena death-cam set `GlobalPosition` before AddChild
+  (is_inside_tree error on every death) — reordered. Arena trimesh floor
+  collision disabled in training (coplanar duplicate of the solid box floor).
+
+---
+
+## 2026-07-07 — Arena redesign: trippy library (grass + starfield fade + bookshelf ring)
+
+- **What**: Redesigned the center arena visuals in `ArenaBuilder.cs`. Grass
+  floor (PolyHaven `leafy_grass`, CC0, in gitignored `assets/img/arena_redesign/`
+  with a procedural-grass shader fallback), the stone dome now dissolves through
+  an animated aurora band (magenta/teal, TIME-driven drift) into a starfield
+  night sky, and a procedural bookshelf ring lines the full wall (32 bays,
+  gnarly leaning posts, ~10 shelf levels, jewel-toned books with ~4.5% emissive
+  glow books via vertex-color alpha). Shelf ring is visual-only — no new
+  collision; wall/floor/dome collision unchanged. Concept was prototyped and
+  approved in Blender first (via Blender MCP; renders in `screenshots/arena_redesign/`).
+- **Latent bug found & fixed**: the arena floor fan in `ArenaBuilder.Build` was
+  wound clockwise-from-above — normals pointed DOWN (comment claimed up). The
+  old cull_disabled stone shader hid this by rendering the underside dimly;
+  any backface-culling material (StandardMaterial3D) made the floor invisible.
+  Flipped the fan winding. Collision unaffected (BackfaceCollision already on).
+- **Godot gotchas captured**:
+  - `render_mode unshaded` ignores `EMISSION` — write final color to `ALBEDO`.
+  - Runtime `Image.Load` albedo textures are sampled linear — call
+    `Image.SrgbToLinear()` (and `GenerateMipmaps()`) or colors wash out.
+  - Never enable a normal map on SurfaceTool meshes without tangents.
+- **Lighting**: torches dimmed to accents (2.1), DomeApexLight is now the key
+  light (moonlight 7.0, cool blue). Verified via `test/TestArena.tscn` captures
+  in `screenshots/arena_ingame/final*.png`.
+
+---
+
+## 2026-07-07 — Interactive grass system (A+ Grass-style, Godot-native)
+
+- **What**: `scripts/GrassField.cs` + `scripts/GrassInteractor.cs` — an
+  interactive grass system recreating the feature set of Unity's "A+ Grass"
+  asset natively in Godot (no asset code used; Unity/URP shaders can't port):
+  60k MultiMesh crossed-quad blades (1 draw call), two-layer scrolling wind
+  noise with blend uniform, base→tip gradient + per-blade jitter + patch noise
+  + root AO, distance fade, and character interaction with a lingering TRAIL:
+  a 128² CPU bend map (RG=push dir, B=strength) stamped by any node in the
+  `GrassInteractor` group, decaying at `RecoverySpeed` (exp decay).
+- **Wiring**: ArenaBuilder adds a `GrassField` (Radius-2.5) over the arena
+  floor; PlayerController and EnemyController each add a `GrassInteractor`
+  child in `_Ready` (one line each). Visual-only — zero collision changes.
+- **Verified**: `test/TestGrass.tscn` — orbiting interactor carves a visible
+  recovering spiral trail (`screenshots/arena_ingame/grass2*.png`).
+- **Skipped deliberately**: mouse interaction (FPS game, no cursor).
+
+## 2026-07-07 — BlenderKit material pass + velvet doorway curtains
+
+- **Materials** (BlenderKit CC0, textures extracted via Blender MCP into
+  gitignored `assets/img/mats/`, all with procedural fallbacks):
+  - Hallway + stair floors → "Ed carpeting" (`GetFloorMat`/`GetStairFloorMat`)
+  - Hallway walls → "Terracotta Floor Tiles" above a 2.4m "Wooden Panels"
+    wainscot (`GetStoneMat`, new `TexSurfShaderSrc` w/ world-space mapping +
+    `mod(y, FloorHeight)` wainscot band)
+  - Stair walls → "Parquet panel" (`GetStairStoneMat`)
+  - Arena wall behind bookshelves → "Wooden Panels" (StandardMaterial3D
+    triplanar); dome-fade base tone warmed to match
+- **Curtains**: huge deep-red velvet curtains over both arena arch doorways
+  (cover the black corridor openings). Shader-cloth: pinned rod, drape
+  scallops, two-layer wind ripple, and bulge/part around nearby
+  GrassInteractors via per-frame push uniforms (`ArenaBuilder._PhysicsProcess`).
+- **CRITICAL DISCOVERY — Jolt vs SoftBody3D**: this project uses Jolt
+  (`physics_engine="Jolt Physics"`), and real SoftBody3D cloth SHREDS under
+  Jolt in Godot 4.6 even with a properly welded indexed mesh (verified
+  verts=221/indices=1152 and position-based pinning). Do NOT use SoftBody3D
+  in this project; use shader-cloth instead.
+  Also: SurfaceTool.GenerateNormals() DEINDEXES surfaces — never call it on a
+  mesh intended for soft-body/welded use; set normals manually.
+- **BlenderKit addon note**: installed 3.21 has a server API version-skew bug
+  (`UserProfile got unexpected 'avatar512'`) breaking ALL downloads; worked
+  around by monkeypatching tolerant dataclass constructors in-session. Addon
+  should be updated. Accidental 68MB addon-source copy deleted from
+  `assets/blendkits/`.
+
+## 2026-07-07 — Valance curtains, taller panel band, liminal weirdcore sky
+
+- Curtains are now valances: rod at the dome spring (WallH), hem at
+  SpringY+ArchRise-1.5 — they overhang the arch top and leave the doorway
+  open. Bookshelves stop at WallH-6 so a 6m wooden-panel band shows above.
+- Dome sky rewritten for the liminal/weirdcore brief: muted blue-grey base
+  (never pure black), fog glow hugging the horizon, crushed-noise dust stars
+  (subtle twinkle) + a few OVERSIZED lonely stars (steady, soft halo), and a
+  pale cyan-violet fog light at the wall-top dissolve (replacing the aurora).
+- 6 cool "BandLight" omnis (WallH-3.5) wash the panel band + valances.
+- **Latent bug found**: the arena wall ring is wound facing OUTWARD (same
+  family as the floor-fan winding bug) — masked because every arena shader
+  is cull_disabled. The panel StandardMaterial3D needed
+  CullMode=Disabled to render; dark mahogany also needed an AlbedoColor lift
+  (~1.9x) since sRGB->linear crushes dark albedos in dim light.
+
+## 2026-07-08 — Open-air arena + real HDRI night sky
+
+- Removed the arena dome entirely (hemisphere loop + DomeSky shader deleted).
+  Walls end at WallH (28m), open to the sky. `domeST` still carries the arch
+  doorway soffits — now emitted as "ArenaArches" with StoneMat, collision kept.
+- Real night sky: `ArenaBuilder.SetupNightSky()` loads the CC0 PolyHaven
+  `satara_night_4k.hdr` (Milky Way photo, assets/img/sky/, gitignored) into a
+  PanoramaSkyMaterial on the scene environment (BackgroundMode=Sky,
+  BackgroundEnergyMultiplier=2.2 since real night HDRIs are dim). Renders at
+  infinity — no parallax, "proper distance away". Missing file → env untouched.
+- HDR loads are linear already — do NOT SrgbToLinear() them (unlike jpg albedo).
+- Blender MCP note: bridge can be revived headlessly by just launching
+  blender.exe — the official addon auto-starts its socket (port 9876) ~2s later.
+- Open-top caveat: no ceiling collision anymore; if movement tech ever gets
+  players above 28m they could exit over the wall — add an invisible barrier
+
+## 2026-07-09 — Task 6: PropLibrary + sconce/prop placement per variant
+
+- New `scripts/PropLibrary.cs`: static GLB loader/cache for `assets/glb/props/{name}.glb`,
+  `Instance(propName, withLight)` returns `null` when a prop file is missing so
+  every caller can skip gracefully. Includes the headless-capture GLTF fallback
+  (GltfDocument/GltfState) for un-imported files, plus a `_scale` table
+  (all 1.0 for now — real GLBs don't exist yet; tune via `MeshInstance3D.GetAabb()`
+  once Task 5's asset generation lands).
+- `PropLibrary.PropsAvailable` does a one-time check of `assets/glb/props` for any
+  `.glb` file and prints `[PropLibrary] assets/glb/props absent — props disabled`
+  exactly once (not per-prop) when empty. Also gates `PieceVariants.AddDrapePanel`,
+  which is a procedural shader mesh (no GLB dependency) — kept behind the same flag
+  so fallback captures render **zero new nodes**, not just zero GLB instances.
+- `PieceVariants.cs` additions, all wired into `ApplyVariant`: `AddSconces` (one
+  torch per closed wall, ~1-in-3 lit via `Fnv`), `AddCornerProps` (variant 0,
+  `plant_a` at true wall corners — naturally skips straight corridors), 
+  `AddMidCorridorProp` (variant 1, `candelabra_a` at straight-corridor midpoints),
+  `AddDrapePanel` (variant 3, procedural velvet cloth reusing `ArenaBuilder`'s
+  shader source as its own copied `const`, per the codebase's shader-duplication
+  convention).
+- Verified fallback end-to-end: `dotnet build` clean, ArenaConnTest capture
+  (`screenshots/manor/sconces*.png`) frame-for-frame identical to the prior
+  Task 4 capture (`trim*.png`) — zero ERROR lines in the run log, the
+  PropLibrary warning printed exactly once. Since no GLBs exist yet, none of
+  the new placement code actually renders anything in this repo state; it's
+  proven correct only via the fallback path and will need a follow-up capture
+  once Task 5 assets land.
+  disc if that becomes a problem.
+
+## 2026-07-09 — Manor overhaul wrap-up: Tasks 1-4, 6-9 + Task 10 QA sweep
+
+Full arc of the "gothic manor" corridor/arena visual overhaul, capped off with
+a QA sweep. Summary of what landed (Task 5 — GLB prop generation — never
+shipped; see Deferred below):
+
+- **Task 1 — shader depth pass**: parallax + tangent-free normal mapping
+  wired into `DungeonBuilder`'s 4 texture getters (`GetStoneMat`,
+  `GetFloorMat`, `GetStairStoneMat`, `GetStairFloorMat`) via new
+  `heightFile`/`normalFile` params on `MakeTexturedMat` + a `LoadDataTexture`
+  helper (no `SrgbToLinear` — height/normal maps are data, not color).
+- **Task 2 — `PieceVariants`**: new deterministic per-piece variant system
+  (`Fnv` hash of `X,Y,Floor,Type,Rotation,salt` → `VariantIndex`, no
+  `Random`/`GetHashCode`), wired into `DungeonBuilder.Build` right before
+  `AddTorches`. `test/TestVariants.tscn` is the determinism harness — prints
+  `[TestVariants] PASS deterministic`.
+- **Task 3 — hall floor v2**: dark-wood floor base
+  (`arena_redesign/dark_wood`) + raised rug-runner slabs per corridor
+  (`AddRugSlab`, 4 tint variants, corridor-axis-aware sizing). Known,
+  unfixed edge case: 4-way junctions fall through to the N/S rug branch
+  (no distinct cross/plus shape) — matches the brief literally, flagged for
+  a future task.
+- **Task 4 — real trim geometry**: wainscot baseboards/chair-rails/stiles
+  (`AddWallTrim`) + ceiling coffer beams (`AddCofferBeams`), procedural
+  wood-grain shader, visual-only (no collision).
+- **Task 6 — `PropLibrary` + sconces/props in variants**: GLB loader/cache
+  with a hard `null`-on-missing contract every caller must honor; sconces,
+  corner plants, mid-corridor candelabras, and a procedural velvet drape
+  panel, all wired into `ApplyVariant`. Fully verified via the **fallback**
+  path only (no GLBs exist) — prints
+  `[PropLibrary] assets/glb/props absent — props disabled` exactly once.
+- **Task 7 — arena second tier**: balustrade/column ring + book-row GLB
+  slots (both null-gated, absent today) plus procedural tier ledge torus and
+  catenary velvet swags (render unconditionally).
+- **Task 8 — stained-glass dome**: squashed-hemisphere leaded-glass dome
+  + iron ribs over the arena, real night-sky HDRI glowing through the
+  panes. Visual-only, no collision — arena ceiling stays open.
+- **Task 9 — physics props + sword impulse**: `PhysicsProp` (RigidBody3D),
+  `PieceVariants.AddClutterProps` (0-2 per non-stair piece, GLB-gated),
+  `SwordCombat.StartStrike` now applies a swing impulse to nearby physics
+  props (2.6m radius, ~70° forward cone). Verified with a primitive-visual
+  test harness (`test/TestPhysicsProps.tscn`) since no clutter GLBs exist to
+  drop into the real game yet.
+- **Task 10 — QA sweep** (this entry): captured all 5 harnesses
+  (`TestArena`, `ArenaConnTest`, `StairInspect`, `TestVariants`,
+  `TestPhysicsProps`), confirmed `dotnet build` clean and
+  `[TestVariants] PASS deterministic`, ran a 30fps/90-frame perf capture on
+  `ArenaConnTest` (only reached 18 frames — see discovery below), and ran
+  unbiased visual QA on the arena and corridor captures
+  (`visual-qa/manor-1.md`, `visual-qa/manor-2.md`).
+
+### Discoveries worth keeping
+
+- **Grass placement is NOT a grid** — `GrassField.cs` uses a uniform random
+  disc distribution (`rng.NextDouble()`-driven angle/radius), confirmed by
+  code read after a visual-QA pass falsely flagged it as grid-snapped. The
+  visible regularity is an optical-illusion artifact of blade density/height
+  at a top-down-ish angle, not a placement bug.
+- **QA test harnesses are ~4x brighter than real gameplay lighting, by
+  design** — `test/ArenaConnTest.cs` (and `TestArena`/`ArenaBuilder`'s own
+  env setup) use flat `AmbientLightColor(0.40,0.40,0.40)`/`Energy=1.0` for
+  QA visibility, while real gameplay (`scenes/OnlineDungeonArena.cs:534-540`)
+  uses near-black `AmbientLightColor(0.10,0.07,0.04)`/`Energy=0.25` per the
+  documented dark-gothic art direction. This makes every 1fps QA capture
+  read as "flat/washed out/sconces don't glow" even though the underlying
+  torches (`DungeonBuilder.AddTorches`, warm `(1.0,0.68,0.22)`,
+  `LightEnergy=2.8`) are real, meaningful lights. **Any visual QA run against
+  these test harnesses needs this caveat** — a "gameplay-lit" capture
+  variant (reusing `OnlineDungeonArena`'s ambient) would be a worthwhile
+  follow-up before trusting flat-lighting QA verdicts about mood/contrast.
+- **`ArenaConnTest.cs` self-quits after cycling its `Cameras[]` waypoints**
+  (`_Process`, line ~137-147), independent of `--quit-after`. A
+  `--quit-after 90` capture only produced 18 frames because the scene called
+  `GetTree().Quit()` once it ran out of camera waypoints. Not a bug — just a
+  harness quirk worth knowing before assuming a longer `--quit-after` will
+  yield more frames on this particular scene.
+- **`visual-qa` skill's default Gemini model name is broken**:
+  `.claude/skills/visual-qa/scripts/visual_qa.py`'s `gemini-3-flash` 404s;
+  needs `gemini-3-flash-preview` or similar. Separately, the fallback
+  `gemini-2.0-flash` hit a hard quota wall (limit 0 — billing not enabled on
+  the configured key). Both are recorded as deferred/follow-up items below;
+  the corridor VQA pass in this task fell back to native Claude vision per
+  the skill's own documented fallback path.
+
+### Perf sanity (Task 10)
+
+30fps/90-frame `--write-movie` capture on `ArenaConnTest` (only 18 frames
+rendered — see harness self-quit discovery above): engine reported
+**CPU render time avg 8.87ms/frame, GPU avg 2.94ms/frame** — well inside the
+33ms/frame budget for 30fps. No frame-pacing complaints in the output. No
+perf regression signal; sconce/light-count tuning remains a recorded
+follow-up, not something this task touched.
+
+### Visual QA verdicts (Task 10)
+
+Both arena and corridor captures came back `fail` from the visual-qa skill,
+but investigation (see `visual-qa/manor-1.md` / `manor-2.md` for full
+detail) attributes nearly all of it to the test-harness lighting gap above,
+one false positive (grass grid claim), one misread (a "green glow" that's
+just the arena's grass floor visible through the archway), and
+already-documented GLB-asset-pipeline blockers (bookshelf tiling, floating
+swags — Task 6/7's known limitations). One minor issue (rug texture near the
+arena-connection landing) touches a documented fragile area (arena
+stitching) and was escalated rather than touched. **No code changes were
+made as a result of either verdict** — everything actionable was either a
+non-issue on inspection or out of this QA task's minimal-fix scope.
+
+### Deferred (unchanged from prior tasks, plus new items from Task 10)
+
+- **GLB prop conversion** (Task 5) — still blocked on an external API key.
+  14 approved reference images sit at `assets/img/props/*.png` with zero
+  GLBs at `assets/glb/props/`. Every prop-placement code path (sconces,
+  book rows, balustrade/columns, clutter) is implemented and null-gated
+  correctly, but renders nothing in the real game until this unblocks.
+- **Prop-placement QA** — explicitly skipped this task (nothing to see
+  without GLBs); re-run once Task 5 unblocks.
+- **Gemini billing / visual-qa model name** — see Discoveries above; the
+  skill's Gemini backend is unusable until (a) billing is enabled on the
+  configured API key and (b) `visual_qa.py`'s default model name is fixed.
+- **Tripo key** — asset-pipeline dependency, still outstanding (same
+  category as the GLB blocker above).
+- **"Gameplay-lit" QA capture variant** — new follow-up suggestion from this
+  task: a corridor/arena test harness that reuses `OnlineDungeonArena`'s
+  near-black ambient instead of the current bright QA-visibility ambient,
+  so future visual-QA verdicts about mood/contrast/light-pools aren't
+  systematically biased by the harness's own lighting choice.
+- Previously-recorded deferrals (still deferred, untouched by Task 10):
+  CellSize increase (arena stitching + stair ramp coupling), walkable
+  balcony collision decision, physics prop multiplayer sync.
+
+## 2026-07-21 — Manor overhaul complete: GLB props landed
+
+- Tripo3D key fixed (tsk_ API key, not tcli_ client key — they 401 on the
+  OpenAPI). 14/14 prop GLBs generated ($5.90 total of $10 budget).
+- Prop QA pass (d5d930d): all scales tuned from measured AABBs; balustrade
+  was spawning submerged inside the tier ledge torus (raised to tierY+0.75);
+  LookAt-before-AddChild reordered defensively; candelabra always-lit kept
+  (captures read atmospheric, not over-lit). Book rows replace box-books.
+- KNOWN ISSUE: lazy GLB loads hitch (~45MB each, ~18s cold-load all 14).
+  Future ticket: decimate/preload (Blender MCP can batch-decimate, or
+  regenerate at default quality).
+
+## 2026-07-21 — Polish Pass Task 2: GLB sconces replace legacy torches
+
+Playtest feedback: "the old torches are still there — remove them. Make the
+new candle-holder/torch things BIGGER, replace the torches, oriented
+correctly and positioned."
+
+- Recon found the actual visible "old torch" was `VisualFlair`'s
+  `AddTorchBracket` — a procedural iron-bracket + emissive-flame-cone mesh
+  that `WallTorches` relocated `DungeonBuilder.AddTorches`' per-cell ambient
+  `OmniLight3D` onto, running alongside the GLB sconces added in the manor
+  overhaul. Deleted `AddTorchBracket`/`WallMount`/`IronMat`/`FlameMat` and the
+  `WallTorches`/`TorchShadows`/`ShadowEvery`/`TorchEnergy`/`TorchRange`
+  control-panel fields (all dead once the bracket was gone).
+- `PieceVariants.AddSconces` now registers each cell's lit sconce light
+  directly into `DungeonBuilder.TorchByCell` (threaded through
+  `PieceVariants.Apply`'s new parameter) — sconces are the primary corridor
+  light source. `AddTorches` now only fills a dim fallback ambient light for
+  cells a sconce didn't light (open 4-way crossings, unlucky rolls), so no
+  cell goes fully dark and no cell double-lights. `TorchSignalSystem` (the
+  Exit→Start BFS reveal) needed zero changes — it only ever needed *a* light
+  per cell in `TorchByCell`.
+- Sconce placement: every closed wall already got one (no change needed
+  there); light roll bumped 1-in-3 → 1-in-2 (new salt 17), sconce light
+  energy/range bumped 2.4/12 → 3.0/14 to carry primary-light duty. `torch_a`/
+  `torch_b` scale 0.7m → 1.1m, `candelabra_a`/`b` 1.6m → 1.9m
+  (`PropLibrary._scale`). Sconce mount height 2.9m → 2.6m so the bigger prop
+  stays centred on the wall face.
+- Verified via `ArenaConnTest`/`StairInspect` captures
+  (`screenshots/polish/t2_hall*.png`, `t2_stairs*.png`): sconces read as real
+  wall-mounted lantern props (not the old crude bracket+cone), correctly
+  oriented into the corridor, backplate flush against the wall, no double
+  torches at the same spot, corridors evenly lit down their length.
+  `dotnet build` clean, 0 warnings/errors.
+- Full report: `.superpowers/sdd/polish-t2-report.md`.
+- Full follow-up list in .superpowers/sdd/progress.md.

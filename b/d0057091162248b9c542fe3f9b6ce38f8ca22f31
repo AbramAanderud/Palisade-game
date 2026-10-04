@@ -1,0 +1,154 @@
+// server/test/relay.test.js — end-to-end relay tests over real WebSockets.
+// Run: node --test server/test/
+// Starts relay.js on a spare port as a child process; every client is a real
+// `ws` socket, so this exercises exactly what the Godot NetworkManager sees.
+const { test, before, after } = require('node:test');
+const assert = require('node:assert');
+const { spawn } = require('node:child_process');
+const path = require('node:path');
+const WebSocket = require('ws');
+
+const PORT = 3199;
+const URL = `ws://localhost:${PORT}`;
+let relay;
+
+before(async () => {
+  relay = spawn(process.execPath, [path.join(__dirname, '..', 'relay.js')], {
+    env: { ...process.env, PORT: String(PORT) },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  await new Promise((resolve, reject) => {
+    relay.stdout.on('data', d => { if (String(d).includes('listening')) resolve(); });
+    relay.on('exit', code => reject(new Error(`relay exited early (${code})`)));
+  });
+});
+
+after(() => { if (relay) relay.kill(); });
+
+class Client {
+  constructor() { this.inbox = []; this.waiters = []; this.id = null; }
+
+  static async open(name) {
+    const c = new Client();
+    c.ws = new WebSocket(URL);
+    c.ws.on('message', raw => c._push(String(raw)));
+    await new Promise((res, rej) => { c.ws.on('open', res); c.ws.on('error', rej); });
+    if (name) {
+      c.send({ type: 'lobby_join', name });
+      c.id = (await c.next(m => m.type === 'lobby_joined')).playerId;
+    }
+    return c;
+  }
+
+  _push(raw) {
+    const m = JSON.parse(raw);
+    Object.defineProperty(m, 'raw', { value: raw, enumerable: false });
+    const i = this.waiters.findIndex(w => w.pred(m));
+    if (i >= 0) { const [w] = this.waiters.splice(i, 1); w.resolve(m); }
+    else this.inbox.push(m);
+  }
+
+  // Resolves with the first message (queued or future) matching pred; consumes it.
+  next(pred, ms = 2000) {
+    const i = this.inbox.findIndex(pred);
+    if (i >= 0) return Promise.resolve(this.inbox.splice(i, 1)[0]);
+    return new Promise((resolve, reject) => {
+      const w = { pred, resolve };
+      this.waiters.push(w);
+      setTimeout(() => {
+        const k = this.waiters.indexOf(w);
+        if (k >= 0) { this.waiters.splice(k, 1); reject(new Error(`timeout waiting for ${pred}`)); }
+      }, ms);
+    });
+  }
+
+  // Asserts that no message matching pred arrives within ms.
+  async none(pred, ms = 300) {
+    await new Promise(r => setTimeout(r, ms));
+    assert.ok(!this.inbox.some(pred), `unexpected message matching ${pred}: ${JSON.stringify(this.inbox.find(pred))}`);
+  }
+
+  send(o) { this.ws.send(typeof o === 'string' ? o : JSON.stringify(o)); }
+  close() { this.ws.close(); }
+}
+
+// Latest message of `type` received so far: waits for at least one, lets any
+// in-flight ones land, then drains the queue and returns the newest.
+async function latestOf(c, type) {
+  let last = await c.next(m => m.type === type);
+  await new Promise(r => setTimeout(r, 100));
+  for (;;) {
+    const i = c.inbox.findIndex(m => m.type === type);
+    if (i < 0) return last;
+    last = c.inbox.splice(i, 1)[0];
+  }
+}
+const latestLobby = c => latestOf(c, 'lobby_update');
+
+test('1v1: challenge → match_made, byte-identical forwarding, peer_disconnected', async () => {
+  const a = await Client.open('Alice');
+  const b = await Client.open('Bob');
+  a.send({ type: 'challenge', targetId: b.id });
+  const inc = await b.next(m => m.type === 'incoming_challenge');
+  assert.equal(inc.fromName, 'Alice');
+  assert.equal(inc.fromId, a.id);
+  b.send({ type: 'challenge_response', challengerId: a.id, accepted: true });
+  const ma = await a.next(m => m.type === 'match_made');
+  const mb = await b.next(m => m.type === 'match_made');
+  assert.equal(ma.isHost, true);
+  assert.equal(mb.isHost, false);
+  assert.equal(ma.opponentName, 'Bob');
+  assert.equal(mb.opponentName, 'Alice');
+  assert.equal(ma.code, mb.code);
+
+  const payload = '{"t":"pos","x":1.5,"y":2,"z":-3}';
+  a.send(payload);
+  const got = await b.next(m => m.t === 'pos');
+  assert.equal(got.raw, payload, 'forwarded verbatim — no "from" stamp in 1v1');
+  const back = '{"t":"hit","dmg":20}';
+  b.send(back);
+  assert.equal((await a.next(m => m.t === 'hit')).raw, back);
+
+  a.close();
+  await b.next(m => m.type === 'peer_disconnected');
+  b.close();
+});
+
+test('1v1: declined challenge', async () => {
+  const a = await Client.open('Ann');
+  const b = await Client.open('Ben');
+  a.send({ type: 'challenge', targetId: b.id });
+  await b.next(m => m.type === 'incoming_challenge');
+  b.send({ type: 'challenge_response', challengerId: a.id, accepted: false });
+  await a.next(m => m.type === 'challenge_declined');
+  a.close(); b.close();
+});
+
+test('manual rooms: create/join, forwarding, full', async () => {
+  const h = await Client.open();
+  h.send({ type: 'create' });
+  const { code } = await h.next(m => m.type === 'room_created');
+  assert.match(code, /^\d{3}$/);
+  const g = await Client.open();
+  g.send({ type: 'join', code });
+  await g.next(m => m.type === 'joined' && m.code === code);
+  await h.next(m => m.type === 'peer_connected');
+  g.send('{"t":"ping"}');
+  assert.equal((await h.next(m => m.t === 'ping')).raw, '{"t":"ping"}');
+  const x = await Client.open();
+  x.send({ type: 'join', code });
+  assert.equal((await x.next(m => m.type === 'error')).reason, 'full');
+  x.send({ type: 'join', code: '000' });
+  assert.equal((await x.next(m => m.type === 'error')).reason, 'not_found');
+  h.close(); await g.next(m => m.type === 'peer_disconnected');
+  g.close(); x.close();
+});
+
+test('stats reports online and lobby counts', async () => {
+  const s = await Client.open();
+  s.send({ type: 'stats' });
+  const st = await s.next(m => m.type === 'stats');
+  assert.equal(typeof st.online, 'number');
+  assert.equal(typeof st.lobby, 'number');
+  s.close();
+});

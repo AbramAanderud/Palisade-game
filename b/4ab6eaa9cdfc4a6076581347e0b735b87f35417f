@@ -1,0 +1,736 @@
+using System;
+using Godot;
+
+/// HUD: red HP bar (top-centre) + self-updating stamina donut ring (bottom-centre).
+/// Attached as child of PlayerController; siblings are found by type, not name.
+public partial class PlayerHUD : CanvasLayer
+{
+    const float BarW = 360f;
+    const float BarH = 20f;
+    const float PadY = 18f;
+
+    ColorRect     _hpFill    = null!;
+    ColorRect?    _hitFlash;
+    float         _hitFlashTimer = 0f;
+    const float   HitFlashDur    = 0.40f;
+    PlayerHealth? _health;
+
+    public override void _Ready()
+    {
+        Layer = 10;
+
+        var root = new Control { Name = "HUDRoot" };
+        root.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        AddChild(root);
+
+        // ── HP bar — top-centre, red, no outline ─────────────────────────────
+        // Dim red track shows the "empty" portion
+        var hpBack = new ColorRect { Color = new Color(0.7f, 0.05f, 0.05f, 0.25f) };
+        hpBack.AnchorLeft     = 0.5f;
+        hpBack.AnchorRight    = 0.5f;
+        hpBack.AnchorTop      = 0f;
+        hpBack.AnchorBottom   = 0f;
+        hpBack.GrowHorizontal = Control.GrowDirection.Both;
+        hpBack.OffsetLeft     = -BarW / 2f;
+        hpBack.OffsetRight    =  BarW / 2f;
+        hpBack.OffsetTop      =  PadY;
+        hpBack.OffsetBottom   =  PadY + BarH;
+        root.AddChild(hpBack);
+
+        _hpFill = new ColorRect
+        {
+            Position = Vector2.Zero,
+            Size     = new Vector2(BarW, BarH),
+            Color    = new Color(0.88f, 0.12f, 0.12f, 1f),
+        };
+        hpBack.AddChild(_hpFill);
+
+        // ── Hit vignette — full-screen red flash on taking damage ─────────────
+        _hitFlash = new ColorRect
+        {
+            Color       = new Color(0.85f, 0f, 0f, 0f),
+            MouseFilter = Control.MouseFilterEnum.Ignore,
+        };
+        _hitFlash.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        root.AddChild(_hitFlash);
+
+        // ── Reload ring — bottom-centre, hidden unless reloading ──────────────
+        var ring = new StaminaRing();
+        ring.AnchorLeft     = 0.5f;
+        ring.AnchorRight    = 0.5f;
+        ring.AnchorTop      = 1.0f;
+        ring.AnchorBottom   = 1.0f;
+        ring.GrowHorizontal = Control.GrowDirection.Both;
+        ring.GrowVertical   = Control.GrowDirection.Begin;
+        ring.OffsetLeft     = -44f;
+        ring.OffsetRight    =  44f;
+        ring.OffsetTop      = -126f;
+        ring.OffsetBottom   =  -38f;
+        root.AddChild(ring);
+
+        // ── Crosshair — its gap tracks live spread, so the accuracy/speed
+        // tradeoff is visible at all times instead of being an invisible stat ──
+        var cross = new SpreadCrosshair();
+        cross.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        cross.MouseFilter = Control.MouseFilterEnum.Ignore;
+        root.AddChild(cross);
+
+        // ── Ammo counter — bottom-right ───────────────────────────────────────
+        _ammoLabel = new Label
+        {
+            Text                = "",
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        _ammoLabel.AnchorLeft     = 1f;
+        _ammoLabel.AnchorRight    = 1f;
+        _ammoLabel.AnchorTop      = 1f;
+        _ammoLabel.AnchorBottom   = 1f;
+        _ammoLabel.GrowHorizontal = Control.GrowDirection.Begin;
+        _ammoLabel.GrowVertical   = Control.GrowDirection.Begin;
+        _ammoLabel.OffsetLeft     = -260f;
+        _ammoLabel.OffsetRight    =  -28f;
+        _ammoLabel.OffsetTop      =  -84f;
+        _ammoLabel.OffsetBottom   =  -28f;
+        _ammoLabel.AddThemeFontSizeOverride("font_size", 34);
+        _ammoLabel.AddThemeColorOverride("font_color", new Color(0.95f, 0.93f, 0.85f, 0.92f));
+        root.AddChild(_ammoLabel);
+
+        // ── Weapon slots — bottom-right, stacked above the ammo counter ───────
+        _slots = new WeaponSlotsPanel();
+        _slots.AnchorLeft     = 1f;
+        _slots.AnchorRight    = 1f;
+        _slots.AnchorTop      = 1f;
+        _slots.AnchorBottom   = 1f;
+        _slots.GrowHorizontal = Control.GrowDirection.Begin;
+        _slots.GrowVertical   = Control.GrowDirection.Begin;
+        _slots.OffsetLeft     = -262f;
+        _slots.OffsetRight    =  -28f;
+        _slots.OffsetTop      = -258f;
+        _slots.OffsetBottom   =  -96f;
+        _slots.Visible        = false;
+        root.AddChild(_slots);
+
+        // ── AWP scope — added last so it draws over everything else while active ──
+        var scope = new ScopeOverlay();
+        scope.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        scope.MouseFilter = Control.MouseFilterEnum.Ignore;
+        root.AddChild(scope);
+    }
+
+    Label?            _ammoLabel;
+    GunCombat?        _gun;
+    WeaponSlotsPanel? _slots;
+
+    public void TriggerHitFlash()
+    {
+        _hitFlashTimer = HitFlashDur;
+        if (_hitFlash != null) _hitFlash.Color = new Color(0.85f, 0f, 0f, 0.50f);
+    }
+
+    public override void _Process(double delta)
+    {
+        // Puppets get a HUD from the shared Spawn path but must never draw one —
+        // it would double up over the real local HUD with stale/frozen values.
+        if (GetParent() is PlayerController owner && owner.IsRemotePuppet) { Visible = false; return; }
+
+        // Resolve PlayerHealth by type — immune to node-name changes
+        if (_health == null)
+        {
+            var parent = GetParent();
+            if (parent != null)
+                foreach (var child in parent.GetChildren())
+                    if (child is PlayerHealth ph) { _health = ph; break; }
+        }
+
+        if (_health != null)
+        {
+            float frac = Mathf.Clamp(_health.CurrentHealth / PlayerHealth.MaxHealth, 0f, 1f);
+            _hpFill.Size = new Vector2(BarW * frac, BarH);
+        }
+
+        if (_hitFlash != null && _hitFlashTimer > 0f)
+        {
+            _hitFlashTimer -= (float)delta;
+            float alpha = Mathf.Clamp(_hitFlashTimer / HitFlashDur * 0.50f, 0f, 0.50f);
+            _hitFlash.Color = new Color(0.85f, 0f, 0f, alpha);
+        }
+
+        // ── Ammo readout ──────────────────────────────────────────────────────
+        if (_gun == null && GetParent() is Node parent2)
+            foreach (var child in parent2.GetChildren())
+                if (child is GunCombat gc) { _gun = gc; break; }
+
+        if (_ammoLabel != null && _gun != null)
+        {
+            _ammoLabel.Text = _gun.IsMelee     ? "KNIFE"
+                            : _gun.IsReloading ? "RELOADING"
+                            : $"{_gun.Ammo} / {_gun.MagSize}";
+            // Flash red when the mag is dry so the empty state is unmissable.
+            _ammoLabel.AddThemeColorOverride("font_color",
+                _gun.IsEmpty ? new Color(1f, 0.25f, 0.18f, 0.95f)
+                             : new Color(0.95f, 0.93f, 0.85f, 0.92f));
+        }
+
+        // ── Weapon slots ──────────────────────────────────────────────────────
+        if (_slots != null)
+        {
+            var pc  = GetParent() as PlayerController;
+            bool on = pc != null && _gun != null && pc.SecondaryGunId != null;
+            _slots.Visible = on;
+            if (on) _slots.UpdateFrom(pc!, _gun!);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+/// Bottom-right loadout readout: PRIMARY (arena prize) over SECONDARY (spawn
+/// roll), each with a live 3D icon of the gun. The held slot is gold-framed and
+/// full-bright, the holstered one dimmed with its remembered mag count; before
+/// the prize is claimed the primary card sits as a dim "IN THE MIDDLE" teaser so
+/// the goal is on screen from the first second.
+public partial class WeaponSlotsPanel : VBoxContainer
+{
+    WeaponSlotCard _primary   = null!;
+    WeaponSlotCard _secondary = null!;
+    WeaponSlotCard _melee     = null!;
+    Label          _hint      = null!;
+
+    public override void _Ready()
+    {
+        Alignment   = AlignmentMode.End;
+        MouseFilter = MouseFilterEnum.Ignore;
+        AddThemeConstantOverride("separation", 6);
+
+        _primary   = new WeaponSlotCard("PRIMARY");
+        _secondary = new WeaponSlotCard("SECONDARY");
+        _melee     = new WeaponSlotCard("MELEE");
+        AddChild(_primary);
+        AddChild(_secondary);
+        AddChild(_melee);
+
+        _hint = new Label
+        {
+            Text                = "TAB — SWAP WEAPON",
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Visible             = false,
+        };
+        _hint.AddThemeFontSizeOverride("font_size", 11);
+        _hint.AddThemeColorOverride("font_color", new Color(0.75f, 0.72f, 0.62f, 0.55f));
+        AddChild(_hint);
+    }
+
+    public void UpdateFrom(PlayerController pc, GunCombat gun)
+    {
+        string held = gun.Def.Id;
+        bool primaryHeld = pc.PrimaryGunId == held;
+        _primary.Update(pc.PrimaryGunId, primaryHeld,
+                        pc.PrimaryGunId is string p ? gun.StoredAmmo(p) : 0);
+        _secondary.Update(pc.SecondaryGunId, !primaryHeld && pc.SecondaryGunId == held,
+                          pc.SecondaryGunId is string s ? gun.StoredAmmo(s) : 0);
+        _melee.Update(GunCombat.KnifeId, gun.IsMelee, 0);
+        _hint.Visible = pc.HasBothGuns;
+    }
+}
+
+/// One loadout slot card: 3D gun icon + slot label + gun name.
+public partial class WeaponSlotCard : PanelContainer
+{
+    static readonly Color HeldBorder = new(1.00f, 0.82f, 0.20f, 0.95f);   // GunSwitcher gold
+    static readonly Color IdleBorder = new(1f, 1f, 1f, 0.10f);
+
+    readonly string _slotName;
+    StyleBoxFlat _style   = null!;
+    GunSlotIcon  _icon    = null!;
+    Label        _qmark   = null!;
+    Label        _nameLbl = null!;
+    Label        _ammoLbl = null!;
+
+    public WeaponSlotCard() : this("SLOT") {}   // parameterless for Godot
+    public WeaponSlotCard(string slotName) => _slotName = slotName;
+
+    public override void _Ready()
+    {
+        MouseFilter = MouseFilterEnum.Ignore;
+        _style = new StyleBoxFlat
+        {
+            BgColor             = new Color(0f, 0f, 0f, 0.45f),
+            BorderColor         = IdleBorder,
+            ContentMarginLeft   = 7, ContentMarginRight  = 9,
+            ContentMarginTop    = 5, ContentMarginBottom = 5,
+            CornerRadiusTopLeft = 4, CornerRadiusTopRight    = 4,
+            CornerRadiusBottomLeft = 4, CornerRadiusBottomRight = 4,
+        };
+        _style.SetBorderWidthAll(2);
+        AddThemeStyleboxOverride("panel", _style);
+
+        var row = new HBoxContainer { MouseFilter = MouseFilterEnum.Ignore };
+        row.AddThemeConstantOverride("separation", 9);
+        AddChild(row);
+
+        // Icon (with a "?" fallback for the unclaimed primary slot)
+        var iconWrap = new Control
+        {
+            CustomMinimumSize = new Vector2(86, 48),
+            MouseFilter       = MouseFilterEnum.Ignore,
+        };
+        _icon = new GunSlotIcon();
+        _icon.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        iconWrap.AddChild(_icon);
+        _qmark = new Label
+        {
+            Text                = "?",
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment   = VerticalAlignment.Center,
+        };
+        _qmark.SetAnchorsPreset(Control.LayoutPreset.FullRect);
+        _qmark.AddThemeFontSizeOverride("font_size", 26);
+        _qmark.AddThemeColorOverride("font_color", new Color(1f, 1f, 1f, 0.35f));
+        iconWrap.AddChild(_qmark);
+        row.AddChild(iconWrap);
+
+        // Slot label over gun name
+        var col = new VBoxContainer
+        {
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            Alignment           = BoxContainer.AlignmentMode.Center,
+            MouseFilter         = MouseFilterEnum.Ignore,
+        };
+        col.AddThemeConstantOverride("separation", 0);
+        var slotLbl = new Label { Text = _slotName };
+        slotLbl.AddThemeFontSizeOverride("font_size", 11);
+        slotLbl.AddThemeColorOverride("font_color", new Color(0.62f, 0.60f, 0.52f, 0.85f));
+        col.AddChild(slotLbl);
+        _nameLbl = new Label();
+        _nameLbl.AddThemeFontSizeOverride("font_size", 17);
+        _nameLbl.AddThemeColorOverride("font_color", new Color(0.95f, 0.93f, 0.85f, 0.95f));
+        col.AddChild(_nameLbl);
+        row.AddChild(col);
+
+        // Holstered mag count — the big ammo counter already covers the held gun
+        _ammoLbl = new Label
+        {
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment   = VerticalAlignment.Center,
+        };
+        _ammoLbl.AddThemeFontSizeOverride("font_size", 15);
+        _ammoLbl.AddThemeColorOverride("font_color", new Color(0.85f, 0.83f, 0.75f, 0.75f));
+        row.AddChild(_ammoLbl);
+    }
+
+    public void Update(string? gunId, bool held, int storedAmmo)
+    {
+        _icon.ShowGun(gunId);
+        bool filled = gunId != null
+                   && GunCombat.Defs.TryGetValue(gunId, out _);
+        _qmark.Visible = !filled;
+        _nameLbl.Text  = filled ? GunCombat.Defs[gunId!].Display : "IN THE MIDDLE";
+        // No mag count for a magazine-less weapon (the knife).
+        _ammoLbl.Text  = filled && !held && GunCombat.Defs[gunId!].MagSize > 0
+                       ? storedAmmo.ToString() : "";
+        _style.BorderColor = held ? HeldBorder : IdleBorder;
+        Modulate = held ? Colors.White
+                        : new Color(1f, 1f, 1f, filled ? 0.60f : 0.40f);
+    }
+}
+
+/// Live 3D thumbnail of one gun: an own-world SubViewport with an orthographic
+/// side-profile camera (Styloo barrels run along +X) — same trick as the map
+/// editor's palette tiles. Transparent background so it sits on the card.
+public partial class GunSlotIcon : SubViewportContainer
+{
+    SubViewport? _vp;
+    Camera3D?    _cam;
+    Node3D?      _rig;
+    string?      _gunId;
+
+    public override void _Ready()
+    {
+        Stretch     = true;
+        MouseFilter = MouseFilterEnum.Ignore;
+
+        _vp = new SubViewport
+        {
+            TransparentBg          = true,
+            OwnWorld3D             = true,   // arena fog/env must not bleed in
+            RenderTargetUpdateMode = SubViewport.UpdateMode.Always,
+        };
+        AddChild(_vp);
+
+        _cam = new Camera3D
+        {
+            Projection = Camera3D.ProjectionType.Orthogonal,
+            Position   = new Vector3(0f, 0f, 3f),
+            Size       = 1f,
+        };
+        _vp.AddChild(_cam);
+
+        var key = new DirectionalLight3D { RotationDegrees = new Vector3(-35f, 30f, 0f) };
+        _vp.AddChild(key);
+        var fill = new DirectionalLight3D
+        {
+            LightEnergy     = 0.45f,
+            RotationDegrees = new Vector3(-10f, -140f, 0f),
+        };
+        _vp.AddChild(fill);
+    }
+
+    public void ShowGun(string? id)
+    {
+        if (id == _gunId || _vp == null) return;
+        _gunId = id;
+        _rig?.QueueFree();
+        _rig = null;
+
+        if (id == null || !GunCombat.Defs.TryGetValue(id, out var def)) return;
+        if (string.IsNullOrEmpty(def.Model) || !ResourceLoader.Exists(def.Model)) return;
+        if (GD.Load<PackedScene>(def.Model) is not PackedScene scene) return;
+
+        var model = scene.Instantiate<Node3D>();
+        PlayerController.FixStylooMaterials(model);
+
+        _rig = new Node3D();
+        _rig.AddChild(model);
+        // Slight yaw off pure profile so the model reads as 3D, not a decal.
+        _rig.RotationDegrees = new Vector3(0f, -28f, 0f);
+        _vp.AddChild(_rig);
+
+        // Centre and frame: ortho Size is the VERTICAL extent, so fit height
+        // directly and width through the card icon's aspect ratio.
+        var aabb = GunCombat.MeasureAabb(model);
+        model.Position = -aabb.GetCenter();
+        const float aspect = 86f / 48f;
+        if (_cam != null)
+            _cam.Size = Mathf.Max(aabb.Size.Y * 1.30f, aabb.Size.X * 1.15f / aspect);
+    }
+}
+
+/// Finds the player's GunCombat from anywhere inside the HUD by walking ANCESTORS
+/// until one owns a GunCombat child.
+///
+/// This replaced hand-counted `GetParent().GetParent()` chains, which were a
+/// silent-failure trap: the real depth is Control → HUDRoot → PlayerHUD →
+/// PlayerController, and two of the three widgets counted only two levels. They
+/// resolved to null forever and simply fell back to defaults — the crosshair drew
+/// at a fixed spread and the scope overlay never once appeared, with no error.
+public static class HudLookup
+{
+    public static GunCombat? FindGun(Node from)
+    {
+        for (Node? n = from; n != null; n = n.GetParent())
+            foreach (var child in n.GetChildren())
+                if (child is GunCombat gc) return gc;
+        return null;
+    }
+
+    public static PlayerController? FindPlayer(Node from)
+    {
+        for (Node? n = from; n != null; n = n.GetParent())
+        {
+            if (n is PlayerController self) return self;
+            foreach (var child in n.GetChildren())
+                if (child is PlayerController pc) return pc;
+        }
+        return null;
+    }
+}
+
+/// Crosshair whose gap is driven by GunCombat's live spread. Standing still
+/// closes it to a tight cross; sprinting or jumping blows it wide open. This is
+/// the entire accuracy mechanic made visible — no tutorial needed.
+public partial class SpreadCrosshair : Control
+{
+    GunCombat?        _gun;
+    PlayerController? _player;
+
+    // ── Hit marker ────────────────────────────────────────────────────────────
+    // Lives here rather than in its own Control because this class already
+    // resolves the gun AND already computes where the reticle actually is — in
+    // third person the camera sits behind the player, so a marker pinned to
+    // screen centre would sit off the target. Riding ReticlePos keeps it honest
+    // for free, and _Process already redraws every frame so the fade costs
+    // nothing extra.
+    const float HitDur = 0.32f;
+    float _hitLeft = 0f;
+    bool  _hitHead = false;
+    bool  _hitHooked = false;
+
+    public override void _Process(double delta)
+    {
+        _gun    ??= HudLookup.FindGun(this);
+        _player ??= HudLookup.FindPlayer(this);
+
+        // GunCombat raises this only on the shooter's own client, so there is no
+        // risk of flashing a marker when you are the one being shot.
+        if (_gun != null && !_hitHooked)
+        {
+            _gun.OnHitConfirmed += OnHitConfirmed;
+            _hitHooked = true;
+        }
+
+        if (_hitLeft > 0f) _hitLeft -= (float)delta;
+
+        // Recharge ring: when it completes with the knife still out, hold the
+        // full circle briefly while it fades — edge-detected here, not in _Draw.
+        bool recharging = _player?.DashRecharging ?? false;
+        if (_ringWasRecharging && !recharging && (_player?.KnifeOut ?? false))
+            _ringFade = RingFadeDur;
+        _ringWasRecharging = recharging;
+        if (_ringFade > 0f) _ringFade -= (float)delta;
+
+        QueueRedraw();
+    }
+
+    // ── Knife dash recharge ring ──────────────────────────────────────────────
+    // Nothing on screen while the dash is ready. After a dash, a small faint
+    // ring under the reticle sweeps clockwise from 12 o'clock as the charge
+    // refills, then fades out once full. Lives here for the same reason as the
+    // hit marker — ReticlePos is already correct in both camera modes.
+    const float RingFadeDur = 0.3f;
+    const float RingRadius  = 6f;
+    const float RingAlpha   = 0.45f;
+    float _ringFade          = 0f;
+    bool  _ringWasRecharging = false;
+
+    void DrawDashRing(Vector2 c)
+    {
+        if (_player == null) return;
+        bool recharging = _player.DashRecharging;
+        if (!recharging && _ringFade <= 0f) return;
+
+        float p     = recharging ? _player.DashRechargeProgress : 1f;
+        float alpha = RingAlpha * (recharging ? 1f : Mathf.Clamp(_ringFade / RingFadeDur, 0f, 1f));
+        var   at    = c + new Vector2(0f, 22f);
+
+        // Faint full track, then the filled sweep on top.
+        DrawArc(at, RingRadius, 0f, Mathf.Tau, 32,
+                new Color(1f, 1f, 1f, alpha * 0.3f), 1.5f, antialiased: true);
+        if (p > 0.001f)
+            DrawArc(at, RingRadius, -Mathf.Pi / 2f, -Mathf.Pi / 2f + Mathf.Tau * p,
+                    Mathf.Max(4, (int)(32 * p)),
+                    new Color(1f, 0.95f, 0.85f, alpha), 2f, antialiased: true);
+    }
+
+    void OnHitConfirmed(bool headshot)
+    {
+        _hitLeft = HitDur;
+        _hitHead = headshot;
+    }
+
+    /// Four ticks flicking outward from the reticle. Gold for a headshot to match
+    /// the gold damage numbers SpawnDamageNumber already throws, white otherwise,
+    /// so the colour language is the same in both places.
+    void DrawHitMarker(Vector2 c)
+    {
+        if (_hitLeft <= 0f) return;
+
+        float t     = _hitLeft / HitDur;              // 1 → 0
+        float alpha = Mathf.Min(t * 1.7f, 1f);        // hold bright, then fall away
+        float gap   = 5f + (1f - t) * 3.5f;           // punches outward as it fades
+        float len   = _hitHead ? 8f : 6.5f;
+        float w     = _hitHead ? 3f : 2f;
+
+        var col = _hitHead ? new Color(1f, 0.85f, 0.15f, alpha)
+                           : new Color(1f, 1f, 1f, alpha);
+
+        ReadOnlySpan<Vector2> diag = stackalloc Vector2[]
+        {
+            new(0.7071f, 0.7071f), new(0.7071f, -0.7071f),
+            new(-0.7071f, 0.7071f), new(-0.7071f, -0.7071f),
+        };
+        foreach (var d in diag)
+            DrawLine(c + d * gap, c + d * (gap + len), col, w, antialiased: true);
+    }
+
+    public override void _Draw()
+    {
+        // Hit confirmation is drawn BEFORE the scoped early-out below: the AWP is
+        // exactly when you most need to know the shot connected, and the scope
+        // overlay suppresses the spread cross but not this.
+        DrawHitMarker(ReticlePos());
+
+        // The AWP scope draws its own reticle over a full-screen overlay -- the
+        // dynamic spread cross would just double up with it, so hide it entirely
+        // while scoped rather than trying to blend the two together.
+        if (_gun != null && _gun.IsAiming) return;
+
+        // Shape, colour, outline and style all live in ReticleRenderer, which the
+        // settings preview also calls -- so what you configure is literally what
+        // gets drawn here.
+        ReticleRenderer.Draw(this, ReticlePos(),
+                             _gun?.SpreadDegrees ?? 1f,
+                             _gun?.IsEmpty ?? false);
+        DrawDashRing(ReticlePos());
+    }
+
+    /// Where the reticle belongs on screen.
+    ///
+    /// First person: the view ray IS the aim ray, so screen centre is exactly
+    /// where the shot goes - return it unchanged.
+    ///
+    /// Third person: the camera sits behind and above the player while the shot
+    /// still leaves from the head, so those two rays diverge. A centred reticle
+    /// there points at the player's own back rather than the target, which is
+    /// what made aiming in third person feel locked. Project the real impact
+    /// point through the active camera instead, so the reticle tracks the shot.
+    Vector2 ReticlePos()
+    {
+        if (_player == null || !_player.TpMode) return Size / 2f;
+        var cam = _player.ActiveCamera;
+        // Behind the near plane UnprojectPosition mirrors the point to the wrong
+        // side of the screen. Fall back to centre rather than draw a lie.
+        if (cam == null || cam.IsPositionBehind(_player.AimPoint)) return Size / 2f;
+        return cam.UnprojectPosition(_player.AimPoint) - GlobalPosition;
+    }
+}
+
+/// Donut-style RELOAD ring. Hidden while idle; appears the moment a reload starts
+/// and sweeps 0→1 over the gun's real reload duration, so how long you are
+/// defenceless is visible rather than guessed. Finds its own GunCombat by walking
+/// up the tree and redraws every frame — no external push needed.
+public partial class StaminaRing : Control
+{
+    const float Radius    = 34f;
+    const float Thickness =  9f;
+    const int   Points    = 64;
+
+    GunCombat? _combat;
+
+    public override void _Process(double delta)
+    {
+        _combat ??= HudLookup.FindGun(this);
+        QueueRedraw();
+    }
+
+    public override void _Draw()
+    {
+        // Reload progress fills the ring; it reads 0 whenever we are not
+        // reloading, and the early-out below keeps the ring invisible then.
+        float used      = _combat?.ReloadProgress ?? 0f;
+        bool  exhausted = _combat?.IsEmpty ?? false;
+
+        // Use a fixed centre so the ring draws correctly even if Size hasn't
+        // been resolved yet by the layout engine.
+        var center = new Vector2(44f, 44f);
+
+        // The ring exists ONLY during a reload — no idle chrome on screen. The
+        // moment it appears you know you are vulnerable, and its sweep tells you
+        // for exactly how much longer.
+        if (_combat == null || !_combat.IsReloading) return;
+
+        // Faint full track shows the target the sweep is filling toward.
+        DrawArc(center, Radius,
+                -Mathf.Pi / 2f, -Mathf.Pi / 2f + Mathf.Tau,
+                Points, new Color(1f, 1f, 1f, 0.14f), Thickness, true);
+
+        float endAngle = -Mathf.Pi / 2f + Mathf.Tau * Mathf.Clamp(used, 0f, 1f);
+        // Amber while reloading, hot red if the reload was forced by a dry mag.
+        Color col = exhausted
+            ? new Color(1.0f, 0.40f, 0.15f, 0.95f)
+            : new Color(0.96f, 0.88f, 0.60f, 0.85f);
+
+        DrawArc(center, Radius,
+                -Mathf.Pi / 2f, endAngle,
+                Points, col, Thickness, true);
+    }
+}
+
+/// CS:GO-style full-screen AWP scope: black surround, circular lens filling the
+/// screen height, thin reticle through the centre. Runs its own fast blend (not
+/// PlayerController's slower ADS lerp) so the reveal snaps in/out with the zoom
+/// instead of creeping. Finds its own GunCombat the same way SpreadCrosshair does.
+public partial class ScopeOverlay : Control
+{
+    const int   Segments   = 64;    // wedge count for the circular cutout — matches StaminaRing's arc resolution
+    const float BlendRate  = 12f;   // 1/rate ≈ 0.083 s — same snappy timing as the FOV zoom
+
+    GunCombat? _gun;
+    float      _blend = 0f;   // 0 = hip, 1 = fully scoped
+
+    public override void _Process(double delta)
+    {
+        _gun ??= HudLookup.FindGun(this);
+
+        bool scoped = _gun?.IsAiming ?? false;
+        _blend = Mathf.MoveToward(_blend, scoped ? 1f : 0f, BlendRate * (float)delta);
+        QueueRedraw();
+    }
+
+    public override void _Draw()
+    {
+        if (_blend <= 0.001f) return;
+
+        // Use the viewport rect rather than Control.Size — this control's anchors
+        // may not have resolved on the very first scoped frame, and the overlay
+        // must cover the true screen regardless.
+        var size   = GetViewportRect().Size;
+        var center = size / 2f;
+
+        // ── RIVALS-style scope, built to the wiki screenshot ──────────────────
+        // Lens is a circle nearly the full screen height; everything outside is
+        // near-black; the edge is a WIDE soft feather (no hard rim, no bezel);
+        // a duplex crosshair runs edge-to-edge ACROSS the black surround, with
+        // hairline inner segments stepping up to thicker posts at half-radius.
+        float lensR  = size.Y * 0.485f;
+        float outerR = size.Length();   // comfortably past every corner regardless of aspect
+
+        var black = new Color(0.02f, 0.02f, 0.02f, _blend);
+
+        // Opaque surround: fan of quads from the lens radius out past the corners.
+        for (int i = 0; i < Segments; i++)
+        {
+            float a0 = Mathf.Tau * i       / Segments;
+            float a1 = Mathf.Tau * (i + 1) / Segments;
+            var   d0 = new Vector2(Mathf.Cos(a0), Mathf.Sin(a0));
+            var   d1 = new Vector2(Mathf.Cos(a1), Mathf.Sin(a1));
+
+            var quad = new[]
+            {
+                center + d0 * (lensR - 1f),
+                center + d1 * (lensR - 1f),
+                center + d1 * outerR,
+                center + d0 * outerR,
+            };
+            DrawPolygon(quad, new[] { black, black, black, black });
+        }
+
+        // Soft feathered vignette: the reference fades over roughly the outer
+        // fifth of the lens. Concentric arc strips ramp alpha 0 → 1 — a shader-
+        // free radial gradient (smoothstep so the band has no visible banding).
+        const int  FeatherSteps = 34;
+        float bandIn  = lensR * 0.78f;
+        float bandW   = lensR - bandIn;
+        float stepW   = bandW / FeatherSteps;
+        for (int i = 0; i < FeatherSteps; i++)
+        {
+            float t = (i + 0.5f) / FeatherSteps;
+            float a = t * t * (3f - 2f * t);          // smoothstep
+            var col = new Color(0.02f, 0.02f, 0.02f, a * _blend);
+            DrawArc(center, bandIn + stepW * (i + 0.5f), 0f, Mathf.Tau,
+                    Segments, col, stepW + 1.5f, true);
+        }
+
+        // Duplex crosshair: dark hairlines through the centre, stepping to
+        // ~2× posts at half the lens radius, and running ALL the way to the
+        // screen edges — over the black surround, exactly as in the reference.
+        var   hairCol = new Color(0.16f, 0.16f, 0.16f, 0.95f * _blend);
+        var   postCol = new Color(0.13f, 0.13f, 0.13f, 0.95f * _blend);
+        float step    = lensR * 0.5f;
+        const float HairW = 2f, PostW = 4f;
+
+        DrawLine(center, center + new Vector2(-step, 0f), hairCol, HairW);
+        DrawLine(center, center + new Vector2( step, 0f), hairCol, HairW);
+        DrawLine(center, center + new Vector2(0f, -step), hairCol, HairW);
+        DrawLine(center, center + new Vector2(0f,  step), hairCol, HairW);
+
+        // Posts stop AT the lens edge — a real reticle is etched into the optic's
+        // glass, so nothing draws across the black surround.
+        DrawLine(center + new Vector2(-step, 0f), center + new Vector2(-lensR, 0f), postCol, PostW);
+        DrawLine(center + new Vector2( step, 0f), center + new Vector2( lensR, 0f), postCol, PostW);
+        DrawLine(center + new Vector2(0f, -step), center + new Vector2(0f, -lensR), postCol, PostW);
+        DrawLine(center + new Vector2(0f,  step), center + new Vector2(0f,  lensR), postCol, PostW);
+
+        // Scoped red dot — RIVALS ships this on by default (its settings expose a
+        // toggle; wire that to the reticle settings later if wanted).
+        DrawCircle(center, 2.4f, new Color(0.95f, 0.15f, 0.12f, _blend));
+    }
+}

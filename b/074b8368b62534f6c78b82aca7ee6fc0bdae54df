@@ -1,0 +1,154 @@
+using Godot;
+
+/// res://test/TestTitleDrag.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Proves the title wordmark is actually DRAGGABLE through the real UI, which
+/// the TestTitleWordmark harness cannot: that one calls DebugSetView directly
+/// and so only exercises the orbit maths, never the input path.
+///
+/// The thing under test is the MouseFilter plumbing. A bare Control defaults to
+/// MouseFilter.Stop, so the full-expand spacers, the layout containers AND the
+/// TitleScreen root itself each swallow background clicks before
+/// _UnhandledInput sees them — the root was missed once and dragging silently
+/// did nothing. Viewport.PushInput is used because it runs the real
+/// GUI-pick → unhandled-input chain, so a Control that eats the event still
+/// eats it here.
+///
+/// Two cases:
+///   1. drag on empty background  → the wordmark MUST orbit
+///   2. press on a menu Button    → the wordmark must NOT orbit
+/// Case 2 finds the button by text and uses its live global rect, so moving the
+/// menu around (which happens whenever the wordmark is resized) can't quietly
+/// turn this into a background click that "fails" for the wrong reason. It also
+/// presses without releasing: Godot Buttons fire on release, so this cannot
+/// trigger navigation or quit the app.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTitleDrag : Node
+{
+    Control?       _title;
+    TitleWordmark? _wm;
+    int   _frame = 0;
+    float _yaw0, _pitch0;
+    float _yawBeforeButton;
+    bool  _done = false;
+
+    // Empty background: left of the 380 px centred menu column, above the
+    // bottom-left dev button.
+    static readonly Vector2 DragStart = new(180f, 450f);
+
+    public override void _Ready()
+    {
+        var packed = GD.Load<PackedScene>("res://scenes/TitleScreen.tscn");
+        if (packed == null) { GD.Print("[Drag] FAIL: TitleScreen.tscn did not load"); return; }
+        _title = packed.Instantiate<Control>();
+        AddChild(_title);
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_done) return;
+        _frame++;
+
+        if (_wm == null)
+        {
+            _wm = _title?.GetNodeOrNull<TitleWordmark>("Wordmark");
+            if (_wm != null)
+            {
+                _yaw0   = _wm.Yaw;
+                _pitch0 = _wm.Pitch;
+                GD.Print($"[Drag] found wordmark: {_wm.TileCount} tiles, " +
+                         $"yaw={_yaw0:F3} pitch={_pitch0:F3} dist={_wm.Dist:F0}");
+            }
+            return;
+        }
+
+        var vp = GetViewport();
+
+        // ── Case 1: drag across empty background ─────────────────────────────
+        if (_frame == 5)
+        {
+            vp.PushInput(new InputEventMouseButton
+            {
+                ButtonIndex = MouseButton.Left,
+                Pressed     = true,
+                Position    = DragStart,
+            });
+        }
+        else if (_frame >= 6 && _frame <= 10)
+        {
+            vp.PushInput(new InputEventMouseMotion
+            {
+                Position = DragStart + new Vector2((_frame - 5) * 20f, (_frame - 5) * 6f),
+                Relative = new Vector2(20f, 6f),
+            });
+        }
+        else if (_frame == 11)
+        {
+            vp.PushInput(new InputEventMouseButton
+            {
+                ButtonIndex = MouseButton.Left,
+                Pressed     = false,
+                Position    = DragStart + new Vector2(100f, 30f),
+            });
+
+            float dYaw   = Mathf.Abs(_wm.Yaw   - _yaw0);
+            float dPitch = Mathf.Abs(_wm.Pitch - _pitch0);
+            GD.Print($"[Drag] after drag: yaw {_yaw0:F3} -> {_wm.Yaw:F3} (d={dYaw:F3}), " +
+                     $"pitch {_pitch0:F3} -> {_wm.Pitch:F3} (d={dPitch:F3})");
+            GD.Print(dYaw > 0.001f && dPitch > 0.001f
+                ? "[Drag] PASS case 1: background drag orbits the wordmark"
+                : "[Drag] FAIL case 1: drag never reached the wordmark (a Control ate it)");
+        }
+
+        // ── Case 2: press on a real menu Button — the UI must consume it ─────
+        else if (_frame == 20)
+        {
+            _yawBeforeButton = _wm.Yaw;
+            var btn = FindButton(_title!, "Settings");
+            if (btn == null)
+            {
+                GD.Print("[Drag] FAIL case 2: could not find the Settings button");
+                _done = true;
+                return;
+            }
+            var centre = btn.GetGlobalRect().GetCenter();
+            GD.Print($"[Drag] pressing Settings at {centre}");
+            vp.PushInput(new InputEventMouseButton
+            {
+                ButtonIndex = MouseButton.Left,
+                Pressed     = true,
+                Position    = centre,
+            });
+        }
+        else if (_frame == 21)
+        {
+            var btn = FindButton(_title!, "Settings");
+            var centre = btn != null ? btn.GetGlobalRect().GetCenter() : Vector2.Zero;
+            vp.PushInput(new InputEventMouseMotion
+            {
+                Position = centre + new Vector2(60f, 0f),
+                Relative = new Vector2(60f, 0f),
+            });
+        }
+        else if (_frame == 22)
+        {
+            float d = Mathf.Abs(_wm.Yaw - _yawBeforeButton);
+            GD.Print($"[Drag] after button press+move: yaw d={d:F4}");
+            GD.Print(d < 0.0001f
+                ? "[Drag] PASS case 2: a press on a menu button does not orbit"
+                : "[Drag] FAIL case 2: dragging off a button orbits the wordmark");
+            _done = true;
+        }
+    }
+
+    static Button? FindButton(Node root, string text)
+    {
+        if (root is Button b && b.Text == text) return b;
+        foreach (var child in root.GetChildren())
+        {
+            var found = FindButton(child, text);
+            if (found != null) return found;
+        }
+        return null;
+    }
+}

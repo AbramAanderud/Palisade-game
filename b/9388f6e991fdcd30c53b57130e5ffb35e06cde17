@@ -1,0 +1,66 @@
+using Godot;
+
+/// End-to-end check that the maze playtest scene actually fills the SECONDARY
+/// slot. TestLoadoutSlots proves the slot model in isolation; this proves
+/// DungeonArena calls into it, which is the part that was missing.
+///
+/// Loads the real DungeonArena scene, finds the spawned PlayerController by
+/// walking the tree (the scene keeps its reference private), and asserts the
+/// player is carrying a registered secondary rather than an unregistered default.
+public partial class TestPlaytestLoadout : Node
+{
+    public override void _Ready()
+    {
+        var watcher = new PlaytestLoadoutWatcher();
+        GetTree().Root.CallDeferred(Node.MethodName.AddChild, watcher);
+        GetTree().CallDeferred(SceneTree.MethodName.ChangeSceneToFile,
+                               "res://scenes/DungeonArena.tscn");
+    }
+}
+
+public partial class PlaytestLoadoutWatcher : Node
+{
+    int  _frame;
+    bool _done;
+
+    public override void _Process(double delta)
+    {
+        if (_done) return;
+        _frame++;
+        if (_frame < 180) return;   // dungeon + arena build takes a while
+        _done = true;
+
+        var scene = GetTree().CurrentScene;
+        GD.Print($"[TestPlaytestLoadout] scene = {scene?.SceneFilePath ?? "<null>"}");
+
+        var p = scene == null ? null : Find(scene);
+        if (p == null)
+        {
+            GD.Print("[TestPlaytestLoadout] PASS=False (no PlayerController in the scene)");
+            GetTree().Quit();
+            return;
+        }
+
+        string held = p.Gun?.Def.Id ?? "-";
+        GD.Print($"[TestPlaytestLoadout] held={held} primary={p.PrimaryGunId ?? "-"} secondary={p.SecondaryGunId ?? "-"}");
+
+        bool hasSecondary = p.SecondaryGunId != null;
+        bool holdsIt      = p.SecondaryGunId == held;
+        GD.Print($"[TestPlaytestLoadout]   {(hasSecondary ? "ok  " : "FAIL")} playtest registers a SECONDARY");
+        GD.Print($"[TestPlaytestLoadout]   {(holdsIt ? "ok  " : "FAIL")} and the player is holding it");
+        GD.Print($"[TestPlaytestLoadout] PASS={hasSecondary && holdsIt}");
+
+        GetTree().Quit();
+    }
+
+    static PlayerController? Find(Node root)
+    {
+        if (root is PlayerController pc) return pc;
+        foreach (var c in root.GetChildren())
+        {
+            var hit = Find(c);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
+}

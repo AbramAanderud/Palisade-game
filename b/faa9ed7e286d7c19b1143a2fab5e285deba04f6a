@@ -1,0 +1,56 @@
+using Godot;
+using System.Linq;
+
+/// test/TierCheck.cs
+/// Asserts the doorway exception stays a GROUND-FLOOR exception.
+///
+/// The arch reaches SpringY + ArchRise = 18m, entirely inside tier 0's shelf
+/// band. When the arena was stacked vertically the doorway skip was applied at
+/// every tier, carving a bare unlit stripe the full height of the wall above
+/// each entryway — reported in playtest as "a giant dark strip above each
+/// entryway". Tier 0 must skip its 2 doorway bays; every tier above it must
+/// close the full 32-bay ring.
+public partial class TierCheck : Node3D
+{
+    public override void _Ready()
+    {
+        var a = new ArenaBuilder { Name = "Arena" };
+        AddChild(a);
+        a.Build(Vector3.Zero, openNorth: true, openSouth: true);
+        CallDeferred(nameof(Run));
+    }
+
+    void Run()
+    {
+        var arena = GetNode("Arena");
+        int fail = 0;
+        void P(string l) => GD.Print("[Tier] " + l);
+        P("──────────────────────────────────────────────");
+
+        // Verts per bay is identical across tiers (same generator), so vert
+        // count is a direct proxy for bay count.
+        var wood = arena.GetChildren().OfType<MeshInstance3D>()
+                        .Where(m => m.Name.ToString().StartsWith("ShelfWood"))
+                        .OrderBy(m => m.Name.ToString()).ToList();
+        if (wood.Count != ArenaBuilder.Tiers) { P($"FAIL expected {ArenaBuilder.Tiers} shelf tiers, got {wood.Count}"); fail++; }
+
+        int t0 = wood[0].Mesh.SurfaceGetArrays(0)[0].AsVector3Array().Length;
+        int perBay = t0 / 30;   // tier 0 = 32 bays minus 2 doorways
+        P($"tier 0 shelf verts {t0}  ({perBay}/bay -> {t0 / perBay} bays, expect 30)");
+        if (t0 / perBay != 30) { P("FAIL tier 0 should skip exactly its 2 doorway bays"); fail++; }
+
+        for (int i = 1; i < wood.Count; i++)
+        {
+            int v = wood[i].Mesh.SurfaceGetArrays(0)[0].AsVector3Array().Length;
+            int bays = v / perBay;
+            P($"tier {i} shelf verts {v}  ({bays} bays, expect 32)");
+            if (bays != 32) { P($"FAIL tier {i} has a doorway gap but there is no arch above tier 0"); fail++; }
+        }
+
+        P(fail == 0
+            ? "PASS — doorway gap only where the arch actually is"
+            : $"FAIL — {fail} problem(s)");
+        P("──────────────────────────────────────────────");
+        GetTree().Quit(fail == 0 ? 0 : 1);
+    }
+}

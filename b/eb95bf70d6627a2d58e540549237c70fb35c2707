@@ -1,0 +1,35 @@
+using Godot;
+
+/// res://scripts/HallwayBuilder.cs — the FFA bonus hallway between a maze's Exit
+/// and its arena door. It's a row of ordinary Straight pieces built by DungeonBuilder,
+/// so it matches the corridor look, collision, sconces and torches exactly. The
+/// only special case is DeadEndOpen along the axis, so neither end is capped.
+public static class HallwayBuilder
+{
+    public static DungeonBuilder? Build(Node parent, SeatPlacement seat, int cells, Vector3 origin, string name)
+    {
+        if (cells <= 0) return null;
+        float cs = DungeonBuilder.CellSize;
+        bool alongZ = seat.Door == Door.N || seat.Door == Door.S;
+        var data = new MazeData { Name = name, IsOnline = false };
+        for (int i = 0; i < cells; i++)
+            data.Pieces.Add(new MazePiece
+            {
+                Type = PieceType.Straight, Floor = 0,
+                X = alongZ ? 0 : i, Y = alongZ ? i : 0,
+                Rotation = alongZ ? 0 : 1,   // rot 0 = N|S, rot 1 = E|W
+            });
+        var a = seat.HallStart; var b = seat.HallEnd;
+        var local = alongZ
+            ? new Vector3(-cs * 0.5f, 0f, Mathf.Min(a.Z, b.Z))
+            : new Vector3(Mathf.Min(a.X, b.X), 0f, -cs * 0.5f);
+        var builder = new DungeonBuilder
+        {
+            Name = name,
+            DeadEndOpen = alongZ ? (Dir.N | Dir.S) : (Dir.E | Dir.W),
+        };
+        parent.AddChild(builder);
+        builder.Build(data, origin + local, Dir.None);
+        return builder;
+    }
+}

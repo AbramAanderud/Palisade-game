@@ -1,0 +1,584 @@
+using Godot;
+using System;
+
+/// Title screen — Wicked Knight font, black background, flat white buttons.
+public partial class TitleScreen : Control
+{
+    SettingsPanel?      _settingsPanel;
+    AudioStreamPlayer? _clickSfx;
+    AudioStreamPlayer? _playGameSfx;
+    bool _changingScene = false;
+
+    Label? _fameLabel;
+    Label? _nameLabel;
+    Label? _onlineLabel;
+
+    /// How often the menu re-asks the relay for its population. Slow on purpose:
+    /// this is ambient information, and the socket stays open between polls.
+    const double StatsPollSeconds = 5.0;
+    double _statsPoll = StatsPollSeconds;
+    CanvasLayer? _namePickerLayer;
+
+    const float CornerPad = 36f;
+    const float BtnH      = 52f;
+    const int   MaxNameLen = 24;
+
+    public override void _Ready()
+    {
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+
+        // Load the active account's profile so RANK reflects the latest gold.
+        PlayerProfile.Load();
+
+        _clickSfx = new AudioStreamPlayer();
+        var clickStream = GD.Load<AudioStream>("res://assets/audio/ui/MenuButtonClick.wav");
+        if (clickStream != null) _clickSfx.Stream = clickStream;
+        AddChild(_clickSfx);
+
+        _playGameSfx = new AudioStreamPlayer();
+        var playStream = GD.Load<AudioStream>("res://assets/audio/ui/PlayGameButtonNoise.wav");
+        if (playStream != null) _playGameSfx.Stream = playStream;
+        AddChild(_playGameSfx);
+
+        SetAnchorsPreset(LayoutPreset.FullRect);
+        GrowHorizontal = GrowDirection.Both;
+        GrowVertical   = GrowDirection.Both;
+        // THIS node is the one that silently breaks wordmark dragging if missed:
+        // TitleScreen is itself a full-rect Control, and Control defaults to
+        // MouseFilter.Stop, so the root consumed every background click before it
+        // could reach the wordmark's _UnhandledInput. MouseFilter is per-node, so
+        // Ignore here costs the menu Buttons nothing — they still capture clicks.
+        // Regression-tested by test/TestTitleDrag.cs.
+        MouseFilter = MouseFilterEnum.Ignore;
+
+        var font = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
+
+        // ── Background ────────────────────────────────────────────────────────
+        // No ColorRect here on purpose. The title is now a 3D wordmark built out
+        // of maze tiles (TitleWordmark), and the root viewport draws its World3D
+        // BEHIND this 2D canvas — a full-rect rect would hide it completely. The
+        // wordmark's own Environment paints the black background instead.
+        AddChild(new TitleWordmark { Name = "Wordmark" });
+
+        // ── Centre column: buttons ────────────────────────────────────────────
+        var outer = new VBoxContainer();
+        outer.SetAnchorsPreset(LayoutPreset.FullRect);
+        outer.AddThemeConstantOverride("separation", 0);
+        // Ignore, not Stop: the gaps around the menu have to pass clicks through
+        // to the wordmark's drag handler. The Buttons themselves still capture.
+        outer.MouseFilter = MouseFilterEnum.Ignore;
+        AddChild(outer);
+
+        // Five spacers above / two below drops the menu clear of the orbiting
+        // wordmark, which owns the upper part of the screen. The bigger the
+        // wordmark gets, the further down this has to sit — a yawed word sweeps
+        // vertically and will reach into the menu otherwise.
+        for (int i = 0; i < 5; i++) outer.AddChild(VSpacer());
+
+        var hrow = new HBoxContainer();
+        hrow.AddThemeConstantOverride("separation", 0);
+        hrow.MouseFilter = MouseFilterEnum.Ignore;
+        outer.AddChild(hrow);
+        hrow.AddChild(HSpacer());
+
+        var vbox = new VBoxContainer();
+        vbox.CustomMinimumSize = new Vector2(380, 0);
+        vbox.AddThemeConstantOverride("separation", 0);
+        vbox.MouseFilter = MouseFilterEnum.Ignore;
+        hrow.AddChild(vbox);
+        hrow.AddChild(HSpacer());
+
+        for (int i = 0; i < 2; i++) outer.AddChild(VSpacer());
+
+        // Fame + name readout (player identity above the menu)
+        _fameLabel = new Label
+        {
+            Text                = $"FAME: {OnlineGameState.Gold}",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (font != null) _fameLabel.AddThemeFontOverride("font", font);
+        _fameLabel.AddThemeFontSizeOverride("font_size", 22);
+        _fameLabel.AddThemeColorOverride("font_color", new Color(1f, 0.85f, 0.3f));
+        vbox.AddChild(_fameLabel);
+
+        _nameLabel = new Label
+        {
+            Text                = $"as {OnlineGameState.PlayerName}",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (font != null) _nameLabel.AddThemeFontOverride("font", font);
+        _nameLabel.AddThemeFontSizeOverride("font_size", 14);
+        _nameLabel.AddThemeColorOverride("font_color", new Color(0.6f, 0.6f, 0.6f));
+        vbox.AddChild(_nameLabel);
+
+        vbox.AddChild(new Control
+        {
+            CustomMinimumSize = new Vector2(0, 36),
+            MouseFilter       = MouseFilterEnum.Ignore,
+        });
+
+        var mazeBtn = MakeBtn("Maze", font, 26, OnMaze);
+        if (!HasAnyOnlineMaze())
+        {
+            mazeBtn.Text = "! Maze";
+            mazeBtn.AddThemeColorOverride("font_color",         new Color(1f, 0.85f, 0f));
+            mazeBtn.AddThemeColorOverride("font_hover_color",   new Color(1f, 1f,    0.4f));
+            mazeBtn.AddThemeColorOverride("font_pressed_color", new Color(0.8f, 0.7f, 0f));
+            mazeBtn.AddThemeColorOverride("font_focus_color",   new Color(1f, 0.85f, 0f));
+        }
+        vbox.AddChild(MakeBtn("Play Game", font, 30, OnPlayGame));
+
+        // Live relay population, directly under Play Game. Starts HIDDEN and only
+        // appears once the relay actually answers — an un-redeployed relay never
+        // replies to "stats", and showing "0 ONLINE" in that case would be a lie
+        // rather than a blank.
+        _onlineLabel = new Label
+        {
+            Text                = "",
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Visible             = false,
+            MouseFilter         = MouseFilterEnum.Ignore,
+        };
+        if (font != null) _onlineLabel.AddThemeFontOverride("font", font);
+        _onlineLabel.AddThemeFontSizeOverride("font_size", 15);
+        _onlineLabel.AddThemeColorOverride("font_color", new Color(0.55f, 0.72f, 0.60f));
+        vbox.AddChild(_onlineLabel);
+
+        var net = GetNodeOrNull<NetworkManager>("/root/NetworkManager");
+        if (net != null)
+        {
+            net.StatsUpdated += OnStatsUpdated;
+            net.RequestStats();
+        }
+
+        vbox.AddChild(mazeBtn);
+        vbox.AddChild(MakeBtn("Training",  font, 26, OnTraining));
+        vbox.AddChild(MakeBtn("Settings",  font, 26, OnSettings));
+
+        // ── Bottom-centre: Exit ───────────────────────────────────────────────
+        var exitBtn = MakeBtn("Exit", font, 20, () => { _clickSfx?.Play(); GetTree().Quit(); });
+        exitBtn.CustomMinimumSize = new Vector2(120, 42);
+        exitBtn.AnchorLeft     = 0.5f; exitBtn.AnchorRight  = 0.5f;
+        exitBtn.AnchorTop      = 1f;   exitBtn.AnchorBottom = 1f;
+        exitBtn.GrowHorizontal = GrowDirection.Both;
+        exitBtn.GrowVertical   = GrowDirection.Begin;
+        exitBtn.OffsetLeft     = -60f;
+        exitBtn.OffsetRight    =  60f;
+        exitBtn.OffsetTop      = -(CornerPad + 42f);
+        exitBtn.OffsetBottom   = -CornerPad;
+        exitBtn.AddThemeColorOverride("font_color",       new Color(0.45f, 0.45f, 0.45f));
+        exitBtn.AddThemeColorOverride("font_hover_color", new Color(0.75f, 0.75f, 0.75f));
+        AddChild(exitBtn);
+
+        // ── Settings panel overlay ────────────────────────────────────────────
+        _settingsPanel = new SettingsPanel { Name = "SettingsPanel" };
+        _settingsPanel.Closed += () => _settingsPanel.Hide();
+        AddChild(_settingsPanel);
+
+        // ── Dev scene picker (bottom-left corner) ─────────────────────────────
+        BuildDevSceneButton(font);
+
+        // First-boot: if the account name is still the auto-seeded "default",
+        // force a name picker modal before they can interact with the menu.
+        if (OnlineGameState.PlayerName == AccountManager.DefaultName)
+            ShowNamePicker();
+    }
+
+    // ── Relay population ──────────────────────────────────────────────────────
+
+    public override void _Process(double delta)
+    {
+        if (_onlineLabel == null) return;
+        _statsPoll -= delta;
+        if (_statsPoll > 0.0) return;
+        _statsPoll = StatsPollSeconds;
+        // Re-uses the socket opened in _Ready; RequestStats only reconnects if it
+        // has actually dropped, so this is a text frame every 5 s, not a reconnect.
+        GetNodeOrNull<NetworkManager>("/root/NetworkManager")?.RequestStats();
+    }
+
+    public override void _ExitTree()
+    {
+        // NetworkManager is an autoload that outlives this scene. Without this
+        // unsubscribe, the NEXT StatsUpdated emission tries to invoke a handler
+        // on the disposed old TitleScreen — which is how the population readout
+        // died after one match. PlayGameScreen already does the same cleanup.
+        var net = GetNodeOrNull<NetworkManager>("/root/NetworkManager");
+        if (net != null) net.StatsUpdated -= OnStatsUpdated;
+    }
+
+    void OnStatsUpdated(int online, int inLobby)
+    {
+        if (_onlineLabel == null) return;
+        // "online" is every socket on the relay, this menu included — so it reads
+        // as "people with the game open", not "people currently in a match".
+        _onlineLabel.Text    = $"{online} ONLINE  ·  {inLobby} IN LOBBY";
+        _onlineLabel.Visible = true;
+    }
+
+    // ── Dev: scene picker ─────────────────────────────────────────────────────
+    // Small bottom-left button that opens a list of every scene in the project so
+    // we can jump to one and iterate on its visuals. PreGameLobby + arena get a
+    // demo-mode bypass so they work standalone.
+
+    static readonly (string label, string path, string demoSetup)[] DevScenes = new[]
+    {
+        ("Title screen",          "res://scenes/TitleScreen.tscn",         ""),
+        ("Play Game (lobby)",     "res://scenes/PlayGameScreen.tscn",      ""),
+        ("Pre-Game Lobby",        "res://scenes/PreGameLobby.tscn",        "pregamelobby"),
+        ("Maze Editor",           "res://scenes/MazeEditor3D.tscn",        ""),
+        ("Training Setup",        "res://scenes/TrainingSetupScreen.tscn", ""),
+        ("Training Arena",        "res://scenes/TrainingArena.tscn",       ""),
+        ("Glyph: C (thick)",      "res://scenes/DevGlyphC.tscn",           ""),
+        ("Hallway Demo",          "res://scenes/HallwayDemo.tscn",         ""),
+    };
+
+    void BuildDevSceneButton(FontFile? font)
+    {
+        var devBtn = new Button
+        {
+            Text              = "Dev: Scenes",
+            CustomMinimumSize = new Vector2(120, 32),
+            Flat              = true,
+            AnchorLeft        = 0f, AnchorRight  = 0f,
+            AnchorTop         = 1f, AnchorBottom = 1f,
+            GrowHorizontal    = GrowDirection.End,
+            GrowVertical      = GrowDirection.Begin,
+        };
+        devBtn.OffsetLeft   = 12f;
+        devBtn.OffsetRight  = 132f;
+        devBtn.OffsetTop    = -44f;
+        devBtn.OffsetBottom = -12f;
+        if (font != null) devBtn.AddThemeFontOverride("font", font);
+        devBtn.AddThemeFontSizeOverride("font_size", 14);
+        devBtn.AddThemeColorOverride("font_color",       new Color(0.45f, 0.45f, 0.45f));
+        devBtn.AddThemeColorOverride("font_hover_color", new Color(0.75f, 0.75f, 0.75f));
+        var empty = new StyleBoxEmpty();
+        devBtn.AddThemeStyleboxOverride("normal", empty);
+        devBtn.AddThemeStyleboxOverride("hover",  empty);
+        devBtn.AddThemeStyleboxOverride("focus",  empty);
+        devBtn.Pressed += ShowDevScenePicker;
+        AddChild(devBtn);
+    }
+
+    void ShowDevScenePicker()
+    {
+        var layer = new CanvasLayer { Name = "DevScenePicker", Layer = 110 };
+        AddChild(layer);
+
+        var bg = new ColorRect
+        {
+            Color       = new Color(0f, 0f, 0f, 0.86f),
+            MouseFilter = Control.MouseFilterEnum.Stop,
+        };
+        bg.SetAnchorsPreset(LayoutPreset.FullRect);
+        layer.AddChild(bg);
+
+        var box = new VBoxContainer
+        {
+            AnchorLeft     = 0.5f, AnchorRight  = 0.5f,
+            AnchorTop      = 0.5f, AnchorBottom = 0.5f,
+            GrowHorizontal = GrowDirection.Both,
+            GrowVertical   = GrowDirection.Both,
+        };
+        box.OffsetLeft = -240; box.OffsetRight  = 240;
+        box.OffsetTop  = -260; box.OffsetBottom = 260;
+        box.AddThemeConstantOverride("separation", 8);
+        layer.AddChild(box);
+
+        var titleFont = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
+
+        var header = new Label
+        {
+            Text                = "Scene Viewer",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (titleFont != null) header.AddThemeFontOverride("font", titleFont);
+        header.AddThemeFontSizeOverride("font_size", 32);
+        header.AddThemeColorOverride("font_color", Colors.White);
+        box.AddChild(header);
+
+        var sub = new Label
+        {
+            Text                = "Click a scene to jump straight to it",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (titleFont != null) sub.AddThemeFontOverride("font", titleFont);
+        sub.AddThemeFontSizeOverride("font_size", 14);
+        sub.AddThemeColorOverride("font_color", new Color(0.6f, 0.6f, 0.6f));
+        box.AddChild(sub);
+
+        box.AddChild(new Control { CustomMinimumSize = new Vector2(0, 12) });
+
+        foreach (var (label, path, demoSetup) in DevScenes)
+        {
+            var btn = new Button
+            {
+                Text              = label,
+                CustomMinimumSize = new Vector2(0, 44),
+                FocusMode         = Control.FocusModeEnum.All,
+                MouseFilter       = Control.MouseFilterEnum.Stop,
+            };
+            if (titleFont != null) btn.AddThemeFontOverride("font", titleFont);
+            btn.AddThemeFontSizeOverride("font_size", 18);
+            string capturedPath  = path;
+            string capturedDemo  = demoSetup;
+            btn.Pressed += () =>
+            {
+                if (_changingScene) return;
+                _changingScene = true;
+                ApplyDevDemoSetup(capturedDemo);
+                _clickSfx?.Play();
+                GetTree().ChangeSceneToFile(capturedPath);
+            };
+            box.AddChild(btn);
+        }
+
+        box.AddChild(new Control { CustomMinimumSize = new Vector2(0, 12) });
+
+        var closeBtn = new Button
+        {
+            Text              = "Close",
+            CustomMinimumSize = new Vector2(0, 40),
+            FocusMode         = Control.FocusModeEnum.All,
+        };
+        if (titleFont != null) closeBtn.AddThemeFontOverride("font", titleFont);
+        closeBtn.AddThemeFontSizeOverride("font_size", 16);
+        closeBtn.AddThemeColorOverride("font_color", new Color(0.6f, 0.6f, 0.6f));
+        closeBtn.Pressed += () => { _clickSfx?.Play(); layer.QueueFree(); };
+        box.AddChild(closeBtn);
+    }
+
+    static void ApplyDevDemoSetup(string kind)
+    {
+        switch (kind)
+        {
+            case "pregamelobby":
+                PreGameLobby.DemoMode = true;
+                // Ensure OnlineGameState has plausible defaults so labels populate.
+                if (string.IsNullOrEmpty(OnlineGameState.PlayerName))
+                    OnlineGameState.PlayerName = "You";
+                break;
+        }
+    }
+
+    // ── First-boot name picker ────────────────────────────────────────────────
+
+    void ShowNamePicker()
+    {
+        if (_namePickerLayer != null) return;
+
+        _namePickerLayer = new CanvasLayer { Name = "NamePicker", Layer = 100 };
+        AddChild(_namePickerLayer);
+
+        // Full-screen black backdrop captures all clicks so menu buttons can't fire.
+        var bg = new ColorRect
+        {
+            Color       = Colors.Black,
+            MouseFilter = Control.MouseFilterEnum.Stop,
+        };
+        bg.SetAnchorsPreset(LayoutPreset.FullRect);
+        _namePickerLayer.AddChild(bg);
+
+        var box = new VBoxContainer
+        {
+            AnchorLeft     = 0.5f, AnchorRight  = 0.5f,
+            AnchorTop      = 0.5f, AnchorBottom = 0.5f,
+            GrowHorizontal = GrowDirection.Both,
+            GrowVertical   = GrowDirection.Both,
+        };
+        box.OffsetLeft = -260; box.OffsetRight = 260;
+        box.OffsetTop  = -140; box.OffsetBottom = 140;
+        box.AddThemeConstantOverride("separation", 18);
+        _namePickerLayer.AddChild(box);
+
+        var titleFont = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
+
+        var prompt = new Label
+        {
+            Text                = "Choose your name",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (titleFont != null) prompt.AddThemeFontOverride("font", titleFont);
+        prompt.AddThemeFontSizeOverride("font_size", 40);
+        prompt.AddThemeColorOverride("font_color", Colors.White);
+        box.AddChild(prompt);
+
+        var sub = new Label
+        {
+            Text                = "Shown to opponents in the lobby.",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (titleFont != null) sub.AddThemeFontOverride("font", titleFont);
+        sub.AddThemeFontSizeOverride("font_size", 14);
+        sub.AddThemeColorOverride("font_color", new Color(0.6f, 0.6f, 0.6f));
+        box.AddChild(sub);
+
+        var edit = new LineEdit
+        {
+            MaxLength           = MaxNameLen,
+            CustomMinimumSize   = new Vector2(380, 50),
+            SizeFlagsHorizontal = SizeFlags.ShrinkCenter,
+            PlaceholderText     = "Player_123",
+        };
+        if (titleFont != null) edit.AddThemeFontOverride("font", titleFont);
+        edit.AddThemeFontSizeOverride("font_size", 20);
+        box.AddChild(edit);
+
+        var okBtn = new Button
+        {
+            Text              = "Continue",
+            CustomMinimumSize = new Vector2(220, 52),
+            SizeFlagsHorizontal = SizeFlags.ShrinkCenter,
+            FocusMode         = Control.FocusModeEnum.All,
+            MouseFilter       = Control.MouseFilterEnum.Stop,
+        };
+        if (titleFont != null) okBtn.AddThemeFontOverride("font", titleFont);
+        okBtn.AddThemeFontSizeOverride("font_size", 22);
+
+        Action submit = () =>
+        {
+            string raw   = edit.Text ?? "";
+            string clean = SanitizeName(raw);
+            ApplyChosenName(clean);
+            _clickSfx?.Play();
+            _namePickerLayer?.QueueFree();
+            _namePickerLayer = null;
+        };
+        okBtn.Pressed       += submit;
+        edit.TextSubmitted  += _ => submit();
+        box.AddChild(okBtn);
+
+        edit.GrabFocus();
+    }
+
+    void ApplyChosenName(string name)
+    {
+        // Switch the active account to the chosen name. On first boot the only
+        // existing account is the auto-seeded "default" — no mazes yet, so a
+        // fresh starter account here is the cleanest move.
+        AccountManager.SwitchOrCreate(name);
+        // Pull that account's reticle / sensitivity / keybinds in before any
+        // gameplay scene reads them.
+        GameSettings.Instance?.ReloadForAccount();
+        OnlineGameState.PlayerName = name;
+        OnlineGameState.Gold       = AccountManager.StarterRank;
+        PlayerProfile.Save();
+        if (_fameLabel != null) _fameLabel.Text = $"FAME: {OnlineGameState.Gold}";
+        if (_nameLabel != null) _nameLabel.Text = $"as {OnlineGameState.PlayerName}";
+        GD.Print($"[AM] Title: first-boot name set to '{name}', account created.");
+    }
+
+    static string SanitizeName(string raw)
+    {
+        string s = (raw ?? "").Trim();
+        var sb = new System.Text.StringBuilder();
+        foreach (char c in s)
+        {
+            if (c < 32 || c == 127) continue;            // strip controls
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                c == '"' || c == '<' || c == '>' || c == '|') continue;   // strip path-unsafe chars
+            sb.Append(c);
+            if (sb.Length >= MaxNameLen) break;
+        }
+        s = sb.ToString().Trim();
+        if (string.IsNullOrEmpty(s) || s == AccountManager.DefaultName)
+            s = "Player_" + (int)GD.RandRange(100, 999);
+        return s;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    // MouseFilter.Ignore matters: these spacers expand to fill the whole screen,
+    // and a Control defaults to Stop — which would eat every drag before the
+    // wordmark's _UnhandledInput ever saw it. Buttons still capture their clicks.
+    static Control VSpacer() =>
+        new Control
+        {
+            SizeFlagsVertical = SizeFlags.ExpandFill,
+            MouseFilter       = MouseFilterEnum.Ignore,
+        };
+
+    static Control HSpacer() =>
+        new Control
+        {
+            SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            MouseFilter         = MouseFilterEnum.Ignore,
+        };
+
+    static Button MakeBtn(string label, FontFile? font, int fontSize, Action pressed)
+    {
+        var btn = new Button
+        {
+            Text      = label,
+            Flat      = true,
+            Alignment = HorizontalAlignment.Center,
+            CustomMinimumSize = new Vector2(0, BtnH),
+        };
+
+        if (font != null) btn.AddThemeFontOverride("font", font);
+        btn.AddThemeFontSizeOverride("font_size", fontSize);
+        btn.AddThemeColorOverride("font_color",         Colors.White);
+        btn.AddThemeColorOverride("font_hover_color",   new Color(0.6f, 0.6f, 0.6f));
+        btn.AddThemeColorOverride("font_pressed_color", new Color(0.4f, 0.4f, 0.4f));
+        btn.AddThemeColorOverride("font_focus_color",   Colors.White);
+
+        var empty = new StyleBoxEmpty();
+        btn.AddThemeStyleboxOverride("normal",   empty);
+        btn.AddThemeStyleboxOverride("hover",    empty);
+        btn.AddThemeStyleboxOverride("pressed",  empty);
+        btn.AddThemeStyleboxOverride("focus",    empty);
+        btn.AddThemeStyleboxOverride("disabled", empty);
+
+        btn.Pressed += pressed;
+        return btn;
+    }
+
+    // ── Navigation ────────────────────────────────────────────────────────────
+
+    void OnSettings()
+    {
+        _clickSfx?.Play();
+        if (_settingsPanel == null) return;
+        _settingsPanel.Visible = !_settingsPanel.Visible;
+    }
+
+    void OnPlayGame()
+    {
+        if (_changingScene) return;
+        _changingScene = true;
+        _clickSfx?.Play();
+        OnlineGameState.Reset();
+        GetTree().CreateTimer(0.25).Timeout += () =>
+            GetTree().ChangeSceneToFile("res://scenes/PlayGameScreen.tscn");
+    }
+
+    void OnMaze()
+    {
+        if (_changingScene) return;
+        _changingScene = true;
+        _clickSfx?.Play();
+        _playGameSfx?.Play();
+        GetTree().CreateTimer(0.5).Timeout += () =>
+            GetTree().ChangeSceneToFile("res://scenes/MazeEditor3D.tscn");
+    }
+
+    void OnTraining()
+    {
+        if (_changingScene) return;
+        _changingScene = true;
+        _clickSfx?.Play();
+        GetTree().ChangeSceneToFile("res://scenes/TrainingSetupScreen.tscn");
+    }
+
+    static bool HasAnyOnlineMaze()
+    {
+        for (int i = 0; i < MazeSerializer.SlotCount; i++)
+        {
+            if (!MazeSerializer.Exists(i)) continue;
+            var d = MazeSerializer.Load(i);
+            if (d?.IsOnline == true) return true;
+        }
+        return false;
+    }
+}

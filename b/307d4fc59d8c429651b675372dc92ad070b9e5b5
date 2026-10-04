@@ -1,0 +1,167 @@
+using System.Collections.Generic;
+using System.Linq;
+
+/// res://scripts/MazeValidator.cs — Game-readiness validation for a MazeData.
+/// A maze is "game-ready" when it has a Start, an Exit, and BFS from Start reaches Exit
+/// (and every other placed piece) through valid same-floor or cross-floor stair connections.
+public static class MazeValidator
+{
+    static readonly Dir[]       AllDirs  = { Dir.N, Dir.E, Dir.S, Dir.W };
+    // Index-parallel with AllDirs. Routed through PieceDB.Delta (the shared
+    // direction->offset table — see I6, 2026-08-31 final-review report) rather
+    // than a hand-written switch, so this array can never drift from the same
+    // convention every other subsystem uses: verified equal to the previous
+    // literal values { (0,-1), (1,0), (0,1), (-1,0) } before making this change.
+    static readonly (int, int)[] DirDelta =
+        { PieceDB.Delta(Dir.N), PieceDB.Delta(Dir.E), PieceDB.Delta(Dir.S), PieceDB.Delta(Dir.W) };
+    static readonly Dir[]       Opposite = { Dir.S, Dir.W, Dir.N, Dir.E };
+
+    /// Validates `maze` and reports the reason it is not game-ready (if any).
+    /// Returns true only when Start exists, Exit exists, and the BFS from Start visits
+    /// every piece in the maze (including Exit).
+    public static bool IsGameReady(MazeData? maze, out string error)
+    {
+        error = "";
+        if (maze == null || maze.Pieces == null || maze.Pieces.Count == 0)
+        {
+            error = "Maze is empty";
+            return false;
+        }
+
+        var start = maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Start);
+        if (start == null) { error = "No Start piece"; return false; }
+
+        var exit = maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+        if (exit == null) { error = "No Exit piece"; return false; }
+
+        // Every Teleport Pad must have exactly one partner. LinkId <= 0 means
+        // unpaired/inert (legacy saves, or a pad whose second half was never
+        // placed); a group of 3+ on one channel is the ambiguous multi-pad case
+        // the editor's placement cap prevents but an edited/legacy save file
+        // might still contain. Either way the maze is not game-ready — this is
+        // the data-level backstop for the editor's teleport pair-lock (I3),
+        // which stops a fresh save/upload from ever producing this shape, but
+        // cannot retroactively fix a maze file edited or saved before it existed.
+        foreach (var grp in maze.Pieces.Where(p => p.Type == PieceType.TrapPortal)
+                                        .GroupBy(p => p.LinkId))
+        {
+            if (grp.Key > 0 && grp.Count() == 2) continue;
+            var bad = grp.First();
+            error = $"Teleport pad at ({bad.X},{bad.Y},F{bad.Floor}) has no partner";
+            return false;
+        }
+
+        // Multi-cell pieces (currently just Pit) register EVERY cell of their volume,
+        // so a corridor touching any face of a pit finds it. Visited-set keys are
+        // canonicalised to the anchor cell so a pit is one BFS node, not 27.
+        // MazeLookup.Build is the one shared implementation of this contract —
+        // DungeonBuilder's geometry pass uses the same helper (see C1 fix notes).
+        var lookup = MazeLookup.Build(maze.Pieces, DungeonBuilder.FloorMin, DungeonBuilder.FloorMax);
+
+        // Canonical visited key for a piece: multi-cell pieces collapse to their anchor.
+        static (int, int, int) KeyOf(MazePiece p) => (p.X, p.Y, p.Floor);
+
+        var visited = new HashSet<(int, int, int)>();
+        var queue   = new Queue<MazePiece>();
+        queue.Enqueue(start);
+        visited.Add(KeyOf(start));
+
+        while (queue.Count > 0)
+        {
+            var piece = queue.Dequeue();
+            Dir open  = PieceDB.GetOpenings(piece.Type, piece.Rotation);
+
+            for (int i = 0; i < AllDirs.Length; i++)
+            {
+                Dir dir = AllDirs[i];
+                if ((open & dir) == 0) continue;
+
+                var (dx, dy) = DirDelta[i];
+                Dir opp      = Opposite[i];
+
+                // Stair pieces cross floors on their cross-dir face
+                int nFloor = piece.Floor;
+                if (PieceDB.IsStair(piece.Type) &&
+                    dir == PieceDB.GetStairCrossDir(piece.Type, piece.Rotation))
+                    nFloor = piece.Floor + PieceDB.StairFloorDelta(piece.Type);
+
+                // Step out of EVERY cell this piece occupies — for a pit that is all
+                // nine cells on all of its floors, which is what makes an entry on any
+                // perimeter face count. A pit exposes three perimeter cells per side per
+                // floor, across up to three floors, so more than one corridor can
+                // legitimately attach along the same face — collect every distinct
+                // unvisited candidate here (deduped by anchor, since a multi-cell piece
+                // is registered under many lookup keys) instead of stopping at the first.
+                var found = new Dictionary<(int, int, int), MazePiece>();
+                foreach (int cellFloor in PieceDB.FloorSpan(piece.Type)
+                             .Select(o => piece.Floor + o)
+                             .Where(f => f >= DungeonBuilder.FloorMin &&
+                                         f <= DungeonBuilder.FloorMax))
+                {
+                    // Stair cross-floor exits only apply from the piece's own floor.
+                    int fromFloor = PieceDB.IsStair(piece.Type) ? nFloor : cellFloor;
+
+                    foreach (var (ox, oy) in PieceDB.Footprint(piece.Type))
+                    {
+                        var probe = (piece.X + ox + dx, piece.Y + oy + dy, fromFloor);
+                        if (!lookup.TryGetValue(probe, out var cand)) continue;
+                        if (cand == piece) continue;                  // our own volume
+                        if (visited.Contains(KeyOf(cand))) continue;
+                        found[KeyOf(cand)] = cand;
+                    }
+                }
+
+                // Validate and enqueue each distinct candidate independently — one
+                // candidate failing the stair/opening guard must not block a sibling
+                // candidate found on the same face, and a rejected candidate is not
+                // marked visited since it may still be reachable via another route.
+                foreach (var cand in found.Values)
+                {
+                    // Cannot enter a stair from its cross-floor face at the same floor level
+                    if (PieceDB.IsStair(cand.Type) &&
+                        opp == PieceDB.GetStairCrossDir(cand.Type, cand.Rotation))
+                        continue;
+
+                    if ((PieceDB.GetOpenings(cand.Type, cand.Rotation) & opp) == 0) continue;
+
+                    visited.Add(KeyOf(cand));
+                    queue.Enqueue(cand);
+                }
+            }
+
+            // Teleport edge: stepping onto a linked teleport pad transports the player
+            // to its partner, so the two pads' cells are connected in the traversal graph
+            // even though nothing is physically adjacent. Without this, a maze whose only
+            // route to the Exit runs through a teleport would be wrongly rejected as
+            // unreachable. LinkId 0 is an unpaired (inert) pad — no edge.
+            if (piece.Type == PieceType.TrapPortal && piece.LinkId != 0)
+            {
+                foreach (var partner in maze.Pieces)
+                {
+                    if (partner.Type != PieceType.TrapPortal) continue;
+                    if (partner == piece || partner.LinkId != piece.LinkId) continue;
+                    if (visited.Contains(KeyOf(partner))) continue;
+                    visited.Add(KeyOf(partner));
+                    queue.Enqueue(partner);
+                }
+            }
+        }
+
+        if (!visited.Contains(KeyOf(exit)))
+        {
+            error = "No path from Start to Exit";
+            return false;
+        }
+
+        var unreached = maze.Pieces.Where(p => !visited.Contains(KeyOf(p))).ToList();
+        if (unreached.Count > 0)
+        {
+            var sample = unreached[0];
+            error = $"{unreached.Count} piece(s) unreachable from Start " +
+                    $"(e.g. {PieceDB.Labels[sample.Type]} at ({sample.X},{sample.Y},F{sample.Floor}))";
+            return false;
+        }
+
+        return true;
+    }
+}

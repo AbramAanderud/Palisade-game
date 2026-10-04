@@ -1,0 +1,144 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// Headless assertion harness for trap metadata and pairing logic, plus a
+/// scene-level regression check that a Darkness Zone cell never gets a lit prop.
+public partial class TestTraps : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    static readonly PieceType[] AllTraps =
+    {
+        PieceType.TrapIce, PieceType.TrapTar, PieceType.TrapDark, PieceType.TrapDoor,
+        PieceType.TrapGate, PieceType.TrapPush, PieceType.TrapPortal, PieceType.TrapGrease,
+    };
+
+    public override void _Ready()
+    {
+        GD.Print("── TrapDB ──");
+
+        foreach (var t in AllTraps)
+        {
+            Check(TrapDB.IsTrap(t), $"{t} is a trap");
+            Check(PieceDB.CategoryOf(t) == PieceCategory.Traps, $"{t} is in the Traps tab");
+            Check(PieceDB.Colors.ContainsKey(t),      $"{t} has a Color");
+            Check(PieceDB.Labels.ContainsKey(t),      $"{t} has a Label");
+            Check(PieceDB.ShortLabels.ContainsKey(t), $"{t} has a ShortLabel");
+            Check(PieceDB.GoldCosts.ContainsKey(t),   $"{t} has a GoldCost");
+
+            // Every trap is a straight corridor as far as the rest of the codebase
+            // is concerned. That is what lets validator BFS, DungeonBuilder.AddPiece
+            // and editor placement accept traps with zero changes.
+            Dir open = PieceDB.GetOpenings(t, 0);
+            Check(open == (Dir.N | Dir.S), $"{t} at rot=0 opens N|S like a Straight");
+            Check(!PieceDB.IsStair(t),     $"{t} is not a stair");
+            Check(!PieceDB.IsMultiCell(t), $"{t} is single-cell");
+        }
+
+        Check(!TrapDB.IsTrap(PieceType.Straight), "Straight is not a trap");
+        Check(!TrapDB.IsTrap(PieceType.Cross),    "Cross is not a trap");
+
+        // Only the gate and the push tile care which way they face.
+        Check(TrapDB.IsDirectional(PieceType.TrapGate), "gate is directional");
+        Check(TrapDB.IsDirectional(PieceType.TrapPush), "push tile is directional");
+        Check(!TrapDB.IsDirectional(PieceType.TrapIce), "ice is not directional");
+        Check(!TrapDB.IsDirectional(PieceType.TrapTar), "tar is not directional");
+
+        // Every trap needs an editor glyph, and glyphs must be distinguishable —
+        // the whole point is that a maze author can read the trap at a glance.
+        var glyphs = AllTraps.Select(TrapDB.Glyph).ToArray();
+        Check(glyphs.Distinct().Count() == AllTraps.Length,
+              "every trap has a distinct editor glyph");
+
+        // Editor colors must be distinct too.
+        var colors = AllTraps.Select(t => PieceDB.Colors[t]).ToArray();
+        Check(colors.Distinct().Count() == AllTraps.Length,
+              "every trap has a distinct editor color");
+
+        // Tuning values must actually hinder, in the right direction.
+        Check(TrapDB.IceFrictionMul  < 1f && TrapDB.IceFrictionMul  > 0f, "ice reduces friction");
+        Check(TrapDB.IceAccelMul     < 1f && TrapDB.IceAccelMul     > 0f, "ice reduces accel");
+        Check(TrapDB.TarSpeedMul     < 1f && TrapDB.TarSpeedMul     > 0f, "tar reduces top speed");
+        Check(TrapDB.TarAccelMul     < 1f && TrapDB.TarAccelMul     > 0f, "tar reduces accel");
+        Check(TrapDB.PushAccel       > 0f, "push tile accelerates");
+        Check(TrapDB.TrapdoorDelay   > 0f, "trapdoor has an opening delay");
+        Check(TrapDB.TrapdoorRearm   > TrapDB.TrapdoorDelay, "trapdoor re-arms after it opens");
+        Check(TrapDB.TeleportCooldown > 0f, "teleport pad has a cooldown");
+
+        // ── Darkness Zone must never carry a lit prop ───────────────────────
+        // Regression for the reviewed bug: AddMidCorridorProp's variant==1
+        // roll spawns PropLibrary.Instance("candelabra_a", withLight: true) —
+        // a REAL OmniLight3D child — on any straight N|S/E|W corridor, and
+        // TrapDark IS one (fixed Dir.N|Dir.S). PieceVariants.ApplyVariant now
+        // guards that call for TrapDark the same way it already guarded
+        // AddSconces.
+        //
+        // Coordinates below were picked by replicating PieceVariants.Fnv/
+        // VariantIndex offline (VariantIndex hashes in (int)PieceType, so the
+        // SAME coordinate lands in different variant buckets for different
+        // piece types — do not assume otherwise):
+        //   - (3, 0, floor 0, rot 0) as TrapDark lands in variant bucket 1
+        //     (the candelabra bucket) AND its AddSconces E/W rolls (that roll
+        //     is independent of piece Type) both come out "unlit" — so if
+        //     this cell has ANY light at all after the fix, that is exactly
+        //     the bug.
+        //   - (2, 0, floor 0, rot 0) as plain Straight independently lands in
+        //     variant bucket 1 too, guaranteeing its candelabra fires — this
+        //     is the control, proving the harness actually detects a lit prop
+        //     when the GLB/light pipeline is working, instead of the TrapDark
+        //     check above passing vacuously (e.g. because the GLB failed to
+        //     load in this headless run).
+        GD.Print("── Darkness Zone: no lit prop regression ──");
+        {
+            var darkDungeon = new DungeonBuilder();
+            AddChild(darkDungeon);   // must be in the tree before Build — AddSconces' LookAt requires it
+            darkDungeon.Build(new MazeData
+            {
+                Name   = "DarkZoneLightCheck",
+                Pieces = new List<MazePiece> {
+                    new() { Type = PieceType.TrapDark, X = 3, Y = 0, Floor = 0, Rotation = 0 },
+                },
+            });
+            var darkBody = darkDungeon.GetNodeOrNull<StaticBody3D>("Cell_3_0_0");
+            Check(darkBody != null, "TrapDark cell body was built");
+            Check(darkBody != null && !HasLight(darkBody),
+                  "TrapDark cell has zero OmniLight3D descendants (no lit candelabra/sconce)");
+
+            var controlDungeon = new DungeonBuilder();
+            AddChild(controlDungeon);
+            controlDungeon.Build(new MazeData
+            {
+                Name   = "DarkZoneLightCheckControl",
+                Pieces = new List<MazePiece> {
+                    new() { Type = PieceType.Straight, X = 2, Y = 0, Floor = 0, Rotation = 0 },
+                },
+            });
+            var controlBody = controlDungeon.GetNodeOrNull<StaticBody3D>("Cell_2_0_0");
+            Check(controlBody != null, "control Straight cell body was built");
+            Check(controlBody != null && HasLight(controlBody),
+                  "control Straight cell (independently variant==1) DOES get a lit prop — harness is not vacuous");
+
+            darkDungeon.Free();
+            controlDungeon.Free();
+        }
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+
+    static bool HasLight(Node n)
+    {
+        if (n is OmniLight3D) return true;
+        foreach (var child in n.GetChildren())
+            if (HasLight(child)) return true;
+        return false;
+    }
+}

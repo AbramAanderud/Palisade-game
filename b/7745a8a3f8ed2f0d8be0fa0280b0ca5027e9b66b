@@ -1,0 +1,181 @@
+using System.Collections.Generic;
+using Godot;
+
+/// res://scripts/TrapBuilder.cs — In-world dressing and behaviour nodes for trap cells.
+///
+/// A trap cell's corridor geometry is already built by DungeonBuilder.AddPiece (traps
+/// declare N|S openings, so they go down the ordinary Straight path). This class only
+/// adds what makes the trap a trap: a tinted floor overlay so the player can read it,
+/// and the Area3D or behaviour node that does the work.
+public static class TrapBuilder
+{
+    const float CS = DungeonBuilder.CellSize;
+    const float HW = DungeonBuilder.OpeningW * 0.5f;   // 3 m — half corridor width
+    const float CH = DungeonBuilder.CellHeight;
+
+    /// Adds trap dressing and behaviour to one cell. No-op for non-trap pieces.
+    /// `lookup` is the same footprint-aware (x, y, floor) -> MazePiece map
+    /// DungeonBuilder.Build already built via MazeLookup.Build — threaded through
+    /// so TrapBehaviours.AddTrapdoor can check whether there's a floor below.
+    public static void Decorate(DungeonBuilder owner, StaticBody3D body,
+                                MazePiece p, float yBase,
+                                Dictionary<(int, int, int), MazePiece> lookup)
+    {
+        if (!TrapDB.IsTrap(p.Type)) return;
+
+        switch (p.Type)
+        {
+            case PieceType.TrapIce:
+                AddFloorOverlay(owner, body, p, yBase, TrapDB.EditorColor(p.Type), 0.55f);
+                AddZone(owner, p, yBase, z =>
+                {
+                    z.FrictionMul = TrapDB.IceFrictionMul;
+                    z.AccelMul    = TrapDB.IceAccelMul;
+                });
+                break;
+
+            case PieceType.TrapTar:
+                AddFloorOverlay(owner, body, p, yBase, TrapDB.EditorColor(p.Type), 0.85f);
+                AddZone(owner, p, yBase, z =>
+                {
+                    z.SpeedMul = TrapDB.TarSpeedMul;
+                    z.AccelMul = TrapDB.TarAccelMul;
+                });
+                break;
+
+            case PieceType.TrapGrease:
+                AddWallSheen(owner, body, p, yBase, TrapDB.EditorColor(p.Type));
+                AddZone(owner, p, yBase, z => z.BlocksWallRun = true);
+                break;
+
+            case PieceType.TrapPush:
+                AddFloorOverlay(owner, body, p, yBase, TrapDB.EditorColor(p.Type), 0.45f);
+                AddZone(owner, p, yBase, z => z.PushAccel = FacingVector(p) * TrapDB.PushAccel);
+                break;
+
+            case PieceType.TrapDark:
+            case PieceType.TrapDoor:
+            case PieceType.TrapGate:
+            case PieceType.TrapPortal:
+                // Gate and Teleport (Task 5) route here too — TrapBehaviours.Decorate's
+                // own switch dispatches each trap type to its AddX/Node pair.
+                TrapBehaviours.Decorate(owner, body, p, yBase, lookup);
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    /// World-space unit vector for a directional trap's facing.
+    /// Rotation 0 faces NORTH (-Z) and rotates clockwise, matching PieceDB's convention.
+    public static Vector3 FacingVector(MazePiece p)
+    {
+        int r = ((p.Rotation % 4) + 4) % 4;
+        return r switch
+        {
+            0 => new Vector3( 0f, 0f, -1f),   // N
+            1 => new Vector3( 1f, 0f,  0f),   // E
+            2 => new Vector3( 0f, 0f,  1f),   // S
+            _ => new Vector3(-1f, 0f,  0f),   // W
+        };
+    }
+
+    /// A trigger volume filling the corridor of one trap cell.
+    /// `configure` sets the zone's multipliers before it enters the tree.
+    public static void AddZone(DungeonBuilder owner, MazePiece p, float yBase,
+                               System.Action<TrapZone> configure)
+    {
+        var zone = new TrapZone { Name = $"TrapZone_{p.Type}_{p.X}_{p.Y}_{p.Floor}" };
+        configure(zone);
+
+        // Corridor-width footprint, tall enough that a jumping player still counts as
+        // "in the trap" — otherwise bhopping across ice would skip it entirely, which
+        // is exactly the trap the player should NOT be able to skip.
+        var shape = new BoxShape3D { Size = new Vector3(CS, CH * 0.9f, CS) };
+        zone.AddChild(new CollisionShape3D { Shape = shape });
+
+        zone.Position = new Vector3(
+            p.X * CS + CS * 0.5f,
+            yBase + CH * 0.45f,
+            p.Y * CS + CS * 0.5f);
+
+        owner.AddChild(zone);
+    }
+
+    /// A thin tinted slab just above the corridor floor. Purely a readability cue —
+    /// it has no collision, so it never changes how the cell walks.
+    static void AddFloorOverlay(DungeonBuilder owner, StaticBody3D body, MazePiece p,
+                                float yBase, Color tint, float alpha)
+    {
+        float x0 = p.X * CS, z0 = p.Y * CS;
+        float cx = x0 + CS * 0.5f, cz = z0 + CS * 0.5f;
+        // PieceVariants.AddRugSlab puts a decor rug BoxMesh (height 0.05) on every
+        // non-stair cell centered at yBase+0.03, so its top face sits at yBase+0.055.
+        // The overlay must clear that or the rug hides almost all of it (confirmed by
+        // capture — the rug is narrower than the corridor, so only a sliver at each
+        // edge showed through before this fix). 0.08 clears it with margin.
+        float y  = yBase + 0.08f;
+
+        var st = DungeonBuilder.MakeST();
+        DungeonBuilder.Quad(st,
+            new(cx - HW, y, cz - CS * 0.5f), new(cx + HW, y, cz - CS * 0.5f),
+            new(cx + HW, y, cz + CS * 0.5f), new(cx - HW, y, cz + CS * 0.5f));
+
+        var mesh = DungeonBuilder.Commit(st);
+        if (mesh == null) return;
+
+        var mi = new MeshInstance3D
+        {
+            Name = $"TrapOverlay_{p.X}_{p.Y}",
+            Mesh = mesh,
+            MaterialOverride = new StandardMaterial3D
+            {
+                AlbedoColor              = new Color(tint.R, tint.G, tint.B, alpha),
+                Transparency             = BaseMaterial3D.TransparencyEnum.Alpha,
+                EmissionEnabled          = true,
+                Emission                 = tint,
+                EmissionEnergyMultiplier = 0.35f,
+                Metallic                 = 0.6f,
+                Roughness                = 0.15f,
+            },
+        };
+        body.AddChild(mi);
+    }
+
+    /// Two tinted panels hugging the corridor's side walls — the visual tell that
+    /// these walls will not take a wall-run.
+    static void AddWallSheen(DungeonBuilder owner, StaticBody3D body, MazePiece p,
+                             float yBase, Color tint)
+    {
+        float x0 = p.X * CS, z0 = p.Y * CS;
+        float cx = x0 + CS * 0.5f;
+        float y0 = yBase + 0.5f, y1 = yBase + CH - 0.5f;
+        float z1 = z0 + CS;
+
+        var st = DungeonBuilder.MakeST();
+        // West wall panel, facing east into the corridor.
+        DungeonBuilder.Quad(st, new(cx - HW + 0.05f, y0, z0), new(cx - HW + 0.05f, y0, z1),
+                                new(cx - HW + 0.05f, y1, z1), new(cx - HW + 0.05f, y1, z0));
+        // East wall panel, facing west.
+        DungeonBuilder.Quad(st, new(cx + HW - 0.05f, y0, z1), new(cx + HW - 0.05f, y0, z0),
+                                new(cx + HW - 0.05f, y1, z0), new(cx + HW - 0.05f, y1, z1));
+
+        var mesh = DungeonBuilder.Commit(st);
+        if (mesh == null) return;
+
+        body.AddChild(new MeshInstance3D
+        {
+            Name = $"TrapGrease_{p.X}_{p.Y}",
+            Mesh = mesh,
+            MaterialOverride = new StandardMaterial3D
+            {
+                AlbedoColor  = new Color(tint.R, tint.G, tint.B, 0.7f),
+                Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+                Metallic     = 0.85f,
+                Roughness    = 0.08f,
+                CullMode     = BaseMaterial3D.CullModeEnum.Disabled,
+            },
+        });
+    }
+}

@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://dgqybkmueo2tu"]
+
+[ext_resource type="Script" path="res://test/TestTeleportMigration.cs" id="1_s"]
+
+[node name="TestTeleportMigration" type="Node"]
+script = ExtResource("1_s")

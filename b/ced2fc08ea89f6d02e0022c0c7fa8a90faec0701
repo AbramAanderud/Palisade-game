@@ -1,0 +1,121 @@
+using Godot;
+
+/// res://test/TestThirdPerson.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Third-person readability check-sheet. Spawns a real PlayerController, gives it
+/// a gun, and films it from an opponent's vantage while it cycles through the
+/// states you actually need to read in a fight:
+///
+///   idle → aim up → aim down → shooting → reloading → running → running+shooting
+///
+/// The question this answers is not "does it animate" but "could I tell what that
+/// player is doing and where they are aiming, from across an arena". Pass
+/// `--gun <id>` style selection via TrainingConfig.Gun before loading the scene,
+/// or edit Gun below.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestThirdPerson : Node3D
+{
+    const string Gun = "ak47";   // long gun — worst case for a bad hand attachment
+
+    PlayerController? _player;
+    Camera3D?         _cam;
+    Label3D?          _caption;
+    float             _t = 0f;
+
+    // (label, seconds) — the sheet runs top to bottom.
+    // Locomotion beats come first and are the acceptance test: the legs must do
+    // exactly what they do unarmed, in EVERY state, while the arms hold the gun.
+    static readonly (string label, float dur)[] Beats =
+    {
+        ("IDLE",            1.6f),
+        ("WALKING",         2.0f),
+        ("RUNNING",         2.0f),
+        ("JUMPING",         1.6f),
+        ("FALLING",         1.6f),
+        ("WALL RUN",        2.0f),
+        ("SLIDING",         2.0f),
+        ("AIM UP",          1.4f),
+        ("AIM DOWN",        1.4f),
+        ("SHOOTING",        2.0f),
+        ("RELOADING",       2.4f),
+        ("RUN + SHOOT",     2.2f),
+    };
+
+    int   _beat      = 0;
+    float _beatTimer = 0f;
+
+    public override void _Ready()
+    {
+        var env = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.07f, 0.07f, 0.09f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(1f, 0.97f, 0.92f),
+            AmbientLightEnergy = 0.75f,
+        };
+        AddChild(new WorldEnvironment { Environment = env });
+
+        var key = new DirectionalLight3D { LightEnergy = 1.5f };
+        key.RotationDegrees = new Vector3(-35f, 40f, 0f);
+        AddChild(key);
+
+        // Floor to stand on.
+        var floor = new StaticBody3D();
+        floor.AddChild(new CollisionShape3D
+        { Shape = new BoxShape3D { Size = new Vector3(40f, 1f, 40f) } });
+        var fm = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(40f, 1f, 40f) } };
+        fm.SetSurfaceOverrideMaterial(0, new StandardMaterial3D
+        { AlbedoColor = new Color(0.20f, 0.20f, 0.22f), Roughness = 1f, Metallic = 0f });
+        floor.AddChild(fm);
+        AddChild(floor);
+        floor.GlobalPosition = new Vector3(0f, -0.5f, 0f);
+
+        _player = PlayerController.Spawn(this, new Vector3(0f, 0.2f, 0f), 0f);
+        _player.Frozen = true;              // no input, no mouse capture fighting us
+        _player.EquipStarterGun(Gun);
+
+        // Opponent's-eye view: front three-quarter, roughly eye height, close
+        // enough to read the hands and the barrel.
+        _cam = new Camera3D { Fov = 50f, CullMask = ~4u };   // hide the FP-only viewmodel
+        AddChild(_cam);
+        _cam.Position = new Vector3(2.6f, 1.7f, 3.0f);
+        _cam.LookAt(new Vector3(0f, 1.0f, 0f), Vector3.Up);
+        _cam.MakeCurrent();
+
+        _caption = new Label3D
+        {
+            Text      = Beats[0].label,
+            FontSize  = 64,
+            Position  = new Vector3(0f, 2.4f, 0f),
+            Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+            Modulate  = new Color(1f, 0.88f, 0.5f),
+            PixelSize = 0.0022f,
+        };
+        AddChild(_caption);
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_player == null) return;
+        float dt = (float)delta;
+        _t += dt;
+        _beatTimer += dt;
+
+        if (_beat < Beats.Length && _beatTimer >= Beats[_beat].dur)
+        {
+            _beatTimer = 0f;
+            _beat++;
+            if (_beat >= Beats.Length) { GetTree().Quit(); return; }
+            if (_caption != null) _caption.Text = Beats[_beat].label;
+        }
+        if (_beat >= Beats.Length) return;
+
+        _player.DebugDriveThirdPerson(Beats[_beat].label, dt);
+
+        // Keep the camera locked on the chest as the player moves.
+        _cam?.LookAt(_player.GlobalPosition + Vector3.Up * 1.0f, Vector3.Up);
+        if (_caption != null)
+            _caption.GlobalPosition = _player.GlobalPosition + Vector3.Up * 2.4f;
+    }
+}

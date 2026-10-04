@@ -1,0 +1,38 @@
+using System.Collections.Generic;
+using Godot;
+
+/// test/TestFfaParty.cs — FfaPartyInfo parses every relay party message shape, and CanStart rules.
+public partial class TestFfaParty : Node
+{
+    int _fail;
+    void Check(bool ok, string label) { GD.Print((ok ? "PASS  " : "FAIL  ") + label); if (!ok) _fail++; }
+
+    public override void _Ready()
+    {
+        var created = FfaPartyInfo.Parse("{\"type\":\"party_created\",\"seat\":0,\"code\":\"123\",\"hostSeat\":0,\"cap\":4,\"started\":false,\"roster\":[{\"seat\":0,\"id\":\"7\",\"name\":\"Abe\"}]}");
+        Check(created.Code == "123" && created.Seat == 0 && created.HostSeat == 0 && created.Cap == 4 && !created.Started, "party_created fields");
+        Check(created.Roster.Count == 1 && created.NameAt(0) == "Abe" && created.Has(0) && !created.Has(1), "roster + NameAt/Has");
+
+        var upd = FfaPartyInfo.Parse("{\"type\":\"party_update\",\"code\":\"123\",\"hostSeat\":2,\"cap\":4,\"started\":false,\"roster\":[{\"seat\":3,\"id\":\"9\",\"name\":\"D\"},{\"seat\":2,\"id\":\"8\",\"name\":\"C\"}]}");
+        Check(upd.Seat == -1, "party_update has no seat → -1");
+        Check(upd.Roster[0].Seat == 2 && upd.Roster[1].Seat == 3, "roster sorted by seat");
+        Check(upd.HostSeat == 2 && upd.NameAt(1) == null, "host handover + empty seat");
+
+        var start = FfaPartyInfo.Parse("{\"type\":\"ffa_start\",\"seat\":1,\"code\":\"123\",\"hostSeat\":0,\"cap\":4,\"started\":true,\"roster\":[{\"seat\":0,\"id\":\"1\",\"name\":\"A\"},{\"seat\":1,\"id\":\"2\",\"name\":\"B\"},{\"seat\":2,\"id\":\"3\",\"name\":\"C\"}]}");
+        Check(start.Started && start.Seat == 1 && start.Roster.Count == 3, "ffa_start fields");
+
+        Check(!FfaPartyInfo.CanStart(created, new HashSet<int> { 0 }), "1 player cannot start");
+        Check(!FfaPartyInfo.CanStart(start, new HashSet<int> { 0, 1 }), "3 players, one unready → no");
+        Check(FfaPartyInfo.CanStart(start, new HashSet<int> { 0, 1, 2 }), "3 players all ready → yes");
+        Check(FfaPartyInfo.CanStart(start, new HashSet<int> { 0, 1, 2, 3 }), "extra stale ready seat is harmless");
+
+        OnlineGameState.IsFfa = true; OnlineGameState.FfaSeat = 2; OnlineGameState.FfaHostSeat = 1;
+        OnlineGameState.FfaRoster.Add(new FfaRosterEntry { Seat = 0 }); OnlineGameState.FfaRotationOffset = 3;
+        OnlineGameState.Reset();
+        Check(!OnlineGameState.IsFfa && OnlineGameState.FfaSeat == -1 && OnlineGameState.FfaHostSeat == 0 &&
+              OnlineGameState.FfaRoster.Count == 0 && OnlineGameState.FfaRotationOffset == 1, "Reset clears FFA state");
+
+        GD.Print(_fail == 0 ? "ALL PASS" : $"{_fail} FAILED");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

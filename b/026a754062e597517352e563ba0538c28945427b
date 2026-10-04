@@ -1,0 +1,191 @@
+using Godot;
+using System.Collections.Generic;
+
+/// Capture harness for the tabbed settings screen.
+///
+/// Two modes, chosen by the "reticle" command-line flag:
+///   default  — one frame per tab (Account / Reticle / Display / Controls)
+///   --reticle — parks on the Reticle tab and applies a different reticle config
+///               per frame, so a --fixed-fps 1 capture proves ReticleRenderer
+///               actually honours style / outline / T-style / alpha / colour
+///               rather than just that the controls exist.
+public partial class TestSettingsCapture : Control
+{
+    SettingsPanel? _panel;
+    readonly List<Button> _tabs = new();
+    int  _frame;
+    bool _reticleMode;
+    bool _saveMode;
+
+    public override void _Ready()
+    {
+        SetAnchorsAndOffsetsPreset(LayoutPreset.FullRect);
+
+        foreach (var a in OS.GetCmdlineUserArgs())
+        {
+            if (a == "reticle") _reticleMode = true;
+            if (a == "save")    _saveMode    = true;
+        }
+
+        _panel = new SettingsPanel();
+        AddChild(_panel);
+        _panel.Show();
+
+        CallDeferred(MethodName.CollectTabs);
+    }
+
+    void CollectTabs()
+    {
+        foreach (var name in new[] { "Account", "Reticle", "Display", "Controls" })
+        {
+            var b = FindNodeOfType<Button>(_panel!, name);
+            if (b != null) _tabs.Add(b);
+        }
+        GD.Print($"[TestSettingsCapture] found {_tabs.Count}/4 tab buttons, reticleMode={_reticleMode}");
+        if (_reticleMode && _tabs.Count > 1)
+            _tabs[1].EmitSignal(BaseButton.SignalName.Pressed);   // park on Reticle
+    }
+
+    static List<T> FindAll<T>(Node root) where T : Node
+    {
+        var hits = new List<T>();
+        void Walk(Node n)
+        {
+            if (n is T t) hits.Add(t);
+            foreach (var c in n.GetChildren()) Walk(c);
+        }
+        Walk(root);
+        return hits;
+    }
+
+    static T? FindNodeOfType<T>(Node root, string? buttonText = null) where T : Node
+    {
+        if (root is T hit && (buttonText == null || (root is Button b && b.Text == buttonText)))
+            return hit;
+        foreach (var c in root.GetChildren())
+        {
+            var r = FindNodeOfType<T>(c, buttonText);
+            if (r != null) return r;
+        }
+        return null;
+    }
+
+    // Each entry is one captured frame. Named so the capture log says which
+    // config produced which frame.
+    static readonly (string Name, System.Action Apply)[] ReticleConfigs =
+    {
+        ("default", () => { }),
+        ("green + T-style + fat outline", () =>
+        {
+            var s = GameSettings.Instance!;
+            s.SetReticleColor(new Color(0.30f, 1f, 0.40f, 1f));
+            s.SetReticleTStyle(true);
+            s.SetReticleOutline(true);
+            s.SetReticleOutlineThick(3f);
+            s.SetReticleThick(4f);
+            s.SetReticleSize(16f);
+        }),
+        ("cyan + static + no dot + 40% alpha", () =>
+        {
+            var s = GameSettings.Instance!;
+            s.SetReticleColor(new Color(0.30f, 0.95f, 1f, 1f));
+            s.SetReticleStyle(GameSettings.ReticleStyleMode.Static);
+            s.SetReticleTStyle(false);
+            s.SetReticleCenterDot(false);
+            s.SetReticleGap(14f);
+            s.SetReticleUseAlpha(true);
+            s.SetReticleAlpha(0.40f);
+        }),
+        ("blue + classic + outline off", () =>
+        {
+            var s = GameSettings.Instance!;
+            s.SetReticleColor(new Color(0.30f, 0.55f, 1f, 1f));
+            s.SetReticleStyle(GameSettings.ReticleStyleMode.Classic);
+            s.SetReticleOutline(false);
+            s.SetReticleAlpha(1f);
+            s.SetReticleThick(2f);
+            s.SetReticleSize(10f);
+            s.SetReticleGap(6f);
+            s.SetReticleCenterDot(true);
+        }),
+    };
+
+    /// One step per captured frame, walking the whole save flow:
+    /// clean -> edited -> saved confirmation -> edited again -> unsaved prompt.
+    void SaveModeStep(int step)
+    {
+        switch (step)
+        {
+            case 0:
+                GD.Print("[TestSettingsCapture] save: baseline (Save Changes greyed out)");
+                break;
+            case 1:
+                GameSettings.Instance?.SetReticleSize(19f);
+                FindNodeOfType<ReticlePreview>(_panel!)?.QueueRedraw();
+                GD.Print("[TestSettingsCapture] save: edited (Save Changes enabled)");
+                break;
+            case 2:
+                Press("Save Changes");
+                GD.Print("[TestSettingsCapture] save: pressed Save Changes -> confirmation");
+                break;
+            case 3:
+                Press("OK");
+                GameSettings.Instance?.SetReticleGap(21f);
+                GD.Print("[TestSettingsCapture] save: dismissed, edited again");
+                break;
+            case 4:
+                _panel!.RequestClose();
+                GD.Print("[TestSettingsCapture] save: RequestClose -> unsaved prompt");
+                break;
+        }
+    }
+
+    void Press(string text)
+    {
+        FindNodeOfType<Button>(_panel!, text)?.EmitSignal(BaseButton.SignalName.Pressed);
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+
+        if (_saveMode)
+        {
+            int step = _frame - 1;
+            if (step >= 0 && step <= 4) SaveModeStep(step);
+            if (_frame > 6) GetTree().Quit();
+            return;
+        }
+
+        if (_reticleMode)
+        {
+            int idx = _frame - 1;
+            if (idx >= 0 && idx < ReticleConfigs.Length)
+            {
+                ReticleConfigs[idx].Apply();
+                FindNodeOfType<ReticlePreview>(_panel!)?.QueueRedraw();
+
+                // From the second frame on, slam every scroll region to the bottom.
+                // That is the case the pinned preview exists for: the lower options
+                // (Alpha, custom RGB) are only reachable by scrolling, and the
+                // preview must still be on screen when you get there.
+                if (idx >= 1)
+                    foreach (var sc in FindAll<ScrollContainer>(_panel!))
+                        sc.ScrollVertical = 9999;
+
+                GD.Print($"[TestSettingsCapture] frame {idx}: {ReticleConfigs[idx].Name}"
+                         + (idx >= 1 ? " (scrolled to bottom)" : ""));
+            }
+            if (_frame > ReticleConfigs.Length + 1) GetTree().Quit();
+            return;
+        }
+
+        int t = _frame - 1;
+        if (t >= 1 && t < _tabs.Count)
+        {
+            _tabs[t].EmitSignal(BaseButton.SignalName.Pressed);
+            GD.Print($"[TestSettingsCapture] switched to tab {t}");
+        }
+        if (_frame > _tabs.Count + 1) GetTree().Quit();
+    }
+}

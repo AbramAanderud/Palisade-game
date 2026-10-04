@@ -1,0 +1,204 @@
+using System.Collections.Generic;
+using Godot;
+
+/// Headless assertion harness for TrapdoorNode's delay/re-arm state machine,
+/// plus TrapBehaviours.AddTrapdoor's bottom-floor guard (fix for a trapdoor
+/// dropping the player into open space at the world's lowest floor).
+/// Drives _PhysicsProcess with synthetic deltas — no player, no physics frame,
+/// no scene geometry — so this proves the timing logic itself rather than
+/// relying on a screenshot of the drop happening at roughly the right moment.
+public partial class TestTrapdoor : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    // Builds a trapdoor node with its own throwaway hatch, matching the shape
+    // TrapBehaviours.AddTrapdoor builds (StaticBody3D + one CollisionShape3D +
+    // one MeshInstance3D), but standalone — never added under a DungeonBuilder,
+    // so this only exercises TrapdoorNode's own bookkeeping.
+    static (TrapdoorNode node, StaticBody3D hatch, CollisionShape3D col) MakeRig()
+    {
+        var hatch = new StaticBody3D();
+        var col   = new CollisionShape3D { Shape = new BoxShape3D() };
+        hatch.AddChild(col);
+
+        var node = new TrapdoorNode { Hatch = hatch };
+        return (node, hatch, col);
+    }
+
+    public override void _Ready()
+    {
+        GD.Print("── TrapdoorNode delay/re-arm timing ──");
+
+        // ── Case 1: untriggered hatch never moves, no matter how much time passes ──
+        {
+            var (node, hatch, col) = MakeRig();
+            node._PhysicsProcess(100.0); // absurdly large delta — should be a pure no-op
+            Check(hatch.Visible,   "untriggered: hatch stays visible");
+            Check(!col.Disabled,   "untriggered: hatch collision stays enabled");
+            Check(!node.DebugTriggered, "untriggered: DebugTriggered stays false");
+            node.Free();
+            hatch.Free(); // cascades to free the child CollisionShape3D too
+        }
+
+        // ── Case 2: a non-player body must not trigger it ──────────────────────
+        {
+            var (node, hatch, _) = MakeRig();
+            var notAPlayer = new Node3D();
+            node.OnBodyEntered(notAPlayer);
+            Check(!node.DebugTriggered, "non-player body: does not trigger");
+            notAPlayer.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 3: entering starts the timer; the hatch survives right up to
+        //    (but not including) TrapdoorDelay — the "it looked solid" beat. ──
+        {
+            var (node, hatch, col) = MakeRig();
+            var player = new PlayerController();
+            node.OnBodyEntered(player);
+            Check(node.DebugTriggered, "on enter: DebugTriggered becomes true");
+
+            float justUnder = TrapDB.TrapdoorDelay - 0.05f;
+            node._PhysicsProcess(justUnder);
+            Check(hatch.Visible, $"at t={justUnder:F2}s (< delay {TrapDB.TrapdoorDelay}): hatch still visible");
+            Check(!col.Disabled, $"at t={justUnder:F2}s (< delay): collision still enabled");
+
+            // Cross the delay threshold.
+            node._PhysicsProcess(0.10f); // total elapsed now > TrapdoorDelay
+            Check(!hatch.Visible, "past delay: hatch becomes invisible");
+            Check(col.Disabled,   "past delay: collision becomes disabled");
+            Check(node.DebugTriggered, "past delay, before rearm: still marked triggered");
+
+            player.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 4: re-arm restores the hatch and resets the trigger, so the
+        //    tile is walkable (and able to fire) again. ─────────────────────────
+        {
+            var (node, hatch, col) = MakeRig();
+            var player = new PlayerController();
+            node.OnBodyEntered(player);
+
+            node._PhysicsProcess(TrapDB.TrapdoorDelay + 0.05f); // drop it
+            Check(!hatch.Visible, "pre-rearm: hatch confirmed down");
+
+            float justUnder = TrapDB.TrapdoorRearm - TrapDB.TrapdoorDelay - 0.10f;
+            node._PhysicsProcess(justUnder);
+            Check(!hatch.Visible,      "just before rearm: hatch still down");
+            Check(node.DebugTriggered, "just before rearm: still triggered (not yet reset)");
+
+            node._PhysicsProcess(0.20f); // cross TrapdoorRearm
+            Check(hatch.Visible,        "past rearm: hatch visible again");
+            Check(!col.Disabled,        "past rearm: collision re-enabled");
+            Check(!node.DebugTriggered, "past rearm: trigger flag reset (re-armed, refireable)");
+            Check(node.DebugTimer == 0f, "past rearm: timer reset to zero");
+
+            player.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 5: re-triggering is a no-op while already triggered — a second
+        //    body walking in mid-drop must not restart the clock. ───────────────
+        {
+            var (node, hatch, _) = MakeRig();
+            var playerA = new PlayerController();
+            var playerB = new PlayerController();
+            node.OnBodyEntered(playerA);
+            node._PhysicsProcess(TrapDB.TrapdoorDelay * 0.5f);
+            float timerBefore = node.DebugTimer;
+            node.OnBodyEntered(playerB); // should be ignored — already triggered
+            Check(node.DebugTimer == timerBefore, "re-entry mid-drop: timer not reset");
+            playerA.Free();
+            playerB.Free();
+            node.Free();
+            hatch.Free();
+        }
+
+        // ── Case 6 (I4): "is there a floor below" guard, not "is this FloorMin" ──
+        //    A TrapDoor must only build a hatch when SOMETHING is actually placed
+        //    at (X, Y, Floor-1) — the same invariant PitBuilder holds by always
+        //    emitting a solid landing at its bottom occupied floor. The OLD guard
+        //    (p.Floor <= DungeonBuilder.FloorMin) only caught the world's bottom
+        //    floor: a TrapDoor at floor 2 with nothing authored at floor 1 in that
+        //    cell dropped the player into an identical infinite fall one floor up,
+        //    which FloorMin never saw. Exercises TrapBehaviours.Decorate — the
+        //    exact public entry point DungeonBuilder calls in production, now
+        //    threaded with the same footprint-aware MazeLookup.Build map
+        //    DungeonBuilder.Build passes it — with a throwaway owner/body that
+        //    are never added to any SceneTree, so this is a pure-predicate
+        //    assertion on the lookup, not a scene/physics test. ──────────────────
+        {
+            var owner = new DungeonBuilder();
+            var body  = new StaticBody3D();
+
+            bool HasHatch()
+            {
+                foreach (var child in owner.GetChildren())
+                    if (child.Name.ToString().StartsWith("TrapdoorHatch_")) return true;
+                return false;
+            }
+
+            // 6a: nothing at all below (even at FloorMin, generalised: the world's
+            // bottom floor is just the special case of "nothing below" — this
+            // proves it via the lookup, not a hardcoded FloorMin comparison).
+            var emptyLookup = MazeLookup.Build(new List<MazePiece>(), DungeonBuilder.FloorMin, DungeonBuilder.FloorMax);
+            var bottomPiece = new MazePiece
+                { Type = PieceType.TrapDoor, X = 0, Y = 0, Floor = DungeonBuilder.FloorMin, Rotation = 0 };
+            TrapBehaviours.Decorate(owner, body, bottomPiece, 0f, emptyLookup);
+            Check(!HasHatch(), "TrapDoor with nothing below (world bottom): no hatch built, floor stays solid");
+
+            // 6b (the actual bug this fix closes): a TrapDoor NOT at the world's
+            // bottom floor, but with nothing authored at Floor-1 in this cell,
+            // must ALSO refuse to build a hatch — the old FloorMin-only guard let
+            // this one straight through into an infinite fall.
+            var midPieces = new List<MazePiece> {
+                new() { Type = PieceType.TrapDoor, X = 0, Y = 0, Floor = DungeonBuilder.FloorMin + 2, Rotation = 0 },
+                // Deliberately nothing at Floor = FloorMin + 1 in this cell.
+            };
+            var midLookup = MazeLookup.Build(midPieces, DungeonBuilder.FloorMin, DungeonBuilder.FloorMax);
+            TrapBehaviours.Decorate(owner, body, midPieces[0], 0f, midLookup);
+            Check(!HasHatch(), "TrapDoor mid-world with nothing at Floor-1 in this cell: no hatch built (I4 regression)");
+
+            // 6c: a normal corridor piece directly below — hatch builds.
+            var normalPieces = new List<MazePiece> {
+                new() { Type = PieceType.TrapDoor, X = 0, Y = 0, Floor = DungeonBuilder.FloorMin + 2, Rotation = 0 },
+                new() { Type = PieceType.Straight,  X = 0, Y = 0, Floor = DungeonBuilder.FloorMin + 1, Rotation = 0 },
+            };
+            var normalLookup = MazeLookup.Build(normalPieces, DungeonBuilder.FloorMin, DungeonBuilder.FloorMax);
+            TrapBehaviours.Decorate(owner, body, normalPieces[0], 0f, normalLookup);
+            Check(HasHatch(), "TrapDoor with an ordinary piece at Floor-1: hatch builds normally");
+
+            // 6d: a Pit's 3x3 footprint sits below — must ALSO count as "has
+            // something below", via the SAME footprint-aware lookup DungeonBuilder
+            // and MazeValidator use (MazeLookup registers a multi-cell piece under
+            // every cell of its footprint, not just its anchor — see C1/MazeLookup's
+            // doc comment). An anchor-only lookup would miss a trapdoor sitting
+            // above one of the pit's OUTER footprint cells.
+            var pitPieces = new List<MazePiece> {
+                new() { Type = PieceType.TrapDoor, X = 4, Y = 4, Floor = DungeonBuilder.FloorMin + 2, Rotation = 0 },
+                // Pit anchored at (5,5) on floor FloorMin+1 — its 3x3 footprint
+                // covers (4,4)..(6,6), so (4,4) is a PERIMETER cell, not the anchor.
+                new() { Type = PieceType.Pit, X = 5, Y = 5, Floor = DungeonBuilder.FloorMin + 1, Rotation = 0 },
+            };
+            var pitLookup = MazeLookup.Build(pitPieces, DungeonBuilder.FloorMin, DungeonBuilder.FloorMax);
+            TrapBehaviours.Decorate(owner, body, pitPieces[0], 0f, pitLookup);
+            Check(HasHatch(), "TrapDoor above a Pit's footprint (not its anchor): hatch still builds (footprint-aware)");
+
+            owner.Free();
+            body.Free();
+        }
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+}

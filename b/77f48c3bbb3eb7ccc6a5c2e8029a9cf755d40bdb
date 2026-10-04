@@ -1,0 +1,33 @@
+using Godot;
+using System.Collections.Generic;
+
+/// Determinism check: variant indices must be identical across two
+/// evaluations (stands in for two multiplayer clients).
+///
+/// NOTE: MazeSerializer has no random-generation API (only Save/Load of
+/// hand-placed slots), so this hand-constructs a small MazeData — matching
+/// the pattern used by test/ArenaConnTest.cs and test/TestVisualFlair.cs.
+public partial class TestVariants : Node3D
+{
+    public override void _Ready()
+    {
+        var data = new MazeData { Name = "VariantTest" };
+        data.Pieces = new List<MazePiece>
+        {
+            new() { Type = PieceType.Start,    X=5, Y=0, Floor=0, Rotation=0 },
+            new() { Type = PieceType.Straight, X=5, Y=1, Floor=0, Rotation=0 },
+            new() { Type = PieceType.Cross,    X=5, Y=2, Floor=0, Rotation=0 },
+            new() { Type = PieceType.Exit,     X=5, Y=3, Floor=0, Rotation=0 },
+        };
+
+        bool pass = true;
+        foreach (var p in data.Pieces)
+        {
+            int a = PieceVariants.VariantIndex(p, PieceVariants.VariantCount);
+            int b = PieceVariants.VariantIndex(p, PieceVariants.VariantCount);
+            if (a != b || a < 0 || a >= PieceVariants.VariantCount) { pass = false; break; }
+        }
+        GD.Print(pass ? "[TestVariants] PASS deterministic" : "[TestVariants] FAIL");
+        GetTree().Quit();
+    }
+}

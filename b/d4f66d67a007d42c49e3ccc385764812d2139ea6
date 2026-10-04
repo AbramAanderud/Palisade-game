@@ -1,0 +1,273 @@
+using System.Collections.Generic;
+using Godot;
+
+/// res://test/TestPitDividerCollision.cs — Issue 1 collision hardening verification.
+///
+/// Playtest report: players PHASE INTO the shared wall between two ADJACENT Pit
+/// pieces and get TRAPPED inside it. Mechanism: before the thickness fix, each
+/// pit emitted a single zero-thickness, single-sided collision plane at the
+/// EXACT shared boundary, with opposite normals — a capsule crossing fast
+/// enough to tunnel past one plane in a single physics tick could end up
+/// straddling both planes' backfaces (no collision either way), or get
+/// sandwiched between two opposing push-outs with zero separation between
+/// them. See PitBuilder.WallSlabBounds / AddWallSegment's doc comment for the
+/// fix: a genuine solid BoxShape3D collider per wall band, in addition to the
+/// visual trimesh.
+///
+/// Two adjacent Pits: A anchored at (2,2,0) [world x:10-40, z:10-40], B
+/// anchored at (5,2,0) [world x:40-70, z:10-40]. Shared boundary: x=40,
+/// z:10-40, y:0-18 (single occupied floor).
+///
+/// IMPORTANT geometry note: PieceType.Pit reports openings in ALL FOUR
+/// directions unconditionally (PieceDB.BaseOpenings), and MazeLookup
+/// registers a Pit under every footprint cell it occupies — so each of the
+/// three 10 m cells along the shared boundary resolves its neighbour as
+/// "a piece with an opening pointing back", and PitBuilder.HasEntry opens a
+/// doorway there. The "dividing wall" the report describes is therefore NOT
+/// one continuous wall: it's the ~2 m jamb pillars flanking each of those
+/// three periodic doorways. All probes below are placed inside a jamb
+/// (z=11, within cell (3,1)'s west jamb, solid z:10-12), not a doorway centre
+/// (which for that same cell spans z:12-18 and is legitimately open).
+///
+/// Part 1 — static shape-overlap probes (capsule-sized, matching
+/// PlayerController: radius 0.35, height 1.6) placed exactly ON the boundary
+/// plane at several heights: must COLLIDE (find solid geometry), not fit
+/// into an empty sandwich gap.
+///
+/// Part 2 — dynamic capsule-sweep: a CharacterBody3D driven at sprint speed
+/// FROM BOTH sides toward the boundary must (a) never cross to the far side
+/// (no tunnel-through) and (b) retain normal lateral (Z-axis) mobility
+/// afterward — i.e. blocked, not stuck/trapped.
+public partial class TestPitDividerCollision : Node3D
+{
+    const float CapsuleRadius = 0.35f;
+    const float CapsuleHeight = 1.6f;
+    const float SprintSpeed   = 30f;    // comparable to TestArenaEscape's SlideSpeed=32
+    const float Gravity       = 22f;
+    const float FloorMaxAngleDeg = 68f;
+    const float BoundaryX = 40f;        // shared plane between Pit A (x<40) and Pit B (x>40)
+
+    int _failures = 0;
+    void Check(bool cond, string label)
+    {
+        if (cond) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    DungeonBuilder _dungeon = null!;
+
+    // ── dynamic sweep state machine ─────────────────────────────────────────
+    class Scenario { public string Name = ""; public Vector3 Start; public Vector3 Dir; public float Limit; public bool FromWest; public bool SpawnOnSeam; }
+    readonly List<Scenario> _scenarios = new();
+    int _idx = -1;
+    CharacterBody3D _capsule = null!;
+    Vector3 _dir;
+    float _t;
+    bool _finished;
+    int _settleLeft;
+    const int SettleFrames = 20;
+    const float DriveDurationSec = 3.0f;
+    const float LateralCheckSec  = 1.0f;
+    bool _lateralPhase;
+    float _lateralStartZ;
+
+    public override void _Ready()
+    {
+        var env = new WorldEnvironment
+        {
+            Environment = new Godot.Environment
+            {
+                AmbientLightSource = Godot.Environment.AmbientSource.Color,
+                AmbientLightColor  = new Color(0.5f, 0.5f, 0.5f),
+                AmbientLightEnergy = 1.0f,
+            }
+        };
+        AddChild(env);
+
+        var pieces = new List<MazePiece>
+        {
+            new() { Type = PieceType.Pit, X = 2, Y = 2, Floor = 0, Rotation = 0 },
+            new() { Type = PieceType.Pit, X = 5, Y = 2, Floor = 0, Rotation = 0 },
+        };
+        _dungeon = new DungeonBuilder();
+        AddChild(_dungeon);
+        _dungeon.Build(new MazeData { Name = "DividerGeo", Pieces = pieces });
+
+        // Part 1 runs once, synchronously, on the next physics frame (collision
+        // shapes added via code need at least one physics-server sync).
+        CallDeferred(nameof(RunStaticProbes));
+
+        // Part 2 setup — capsule matches PlayerController's collision exactly.
+        _capsule = new CharacterBody3D { Name = "TestCapsule" };
+        _capsule.AddChild(new CollisionShape3D
+        {
+            Name  = "Body",
+            Shape = new CapsuleShape3D { Radius = CapsuleRadius, Height = CapsuleHeight },
+        });
+        _capsule.CollisionMask   = 0xFFFFFFFF;
+        _capsule.MotionMode      = CharacterBody3D.MotionModeEnum.Grounded;
+        _capsule.UpDirection     = Vector3.Up;
+        _capsule.FloorMaxAngle   = FloorMaxAngleDeg * Mathf.Pi / 180f;
+        _capsule.FloorSnapLength = 1.5f;
+        AddChild(_capsule);
+
+        float capY = CapsuleHeight * 0.5f + 0.05f;
+
+        // From the WEST (deep in Pit A, x=15) sprinting EAST (+X) across x=40.
+        _scenarios.Add(new Scenario { Name = "west_to_east", Start = new Vector3(15f, capY, 11f), Dir = new Vector3(1, 0, 0), Limit = BoundaryX, FromWest = true });
+        // From the EAST (deep in Pit B, x=65) sprinting WEST (-X) across x=40.
+        _scenarios.Add(new Scenario { Name = "east_to_west", Start = new Vector3(65f, capY, 11f), Dir = new Vector3(-1, 0, 0), Limit = BoundaryX, FromWest = false });
+        // Spawned STRADDLING the exact old coincident boundary plane (x=40.0
+        // exactly) — the most literal version of "sandwiched between two
+        // opposing paper films". No drive input: just settle physics and see
+        // whether it resolves to a stable rest position on one side (fixed)
+        // or stays stuck exactly on the seam / oscillates (still trapped).
+        _scenarios.Add(new Scenario { Name = "spawn_on_seam", Start = new Vector3(BoundaryX, capY, 11f), Dir = Vector3.Zero, Limit = BoundaryX, FromWest = true, SpawnOnSeam = true });
+
+        StartScenario(0);
+    }
+
+    // ── Part 1: static shape-overlap probes exactly on the shared boundary ──
+    void RunStaticProbes()
+    {
+        GD.Print("── Part 1: static shape-overlap probes on the shared pit divider ──");
+        var space = GetWorld3D().DirectSpaceState;
+        var shape = new CapsuleShape3D { Radius = CapsuleRadius, Height = CapsuleHeight };
+
+        (string label, float x, float y)[] probes =
+        {
+            ("on boundary, near floor",   BoundaryX,       1.0f),
+            ("on boundary, mid wall",     BoundaryX,       9.0f),
+            ("on boundary, near top",     BoundaryX,      16.0f),
+            ("inside Pit A's slab only",  BoundaryX-0.2f,  9.0f),
+            ("inside Pit B's slab only",  BoundaryX+0.2f,  9.0f),
+        };
+
+        foreach (var (label, x, y) in probes)
+        {
+            var q = new PhysicsShapeQueryParameters3D
+            {
+                Shape      = shape,
+                Transform  = new Transform3D(Basis.Identity, new Vector3(x, y, 11f)),
+                CollideWithBodies = true,
+                CollideWithAreas  = false,
+            };
+            var hits = space.IntersectShape(q, 4);
+            Check(hits.Count > 0, $"probe '{label}' at x={x:F2},y={y:F1} collides with solid geometry (found {hits.Count} overlap(s))");
+        }
+
+        // Negative control: a probe far from any geometry (deep in open air
+        // above the maze) must NOT collide — proves the detector can tell
+        // "solid" from "empty", so the PASSes above aren't vacuous.
+        var farQ = new PhysicsShapeQueryParameters3D
+        {
+            Shape     = shape,
+            Transform = new Transform3D(Basis.Identity, new Vector3(BoundaryX, 200f, 25f)),
+        };
+        var farHits = space.IntersectShape(farQ, 4);
+        Check(farHits.Count == 0, "sanity: a probe far from any geometry (y=200) finds nothing — detector isn't vacuously true");
+    }
+
+    void StartScenario(int idx)
+    {
+        _idx = idx;
+        var s = _scenarios[idx];
+        _dir = s.Dir;
+        _capsule.Velocity = Vector3.Zero;
+        _capsule.GlobalPosition = s.Start;
+        _capsule.ResetPhysicsInterpolation();
+        _t = 0f;
+        _settleLeft = SettleFrames;
+        _lateralPhase = false;
+        GD.Print($"[TestPitDividerCollision] === START {s.Name} start=({s.Start.X:F2},{s.Start.Y:F2},{s.Start.Z:F2}) dir=({_dir.X:F0},0,{_dir.Z:F0}) ===");
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_finished || _idx < 0 || _idx >= _scenarios.Count) return;
+        float dt = (float)delta;
+        bool onFloor = _capsule.IsOnFloor();
+        var vel = _capsule.Velocity;
+
+        if (_settleLeft > 0)
+        {
+            vel.X = 0f; vel.Z = 0f;
+            vel.Y = onFloor ? -0.5f : vel.Y - Gravity * dt;
+            _capsule.Velocity = vel;
+            _capsule.MoveAndSlide();
+            _settleLeft--;
+            return;
+        }
+
+        if (!_lateralPhase)
+        {
+            // Drive phase: sprint straight at the boundary.
+            if (onFloor) { vel.X = _dir.X * SprintSpeed; vel.Z = _dir.Z * SprintSpeed; vel.Y = -0.5f; }
+            else vel.Y -= Gravity * dt;
+            _capsule.Velocity = vel;
+            _capsule.MoveAndSlide();
+            _t += dt;
+
+            if (_t >= DriveDurationSec)
+            {
+                var s = _scenarios[_idx];
+                var pos = _capsule.GlobalPosition;
+
+                if (s.SpawnOnSeam)
+                {
+                    // Spawned exactly straddling the old coincident boundary
+                    // (no drive input — Dir=Zero — so this phase is pure
+                    // depenetration/settle). A healthy resolution pushes the
+                    // capsule cleanly off the seam to one side; a genuine
+                    // "sandwiched" deadlock would leave it still centred near
+                    // x=40, or fling it to an absurd position (NaN/explosion).
+                    float offSeam = Mathf.Abs(pos.X - s.Limit);
+                    Check(offSeam > 0.05f, $"{s.Name}: settled OFF the exact seam, not stuck on it (|pos.X-{s.Limit:F0}|={offSeam:F3})");
+                    Check(Mathf.IsFinite(pos.X) && Mathf.Abs(pos.X - s.Limit) < 5f,
+                        $"{s.Name}: resolved position is sane, not flung/exploded (pos.X={pos.X:F3})");
+                }
+                else
+                {
+                    bool crossed = s.FromWest ? pos.X > s.Limit + 0.1f : pos.X < s.Limit - 0.1f;
+                    Check(!crossed, $"{s.Name}: capsule did NOT tunnel through the divider (pos.X={pos.X:F3}, boundary={s.Limit:F1})");
+                }
+
+                // Now test lateral (Z-axis) mobility while pressed against the
+                // wall — a trapped/sandwiched capsule would be frozen even
+                // sideways; a normally-blocked one slides freely along the wall.
+                _lateralPhase = true;
+                _lateralStartZ = pos.Z;
+                _t = 0f;
+            }
+            return;
+        }
+
+        // Lateral-mobility phase: push sideways (+Z) while still pressing
+        // into the wall along the original axis.
+        vel.X = _dir.X * SprintSpeed * 0.3f;
+        vel.Z = 8f;
+        vel.Y = onFloor ? -0.5f : vel.Y - Gravity * dt;
+        _capsule.Velocity = vel;
+        _capsule.MoveAndSlide();
+        _t += dt;
+
+        if (_t >= LateralCheckSec)
+        {
+            var s = _scenarios[_idx];
+            var pos = _capsule.GlobalPosition;
+            float moved = pos.Z - _lateralStartZ;
+            Check(moved > 1.0f, $"{s.Name}: capsule still has normal lateral mobility while pressed against the wall (moved {moved:F2}m sideways in {LateralCheckSec:F1}s — not trapped/frozen)");
+
+            if (_idx + 1 < _scenarios.Count)
+            {
+                StartScenario(_idx + 1);
+            }
+            else
+            {
+                _finished = true;
+                GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+                GetTree().Quit(_failures == 0 ? 0 : 1);
+            }
+        }
+    }
+}

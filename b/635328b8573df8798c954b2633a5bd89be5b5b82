@@ -1,0 +1,227 @@
+using Godot;
+using System.Collections.Generic;
+
+/// res://test/TestGunRange.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Headless gun range. Drives GunCombat directly — no player input, no camera —
+/// and reports time-to-kill for every gun in both pools at several distances.
+///
+/// This is the "easy to test" half of the gun work: TTK is the number that
+/// decides whether a fight feels good, and this prints it in a couple of seconds
+/// instead of requiring a live playtest per tuning change.
+///
+/// Run: set project.godot run/main_scene to res://test/TestGunRange.tscn, then
+///   godot --headless --fixed-fps 60 --quit-after 900
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestGunRange : Node3D
+{
+    const float TargetHp = 100f;
+
+    // Distances that matter: point blank, corridor length (a 10 m cell), and
+    // across the arena.
+    static readonly float[] Distances = { 3f, 10f, 25f };
+
+    readonly List<string> _report = new();
+
+    StaticBody3D  _shooter = null!;
+    GunCombat     _gun     = null!;
+    CharacterBody3D? _target;
+    PlayerHealth  _targetHp = null!;
+
+    int   _gunIdx = 0, _distIdx = 0;
+    int   _shots  = 0;
+    float _elapsed = 0f;
+    bool  _done = false;
+
+    static readonly string[] AllGuns =
+    {
+        "mac10", "pew", "shotgun",          // starter pool
+        "awp", "ak47", "rocketlaucher", "quadrocket",  // arena pool
+    };
+
+    public override void _Ready()
+    {
+        // Floor, so rockets have something to detonate against if they droop.
+        var floor = new StaticBody3D { Name = "Floor" };
+        floor.AddChild(new CollisionShape3D
+        {
+            Shape = new BoxShape3D { Size = new Vector3(200f, 1f, 200f) },
+        });
+        floor.Position = new Vector3(0f, -2.5f, 0f);
+        AddChild(floor);
+
+        // Shooter: a bare body that owns a GunCombat. GunCombat only needs a
+        // Node3D parent (and a CollisionObject3D to exclude itself from raycasts).
+        _shooter = new StaticBody3D { Name = "Shooter" };
+        AddChild(_shooter);
+        _shooter.GlobalPosition = Vector3.Zero;
+
+        _gun = new GunCombat { CombatTeam = 0 };
+        _shooter.AddChild(_gun);
+
+        DumpGunAabbs();
+        CheckReloadAndAds();
+        StartCase();
+    }
+
+    /// Asserts two rules that are easy to break silently:
+    ///   1. Every gun can be reloaded at ANY time from a partial magazine, and a
+    ///      reload always refills to full — there is no reserve pool, so a player
+    ///      can never be starved of ammo.
+    ///   2. Only the AWP (the one scoped gun) can enter ADS.
+    void CheckReloadAndAds()
+    {
+        GD.Print("═══ RELOAD + ADS RULES ═══");
+        foreach (var id in AllGuns)
+        {
+            _gun.Equip(id);
+            var def = GunCombat.Defs[id];
+
+            // Spend a single round, then ask to reload immediately.
+            var origin = new Vector3(0f, 1.6f, 0f);
+            var dir    = new Vector3(0f, 0f, -1f);
+            _gun.RequestAttack();
+            _gun.Tick(0.016f, origin, dir, 0f, false);
+            int afterShot = _gun.Ammo;
+
+            _gun.RequestReload();
+            _gun.Tick(0.016f, origin, dir, 0f, false);
+            bool started = _gun.IsReloading;
+
+            // Run the reload out and confirm it refills to a full magazine.
+            for (float t = 0f; t < def.ReloadDur + 0.5f; t += 0.016f)
+                _gun.Tick(0.016f, origin, dir, 0f, false);
+            bool refilled = _gun.Ammo == _gun.MagSize;
+
+            // ADS gate.
+            _gun.SetAiming(true);
+            bool aims = _gun.IsAiming;
+            _gun.SetAiming(false);
+
+            bool adsOk = aims == (id == "awp");
+            GD.Print($"  {def.Display,-16} shot->{afterShot,3}/{_gun.MagSize,-3} " +
+                     $"reload-on-partial={(started ? "yes" : "NO ")} " +
+                     $"refilled={(refilled ? "yes" : "NO ")} " +
+                     $"ads={(aims ? "yes" : "no ")} " +
+                     $"{(started && refilled && adsOk ? "OK" : "*** FAIL ***")}");
+        }
+        GD.Print("══════════════════════════");
+    }
+
+    /// Print each model's local AABB so the barrel axis can be identified and the
+    /// per-gun viewmodel rotation set correctly (a gun pointing sideways on screen
+    /// is the single most obvious way a viewmodel looks wrong).
+    static void DumpGunAabbs()
+    {
+        GD.Print("═══ GUN MODEL AABBs (size + centre, model-local) ═══");
+        foreach (var id in AllGuns)
+        {
+            var def = GunCombat.Defs[id];
+            if (!ResourceLoader.Exists(def.Model)) { GD.Print($"  {id}: MISSING"); continue; }
+            var scene = GD.Load<PackedScene>(def.Model);
+            if (scene == null) { GD.Print($"  {id}: LOAD FAIL"); continue; }
+
+            var root = scene.Instantiate<Node3D>();
+            var a    = GunCombat.MeasureAabb(root);
+            var sz   = a.Size;
+            var ctr  = a.GetCenter();
+            string longest = sz.X >= sz.Y && sz.X >= sz.Z ? "X"
+                           : sz.Y >= sz.Z                 ? "Y" : "Z";
+            GD.Print($"  {id,-16} size=({sz.X,6:F2},{sz.Y,6:F2},{sz.Z,6:F2}) " +
+                     $"centre=({ctr.X,6:F2},{ctr.Y,6:F2},{ctr.Z,6:F2}) longest={longest}");
+            root.Free();
+        }
+        GD.Print("════════════════════════════════════════════════════");
+    }
+
+
+    void StartCase()
+    {
+        _gun.Equip(AllGuns[_gunIdx]);
+        _gun.CombatTeam = 0;
+        // PlayerHealth latches _dead permanently, so a fresh target per case is
+        // the only honest reset — healing a corpse leaves it unhittable.
+        RebuildTarget();
+        _shots   = 0;
+        _elapsed = 0f;
+    }
+
+    void RebuildTarget()
+    {
+        if (_target != null && IsInstanceValid(_target))
+        {
+            RemoveChild(_target);
+            _target.QueueFree();
+        }
+
+        _target = new CharacterBody3D { Name = "Target" };
+        _target.AddChild(new CollisionShape3D
+        {
+            // Capsule centred at +0.9 so the body origin sits at the feet, matching
+            // PlayerController — this is what makes the head/leg thresholds valid.
+            Shape    = new CapsuleShape3D { Radius = 0.4f, Height = 1.8f },
+            Position = new Vector3(0f, 0.9f, 0f),
+        });
+        _targetHp = new PlayerHealth { Name = "PlayerHealth" };
+        _target.AddChild(_targetHp);
+        AddChild(_target);
+        _target.GlobalPosition = new Vector3(0f, 0f, -Distances[_distIdx]);
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_done) return;
+
+        float dt = (float)delta;
+        _elapsed += dt;
+
+        // Aim dead centre of mass, from roughly eye height.
+        var origin = _shooter.GlobalPosition + Vector3.Up * 1.6f;
+        if (_target == null) return;
+        var aimAt  = _target.GlobalPosition + Vector3.Up * 1.0f;
+        var dir    = (aimAt - origin).Normalized();
+
+        int before = _gun.Ammo;
+        _gun.RequestAttack();
+        _gun.Tick(dt, origin, dir, 0f, false);   // standing still, grounded
+        if (_gun.Ammo < before) _shots++;
+
+        bool dead    = _targetHp.CurrentHealth <= 0f;
+        bool timeout = _elapsed > 12f;
+
+        if (dead || timeout)
+        {
+            string gunName = GunCombat.Defs[AllGuns[_gunIdx]].Display;
+            _report.Add(dead
+                ? $"  {gunName,-16} @ {Distances[_distIdx],5:F1} m : " +
+                  $"{_shots,3} shots, {_elapsed,5:F2} s"
+                : $"  {gunName,-16} @ {Distances[_distIdx],5:F1} m : " +
+                  $"NO KILL in 12 s ({_shots} shots, " +
+                  $"{_targetHp.CurrentHealth:F0} HP left)");
+
+            Advance();
+        }
+    }
+
+    void Advance()
+    {
+        _distIdx++;
+        if (_distIdx >= Distances.Length)
+        {
+            _distIdx = 0;
+            _gunIdx++;
+        }
+        if (_gunIdx >= AllGuns.Length) { Finish(); return; }
+        StartCase();
+    }
+
+    void Finish()
+    {
+        _done = true;
+        GD.Print("");
+        GD.Print("═══ GUN RANGE — time to kill vs 100 HP, standing still ═══");
+        foreach (var line in _report) GD.Print(line);
+        GD.Print("══════════════════════════════════════════════════════════");
+        GetTree().Quit();
+    }
+}

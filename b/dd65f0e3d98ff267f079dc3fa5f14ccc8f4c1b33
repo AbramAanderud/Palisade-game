@@ -1,0 +1,156 @@
+using Godot;
+
+/// test/TestGunTuning.cs
+/// Headless proof for the 2026-09-27 gun pass:
+///
+///   RELOAD  — taking a hit mid-reload no longer cancels it, and airborne/fast
+///             ticks never did; a weapon SWAP still ends it.
+///   AWP     — 75 body damage; bullet radius hits a 0.15 m near miss, still
+///             misses a 0.65 m one, and a head-height near miss is BODY damage.
+///   ROCKET  — soft homing curls a rocket into a target 3 m off its line, and
+///             ignores one outside the 22° cone.
+///   SHOTGUN — 10 per pellet.
+///
+/// Lanes sit 100 m apart so no assist or homing scan can reach a neighbour.
+public partial class TestGunTuning : Node3D
+{
+    const float Lane = 100f;
+
+    PlayerHealth _awpNear = null!, _awpFar = null!, _awpHead = null!;
+    PlayerHealth _homeIn  = null!, _homeOut = null!;
+    GunCombat    _reloadGun = null!;
+    int  _tick;
+    int  _fail;
+
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    /// A player-shaped opponent: same capsule as PlayerController, in the
+    /// "players" group, with a PlayerHealth — everything assist/homing key on.
+    PlayerHealth Target(Vector3 at, string name)
+    {
+        var b = new StaticBody3D { Name = name };
+        b.AddChild(new CollisionShape3D
+        {
+            Shape = new CapsuleShape3D { Radius = 0.35f, Height = 1.6f },
+        });
+        var h = new PlayerHealth { Name = "PlayerHealth" };
+        b.AddChild(h);
+        AddChild(b);
+        b.GlobalPosition = at;
+        b.AddToGroup("players");
+        return h;
+    }
+
+    GunCombat Shooter(Vector3 at, string gun)
+    {
+        var s = new StaticBody3D { Name = "Shooter_" + gun };
+        AddChild(s);
+        s.GlobalPosition = at;
+        var g = new GunCombat { CombatTeam = 0 };
+        s.AddChild(g);
+        g.Equip(gun);
+        return g;
+    }
+
+    public override void _Ready()
+    {
+        // Lane 0: reload.
+        _reloadGun = Shooter(new Vector3(-Lane, 1.6f, 0f), "ak47");
+
+        // Lanes 1-3: AWP bullet radius. Targets centred at y=1 (feet at 0.2).
+        _awpNear = Target(new Vector3(Lane * 1 + 0.50f, 1f, -20f), "AwpNear");  // gap 0.15
+        _awpFar  = Target(new Vector3(Lane * 2 + 1.00f, 1f, -20f), "AwpFar");   // gap 0.65
+        _awpHead = Target(new Vector3(Lane * 3,         1f, -20f), "AwpHead");  // ray over the head
+
+        // Lanes 4-5: homing. Rocket flies -Z at y=1.
+        _homeIn  = Target(new Vector3(Lane * 4 + 3f, 1f, -25f), "HomeIn");      // ~6.8° off
+        _homeOut = Target(new Vector3(Lane * 5 + 5f, 1f, -10f), "HomeOut");     // ~26.6° off
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        float dt = (float)delta;
+        _tick++;
+
+        // Let the physics space register the bodies before any query.
+        if (_tick == 3) FireEverything();
+
+        // Reload lane: run the gun "mid-bhop" (fast + airborne) the whole time.
+        _reloadGun.Tick(dt, new Vector3(-Lane, 1.6f, 0f), Vector3.Forward, 20f, true);
+        if (_tick == 10) _reloadGun.InterruptByHit();
+
+        if (_tick == 150) Finish();
+    }
+
+    void FireEverything()
+    {
+        // ── Reload ──
+        _reloadGun.RequestAttack();
+        _reloadGun.Tick(0.016f, new Vector3(-Lane, 1.6f, 0f), Vector3.Forward, 0f, false);
+        _reloadGun.RequestReload();
+        _reloadGun.Tick(0.016f, new Vector3(-Lane, 1.6f, 0f), Vector3.Forward, 0f, false);
+        Check(_reloadGun.IsReloading && _reloadGun.Ammo == 29, "AK reload started (29/30)");
+
+        // ── AWP ── straight down -Z from eye height 1.6 (target mid-body).
+        foreach (int lane in new[] { 1, 2 })
+        {
+            var g = Shooter(new Vector3(Lane * lane, 1.6f, 0f), "awp");
+            g.RequestAttack();
+            g.Tick(0.016f, new Vector3(Lane * lane, 1.6f, 0f), Vector3.Forward, 0f, false);
+        }
+        // Head lane: ray at y=1.9, 0.10 m above the capsule top (1.8).
+        var gh = Shooter(new Vector3(Lane * 3, 1.9f, 0f), "awp");
+        gh.RequestAttack();
+        gh.Tick(0.016f, new Vector3(Lane * 3, 1.9f, 0f), Vector3.Forward, 0f, false);
+
+        // ── Rockets ── owners in-tree so the direct hit deals real damage.
+        foreach (int lane in new[] { 4, 5 })
+        {
+            var owner = new GunCombat { CombatTeam = 0 };
+            var host  = new StaticBody3D();
+            AddChild(host);
+            host.GlobalPosition = new Vector3(Lane * lane, 1f, 2f);
+            host.AddChild(owner);
+            Rocket.Spawn(this, new Vector3(Lane * lane, 1f, 0f), Vector3.Forward,
+                         GunCombat.Defs["rocketlaucher"], owner);
+        }
+    }
+
+    void Finish()
+    {
+        // Reload: 1.6 s at 60 Hz ≈ 96 ticks from tick 3 — done by 150.
+        Check(Mathf.IsEqualApprox(GunCombat.Defs["ak47"].ReloadDur, 1.6f), "AK reload is 1.6 s");
+        Check(!_reloadGun.IsReloading && _reloadGun.Ammo == 30,
+              "reload finished through a hit + airborne/fast ticks (30/30)");
+
+        // Swap still cancels.
+        var sw = Shooter(new Vector3(-Lane * 2, 1.6f, 0f), "ak47");
+        sw.RequestAttack();
+        sw.Tick(0.016f, Vector3.Zero, Vector3.Forward, 0f, false);
+        sw.RequestReload();
+        sw.Tick(0.016f, Vector3.Zero, Vector3.Forward, 0f, false);
+        sw.SwitchTo("pew");
+        Check(!sw.IsReloading, "weapon swap still ends the reload");
+
+        Check(Mathf.IsEqualApprox(_awpNear.CurrentHealth, 25f),
+              $"AWP 0.15 m near miss hits for 75 (hp {_awpNear.CurrentHealth})");
+        Check(Mathf.IsEqualApprox(_awpFar.CurrentHealth, 100f),
+              $"AWP 0.65 m miss stays a miss (hp {_awpFar.CurrentHealth})");
+        Check(Mathf.IsEqualApprox(_awpHead.CurrentHealth, 25f),
+              $"AWP head-height near miss is BODY damage, not a one-shot (hp {_awpHead.CurrentHealth})");
+
+        Check(_homeIn.CurrentHealth < 100f,
+              $"rocket homes into a target 3 m off its line (hp {_homeIn.CurrentHealth})");
+        Check(Mathf.IsEqualApprox(_homeOut.CurrentHealth, 100f),
+              $"target outside the 22° cone is ignored (hp {_homeOut.CurrentHealth})");
+
+        Check(Mathf.IsEqualApprox(GunCombat.Defs["shotgun"].Damage, 10f), "shotgun pellet is 10");
+
+        GD.Print(_fail == 0 ? "RESULT OK" : $"RESULT {_fail} FAILURE(S)");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

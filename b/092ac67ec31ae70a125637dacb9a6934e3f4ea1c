@@ -1,0 +1,77 @@
+using System;
+using System.Linq;
+using Godot;
+
+/// Headless assertion harness for trap metadata and pairing logic.
+public partial class TestTraps : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    static readonly PieceType[] AllTraps =
+    {
+        PieceType.TrapIce, PieceType.TrapTar, PieceType.TrapDark, PieceType.TrapDoor,
+        PieceType.TrapGate, PieceType.TrapPush, PieceType.TrapPortal, PieceType.TrapGrease,
+    };
+
+    public override void _Ready()
+    {
+        GD.Print("── TrapDB ──");
+
+        foreach (var t in AllTraps)
+        {
+            Check(TrapDB.IsTrap(t), $"{t} is a trap");
+            Check(PieceDB.CategoryOf(t) == PieceCategory.Traps, $"{t} is in the Traps tab");
+            Check(PieceDB.Colors.ContainsKey(t),      $"{t} has a Color");
+            Check(PieceDB.Labels.ContainsKey(t),      $"{t} has a Label");
+            Check(PieceDB.ShortLabels.ContainsKey(t), $"{t} has a ShortLabel");
+            Check(PieceDB.GoldCosts.ContainsKey(t),   $"{t} has a GoldCost");
+
+            // Every trap is a straight corridor as far as the rest of the codebase
+            // is concerned. That is what lets validator BFS, DungeonBuilder.AddPiece
+            // and editor placement accept traps with zero changes.
+            Dir open = PieceDB.GetOpenings(t, 0);
+            Check(open == (Dir.N | Dir.S), $"{t} at rot=0 opens N|S like a Straight");
+            Check(!PieceDB.IsStair(t),     $"{t} is not a stair");
+            Check(!PieceDB.IsMultiCell(t), $"{t} is single-cell");
+        }
+
+        Check(!TrapDB.IsTrap(PieceType.Straight), "Straight is not a trap");
+        Check(!TrapDB.IsTrap(PieceType.Cross),    "Cross is not a trap");
+
+        // Only the gate and the push tile care which way they face.
+        Check(TrapDB.IsDirectional(PieceType.TrapGate), "gate is directional");
+        Check(TrapDB.IsDirectional(PieceType.TrapPush), "push tile is directional");
+        Check(!TrapDB.IsDirectional(PieceType.TrapIce), "ice is not directional");
+        Check(!TrapDB.IsDirectional(PieceType.TrapTar), "tar is not directional");
+
+        // Every trap needs an editor glyph, and glyphs must be distinguishable —
+        // the whole point is that a maze author can read the trap at a glance.
+        var glyphs = AllTraps.Select(TrapDB.Glyph).ToArray();
+        Check(glyphs.Distinct().Count() == AllTraps.Length,
+              "every trap has a distinct editor glyph");
+
+        // Editor colors must be distinct too.
+        var colors = AllTraps.Select(t => PieceDB.Colors[t]).ToArray();
+        Check(colors.Distinct().Count() == AllTraps.Length,
+              "every trap has a distinct editor color");
+
+        // Tuning values must actually hinder, in the right direction.
+        Check(TrapDB.IceFrictionMul  < 1f && TrapDB.IceFrictionMul  > 0f, "ice reduces friction");
+        Check(TrapDB.IceAccelMul     < 1f && TrapDB.IceAccelMul     > 0f, "ice reduces accel");
+        Check(TrapDB.TarSpeedMul     < 1f && TrapDB.TarSpeedMul     > 0f, "tar reduces top speed");
+        Check(TrapDB.TarAccelMul     < 1f && TrapDB.TarAccelMul     > 0f, "tar reduces accel");
+        Check(TrapDB.PushAccel       > 0f, "push tile accelerates");
+        Check(TrapDB.TrapdoorDelay   > 0f, "trapdoor has an opening delay");
+        Check(TrapDB.TrapdoorRearm   > TrapDB.TrapdoorDelay, "trapdoor re-arms after it opens");
+        Check(TrapDB.TeleportCooldown > 0f, "teleport pad has a cooldown");
+
+        GD.Print(_failures == 0 ? "RESULT OK" : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+}

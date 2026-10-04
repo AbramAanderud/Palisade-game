@@ -1,0 +1,57 @@
+/// res://scripts/MazeRotation.cs — rotate a maze's DATA by clockwise quarter turns.
+///
+/// Every piece's openings, stair directions and footprints are defined as
+/// "base shape at rotation 0, turned clockwise once per rotation step"
+/// (PieceDB.RotateCW: N→E→S→W, with N = −Y and E = +X). Turning the whole
+/// 10×10 grid clockwise is therefore exact for EVERY piece type:
+/// (x, y) → (Grid−1−y, x) and rotation + 1. No per-type table is needed —
+/// unlike DungeonArena.FlipMazeZ, which is a MIRROR and so has to remap
+/// chiral pieces one by one. Used by the FFA plus layout for the E/S/W mazes.
+public static class MazeRotation
+{
+    public const int Grid = 10;
+
+    static int Norm(int k) => ((k % 4) + 4) % 4;
+
+    public static (int x, int y) RotateCell(int x, int y, int quarterTurns)
+    {
+        for (int i = 0; i < Norm(quarterTurns); i++) (x, y) = (Grid - 1 - y, x);
+        return (x, y);
+    }
+
+    public static Dir RotateDir(Dir d, int quarterTurns)
+    {
+        for (int i = 0; i < Norm(quarterTurns); i++)
+        {
+            Dir r = Dir.None;
+            if ((d & Dir.N) != 0) r |= Dir.E;
+            if ((d & Dir.E) != 0) r |= Dir.S;
+            if ((d & Dir.S) != 0) r |= Dir.W;
+            if ((d & Dir.W) != 0) r |= Dir.N;
+            d = r;
+        }
+        return d;
+    }
+
+    public static MazeData Rotate(MazeData src, int quarterTurns)
+    {
+        int k = Norm(quarterTurns);
+        var dst = new MazeData
+        {
+            Name = src.Name, GoldSpent = src.GoldSpent,
+            IsOnline = src.IsOnline, IsGameReady = src.IsGameReady,
+        };
+        foreach (var p in src.Pieces)
+        {
+            var (x, y) = RotateCell(p.X, p.Y, k);
+            dst.Pieces.Add(new MazePiece
+            {
+                Type = p.Type, X = x, Y = y, Floor = p.Floor,
+                Rotation  = Norm(p.Rotation + k),
+                LinkId    = p.LinkId,      // teleport pairs survive (see FlipMazeZ's note)
+                RoomGroup = p.RoomGroup,
+            });
+        }
+        return dst;
+    }
+}

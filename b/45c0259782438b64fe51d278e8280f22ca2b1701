@@ -1,0 +1,85 @@
+using Godot;
+
+/// res://scenes/OnlineFfaArena.cs — FFA Phase 4 PLACEHOLDER, to be replaced by the
+/// real 3–4 player arena in Phase 5. It only proves the hand-off from
+/// FfaPreGameLobby: it shows the OnlineGameState FFA fields set on ffa_start and
+/// logs relay peer_left notices (updating FfaHostSeat).
+public partial class OnlineFfaArena : Control
+{
+    NetworkManager _nm = null!;
+    FontFile?      _font;
+    Label          _hostLabel = null!;
+    Label          _leftLog   = null!;
+    bool           _leaving;
+
+    /// Number of peer_left notices received (read by tests).
+    public int PeerLeftCount { get; private set; }
+
+    public override void _Ready()
+    {
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+        _font = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
+        _nm = GetNode<NetworkManager>("/root/NetworkManager");
+        _nm.PeerLeft += OnPeerLeft;
+
+        SetAnchorsPreset(LayoutPreset.FullRect);
+        var bg = new ColorRect { Color = Colors.Black };
+        bg.SetAnchorsPreset(LayoutPreset.FullRect);
+        AddChild(bg);
+
+        var stack = new VBoxContainer { Alignment = BoxContainer.AlignmentMode.Center };
+        stack.SetAnchorsPreset(LayoutPreset.FullRect);
+        stack.AddThemeConstantOverride("separation", 14);
+        AddChild(stack);
+
+        stack.AddChild(MakeLabel("FREE FOR ALL", 64, Colors.White));
+        _hostLabel = MakeLabel("", 20, new Color(0.75f, 0.75f, 0.5f));
+        stack.AddChild(_hostLabel);
+        UpdateHostLabel();
+        foreach (var e in OnlineGameState.FfaRoster)
+        {
+            bool mine = e.Seat == OnlineGameState.FfaSeat;
+            stack.AddChild(MakeLabel($"Seat {e.Seat}: {e.Name}{(mine ? "  (you)" : "")}", 22,
+                mine ? new Color(0.45f, 0.85f, 1.0f) : Colors.White));
+        }
+        stack.AddChild(MakeLabel("Arena coming in the next update", 16, new Color(0.5f, 0.5f, 0.5f)));
+        _leftLog = MakeLabel("", 16, new Color(1.0f, 0.5f, 0.45f));
+        stack.AddChild(_leftLog);
+
+        MenuUI.AddBackButton(this, _font, OnBack);
+    }
+
+    public override void _ExitTree()
+    {
+        if (_nm != null) _nm.PeerLeft -= OnPeerLeft;
+    }
+
+    void OnPeerLeft(int seat, int hostSeat)
+    {
+        PeerLeftCount++;
+        OnlineGameState.FfaHostSeat = hostSeat;
+        _leftLog.Text += (_leftLog.Text == "" ? "" : "\n") + $"Seat {seat} left (host is now seat {hostSeat})";
+        UpdateHostLabel();
+    }
+
+    void UpdateHostLabel() =>
+        _hostLabel.Text = $"Seat {OnlineGameState.FfaSeat} · host seat {OnlineGameState.FfaHostSeat}";
+
+    void OnBack()
+    {
+        if (_leaving) return;
+        _leaving = true;
+        _nm.PartyLeave();
+        _nm.Disconnect();
+        GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn");
+    }
+
+    Label MakeLabel(string text, int size, Color color)
+    {
+        var lbl = new Label { Text = text, HorizontalAlignment = HorizontalAlignment.Center };
+        if (_font != null) lbl.AddThemeFontOverride("font", _font);
+        lbl.AddThemeFontSizeOverride("font_size", size);
+        lbl.AddThemeColorOverride("font_color", color);
+        return lbl;
+    }
+}

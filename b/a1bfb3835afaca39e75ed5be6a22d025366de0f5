@@ -1,0 +1,2909 @@
+using System;
+using System.Collections.Generic;
+using Godot;
+
+/// res://scripts/PlayerController.cs
+/// Movement system:
+///   Walk          — WASD, 6 m/s
+///   Sprint        — Shift, 11 m/s
+///   Crouch walk   — Ctrl while walking (not sprinting), 2.5 m/s, camera lowers
+///   Slide         — Ctrl while sprinting OR landing fast from air; camera lowest
+///   Slide-jump    — Space during slide; big horizontal + vertical launch
+///   Wall-run      — lean into a wall while airborne, gravity pauses 2 s
+///   Wall-jump     — Space during wall-run; kick off with directional boost
+public partial class PlayerController : CharacterBody3D
+{
+    // ── Speed constants ────────────────────────────────────────────────────────
+    const float WalkSpeed      = 5.5f;
+    const float SprintSpeed    = 8.0f;
+    const float CrouchSpeed    = 2.5f;
+
+    const float GroundAccel    = 55.0f;   // m/s² — how fast you reach target walk/sprint speed
+    const float SprintAccel    = 45.0f;   // m/s² — slightly slower buildup while sprinting
+    const float GroundFriction = 70.0f;   // m/s² — very snappy stop when no input
+    const float AirAccel       = 4f;
+    const float Gravity        = 22f;
+    const float JumpSpeed      = 10.5f;
+    const float JumpFwdBoost   = 0.7f;      // base forward nudge — scales up with momentum
+    const float CoyoteTime     = 0.12f;
+    const float LandFriction   = 0.7f;      // horizontal velocity kept on landing with no input (kills ice-drift)
+
+    // ── Slide constants ────────────────────────────────────────────────────────
+    const float SlideBoostFactor = 1.8f;    // entry = current_speed * factor
+    const float SlideMinEntry    = 12.0f;   // minimum entry speed (burst even from slow walk)
+    const float SlideMaxEntry    = 32.0f;   // cap to prevent absurd speeds
+    const float SlideGrace       = 0.30f;   // no-friction window at slide start
+    const float SlideFriction    = 7.0f;    // deceleration after grace
+    const float SlideMinSpeed    = 4.0f;    // slide ends below this
+    const float SlideJumpV       = 12.0f;   // vertical launch on slide-jump
+    const float LandSlideMin     = 8.0f;    // fall speed to trigger auto-slide on land
+
+    // ── Momentum system ────────────────────────────────────────────────────────
+    const float MomentumDecayRate    = 2.0f;    // fast decay when braking or stopped
+    const float MomentumSprintDecay  = 0.10f;   // slow drain while actively sprinting
+    const float MomentumAirDecayRate = 0.15f;   // slow air drain — preserves bhop momentum
+    const float MomentumSlideBonus   = 0.20f;
+    const float MomentumJumpBonus    = 0.20f;   // meaningful per-hop build for bhopping
+    const float MomentumWallBonus    = 0.15f;
+    const float MomentumMax          = 3.0f;    // hard clamp so FOV / lunge / wall-run stay sane
+    float _momentum = 0f;
+
+    // ── Bunny-hop (bhop) ────────────────────────────────────────────────────────
+    // Chained jumps out-accelerate sprinting: each hop adds a momentum-scaled
+    // forward boost, the air preserves it, and the ground only bleeds it gently —
+    // so ~2 well-timed hops already beat the flat sprint speed, climbing to BhopMaxSpeed.
+    const float BhopJumpScale = 2.5f;    // forward speed added per unit of momentum, per jump
+    const float BhopMaxSpeed  = 16.0f;   // hard ceiling on bhop horizontal speed
+    const float BhopBleed     = 8.0f;    // gentle ground decel when carrying speed above sprint
+
+    // ── Sustained sprint ramp ──────────────────────────────────────────────────
+    // After SprintRampTime seconds of continuous sprinting you get a flat speed bonus.
+    const float SprintRampTime  = 3.0f;
+    const float SprintRampBonus = 0.15f;  // +15% sprint speed after 3 s
+    float _sprintTime = 0f;
+
+    // ── Camera heights ─────────────────────────────────────────────────────────
+    // Model root is 0.9 m below origin; UAL1 eye socket ≈ 0.74 m above origin.
+    // Body is on visual layer 2 — FP camera excludes that layer, so no inside-mesh hacks needed.
+    const float EyeHeight   = 0.74f;
+    const float CrouchEyeH = 0.38f;
+    const float SlideEyeH  = 0.26f;
+
+    // ── Wall-run constants ─────────────────────────────────────────────────────
+    const float WallRunSpeed   = 15.0f;
+    const float WallRunAccel   = 4.0f;     // m/s² — gradual, not snappy
+    const float WallRunTime    = 6.0f;
+    const float WallRunGravity = 3.0f;
+    const float WallJumpOff    = 8.0f;
+    const float WallJumpUp     = 11.0f;
+    const float WallRunCooldown= 0.4f;
+
+    // Radians per pixel at sensitivity 1.0. Settings -> Controls multiplies this
+    // by the player's sensitivity number; the base is chosen so the default 2.0
+    // reproduces the old hardcoded 0.002 exactly, leaving existing aim untouched.
+    const float MouseSensBase  = 0.001f;
+    const float DefaultSens    = 2.0f;
+    const float PitchClamp     = 85f * Mathf.Pi / 180f;
+
+    // ── Nodes ─────────────────────────────────────────────────────────────────
+    Camera3D        _cam   = null!;
+    Node3D          _mount = null!;
+    Node3D?         _heldWeapon;   // Node3D wrapper; inner mesh is flipped 180° Y so blade points forward
+
+    // ── Look ──────────────────────────────────────────────────────────────────
+    float _yaw   = 0f;
+    float _pitch = 0f;
+
+    // ── Gun feel ──────────────────────────────────────────────────────────────
+    float _fpGunKick = 0f;   // viewmodel recoil, decays every frame
+    float _adsBlend  = 0f;   // 0 = hipfire, 1 = fully aimed
+
+    // AWP scope — separate from _adsBlend above because a CS:GO-style scope
+    // snap needs to be much faster than the viewmodel pull-in lerp.
+    float _scopeBlend = 0f;             // 0 = unscoped, 1 = fully scoped
+    const float ScopeBlendRate = 12f;   // 1/rate ≈ 0.083 s full swing — snap, not a zoom creep
+
+    // ── Slide state ───────────────────────────────────────────────────────────
+    bool    _sliding        = false;
+    Vector3 _slideDir       = Vector3.Zero;
+    float   _slideSp        = 0f;
+    float   _slideGraceLeft = 0f;   // no-friction burst window at slide start
+    float   _slideMinTimer  = 0f;   // player is locked into the slide for this many seconds
+
+    // ── Crouch state ──────────────────────────────────────────────────────────
+    bool _crouching = false;   // prone crouch walk (Ctrl while walking)
+
+    // ── Wall-run state ────────────────────────────────────────────────────────
+    bool    _wallRunning  = false;
+    float   _wallRunTimer = 0f;
+    float   _wallCooldown = 0f;
+    Vector3 _wallNormal   = Vector3.Zero;
+    float   _wallRollSign = 0f;
+
+    // ── Trap modifiers ────────────────────────────────────────────────────────
+    // Every TrapZone the capsule currently overlaps. Effects combine multiplicatively
+    // so overlapping traps stack without any zone knowing about the others.
+    readonly System.Collections.Generic.HashSet<TrapZone> _trapZones = new();
+    float   _trapFrictionMul = 1f;
+    float   _trapSpeedMul    = 1f;
+    float   _trapAccelMul    = 1f;
+    Vector3 _trapPush        = Vector3.Zero;
+    bool    _trapNoWallRun   = false;
+
+    /// True while a Greased Walls trap forbids starting a wall-run.
+    public bool WallRunBlocked => _trapNoWallRun;
+
+    // ── Trampoline launch ───────────────────────────────────────────────────────
+    // The pit trampoline flings the player up the shaft and, for a short window
+    // afterward, grants much stronger directional air control so they can steer to a
+    // doorway on the way up instead of just arcing ballistically. Constants live here
+    // so the feel is tuned in one place.
+    const float AirBoostAccel = 26f;    // vs the normal AirAccel of 4 — sharp redirect
+    const float AirBoostCap   = 14f;    // lets a boosted redirect actually build speed
+    float _airBoostTimer = 0f;
+
+    /// Fling the player straight up at `upSpeed` and grant the stronger air-control
+    /// window for `boostSeconds`. Horizontal velocity is preserved so a running
+    /// entry still carries across. Called by the pit trampoline.
+    public void LaunchUp(float upSpeed, float boostSeconds)
+    {
+        Velocity = new Vector3(Velocity.X, upSpeed, Velocity.Z);
+        _airBoostTimer = boostSeconds;
+    }
+
+    // Test hooks — expose the combined modifiers so headless tests can assert
+    // stacking/restore behaviour without a running physics frame.
+    internal float   TrapFrictionMul => _trapFrictionMul;
+    internal float   TrapSpeedMul    => _trapSpeedMul;
+    internal float   TrapAccelMul    => _trapAccelMul;
+    internal Vector3 TrapPush        => _trapPush;
+
+    public void EnterTrapZone(TrapZone z)
+    {
+        if (_trapZones.Add(z)) RecomputeTrapModifiers();
+    }
+
+    public void ExitTrapZone(TrapZone z)
+    {
+        if (_trapZones.Remove(z)) RecomputeTrapModifiers();
+    }
+
+    void RecomputeTrapModifiers()
+    {
+        _trapFrictionMul = 1f;
+        _trapSpeedMul    = 1f;
+        _trapAccelMul    = 1f;
+        _trapPush        = Vector3.Zero;
+        _trapNoWallRun   = false;
+
+        // A freed zone can linger in the set for a frame if its node was removed
+        // while we were inside it — drop those rather than dereferencing them.
+        _trapZones.RemoveWhere(z => !IsInstanceValid(z));
+
+        foreach (var z in _trapZones)
+        {
+            _trapFrictionMul *= z.FrictionMul;
+            _trapSpeedMul    *= z.SpeedMul;
+            _trapAccelMul    *= z.AccelMul;
+            _trapPush        += z.PushAccel;
+            if (z.BlocksWallRun) _trapNoWallRun = true;
+        }
+    }
+
+    // ── Coyote time ───────────────────────────────────────────────────────────
+    float _coyote     = 0f;
+    bool  _wasOnFloor = false;
+
+    // ── Landing-slide tracking ─────────────────────────────────────────────────
+    float _airFallSpeed = 0f;
+
+    // ── Sprint grace — slide window after releasing sprint ────────────────────
+    // Does NOT decay in the air so sprint→jump→land→slide still works.
+    const float SprintGrace    = 0.8f;
+    float _sprintGraceTimer    = 0f;
+
+    // ── Stair climbing ────────────────────────────────────────────────────────
+    const float StairDownBoost  = 10f;   // m/s² gravity assist going down stairs
+    const float StairStepHeight = 0.62f; // max riser height to auto-step over
+    float _prevFloorY = 0f;              // floor height last frame, used to detect descent
+
+    // ── Camera smoothing ──────────────────────────────────────────────────────
+    float _camH          = EyeHeight;
+    float _camRoll       = 0f;
+    float _camShakeAmount = 0f;
+
+    // ── Third-person camera ────────────────────────────────────────────────────
+    const float TpDistance      = 6.0f;
+    const float TpDistanceBlock = 5.0f;
+    const float TpElevation     = 2.2f;
+    const float TpElevationSlide= 1.0f;
+    // Third-person orbit is clamped TIGHTER than the look PitchClamp (85 deg).
+    // At +-90 deg the orbit offset is parallel to Vector3.Up, which makes
+    // LookAt's up-vector degenerate and snaps/NaNs the camera basis.
+    const float TpPitchClamp    = 70f * Mathf.Pi / 180f;
+    // How far the aim ray is traced to find the point the third-person reticle
+    // should sit on. Also the fallback distance when the ray hits nothing.
+    const float AimTraceLen     = 200f;
+    bool        _tpMode         = false;
+    Camera3D    _tpCam          = null!;
+    Node3D      _playerBody     = null!;
+    float       _tpDistCurrent  = 5.0f;
+    float       _tpElevCurrent  = 2.5f;
+
+    // ── Weapon node references ─────────────────────────────────────────────────
+    Node3D? _tpWeapon;    // bone-attached holder; RebuildTpGun fills it with the gun model
+    Node3D?         _fpArmsModel; // camera-space arm model (layer 3, FP only)
+
+
+    // ── Camera bob (FP only — moves the camera, not the model) ───────────────
+    float   _camBobPhase  = 0f;
+    Vector3 _camBobOffset = Vector3.Zero;
+
+    // ── Weapon sway (spring simulation driven by mouse input) ─────────────────
+    Vector2 _frameMouseDelta = Vector2.Zero;
+    Vector2 _swayVelocity    = Vector2.Zero;
+    Vector2 _swayOffset      = Vector2.Zero;
+    const float SwayScale  = 0.0025f;
+    const float SwaySpring = 9.0f;
+    const float SwayDamp   = 5.5f;
+    const float SwayLimit  = 0.035f;
+
+    // ── Hold-R reset ──────────────────────────────────────────────────────────
+    float _resetHoldTime = 0f;
+    const float ResetHoldThreshold = 0.5f;
+
+    // ── Death state ───────────────────────────────────────────────────────────
+    bool _isDead = false;
+
+    // ── World-space health+stamina bars (puppet / online opponent) ────────────
+    Node3D? _worldBarRoot;
+
+    // ── Audio ─────────────────────────────────────────────────────────────────
+    AudioStreamPlayer _walkSfx = null!;
+    AudioStreamPlayer _runSfx  = null!;
+    AudioStreamPlayer _jumpSfx = null!;
+    AudioStreamPlayer _landSfx = null!;
+    AudioStreamPlayer _hitSfx  = null!;
+
+    // ── Animator ──────────────────────────────────────────────────────────────
+    PlayerAnimator _animator = null!;
+
+    // ── Combat ────────────────────────────────────────────────────────────────
+    GunCombat _combat = null!;
+
+    // ── Public ────────────────────────────────────────────────────────────────
+    public bool HasWeapon { get; private set; } = false;
+
+    /// Player's current facing direction in world space (yaw only, Y=0).
+    public Vector3 ForwardVector => new Vector3(-Mathf.Sin(_yaw), 0f, -Mathf.Cos(_yaw));
+
+    /// Current combat phase — Idle when the player has no weapon.
+    public GunCombat.Phase PlayerCombatPhase =>
+        HasWeapon ? _combat.CombatPhase : GunCombat.Phase.Idle;
+
+    /// The player's gun, for HUD readout (ammo, reload ring, live spread).
+    public GunCombat? Gun => _combat;
+
+    /// Ammo remaining as 0-100, reusing the network's existing "stam" field so the
+    /// opponent's world bar shows how loaded they are with no protocol change.
+    public float PlayerStamina => _combat != null ? _combat.AmmoFraction * 100f : 100f;
+
+    /// Ammo value received from network for this puppet; drives the world bar.
+    public float PuppetStamina { get; set; } = 100f;
+
+    /// True when this player's gun is empty — the world bar blinks red.
+    public bool IsExhausted    => _combat?.IsEmpty ?? false;
+    /// Exhaustion state received from network for this puppet; drives bar blink.
+    public bool PuppetExhausted { get; set; } = false;
+
+    /// Creates a world-space HP+stamina bar above this player (for online opponent display).
+    public void EnableWorldBars()
+    {
+        if (_worldBarRoot != null) return;
+        _worldBarRoot = EnemyController.BuildBarGroup(1.2f);
+        AddChild(_worldBarRoot);
+    }
+
+    public override void _Process(double delta)
+    {
+        if (_worldBarRoot == null) return;
+
+        const float BarW  = 0.9f;
+        const float HpH   = 0.12f;
+        const float StamH = 0.03f;
+        const float Gap   = 0.005f;
+        float stamY = -(HpH / 2f + Gap + StamH / 2f);
+
+        var health  = GetNodeOrNull<PlayerHealth>("PlayerHealth");
+        float hpFrac = health != null
+            ? Mathf.Clamp(health.CurrentHealth / PlayerHealth.MaxHealth, 0f, 1f) : 1f;
+        var hpFill = _worldBarRoot.GetNodeOrNull<MeshInstance3D>("HpFill");
+        if (hpFill != null)
+        {
+            hpFill.Scale    = new Vector3(Mathf.Max(hpFrac, 0.001f), 1f, 1f);
+            hpFill.Position = new Vector3(BarW * (hpFrac - 1f) / 2f, 0f, 0f);
+        }
+
+        float rawStam  = IsRemotePuppet ? PuppetStamina : PlayerStamina;
+        float maxStam  = 100f;   // ammo is broadcast as a 0-100 fraction
+        float sFrac    = Mathf.Clamp(rawStam / maxStam, 0f, 1f);
+        var   stamFill = _worldBarRoot.GetNodeOrNull<MeshInstance3D>("StamFill");
+        if (stamFill != null)
+        {
+            stamFill.Scale    = new Vector3(Mathf.Max(sFrac, 0.001f), 1f, 1f);
+            stamFill.Position = new Vector3(BarW * (sFrac - 1f) / 2f, stamY, 0f);
+        }
+        if (stamFill != null && IsRemotePuppet)
+        {
+            var mat = stamFill.GetSurfaceOverrideMaterial(0) as StandardMaterial3D;
+            if (mat == null)
+            {
+                mat = new StandardMaterial3D { AlbedoColor = new Color(0.9f, 0.7f, 0.1f) };
+                stamFill.SetSurfaceOverrideMaterial(0, mat);
+            }
+            if (PuppetExhausted)
+            {
+                bool blink = (Time.GetTicksMsec() / 250) % 2 == 0;
+                mat.AlbedoColor = blink ? new Color(1f, 0.1f, 0.1f) : new Color(0.9f, 0.7f, 0.1f);
+            }
+            else
+            {
+                mat.AlbedoColor = new Color(0.9f, 0.7f, 0.1f);
+            }
+        }
+
+        var cam = GetViewport().GetCamera3D();
+        if (cam != null)
+        {
+            var toCamera = cam.GlobalPosition - _worldBarRoot.GlobalPosition;
+            toCamera.Y   = 0f;
+            if (toCamera.LengthSquared() > 0.001f)
+                _worldBarRoot.LookAt(_worldBarRoot.GlobalPosition + toCamera, Vector3.Up);
+        }
+    }
+
+    /// Recoil punch applied to the look angles on every shot. Vertical kick is
+    /// the bulk of it with a small random horizontal component, so a held burst
+    /// climbs predictably enough to fight but never feels rail-straight.
+    void ApplyRecoil(float scale)
+    {
+        _pitch = Mathf.Clamp(_pitch + 0.011f * scale, -PitchClamp, PitchClamp);
+        _yaw  += (GD.Randf() - 0.5f) * 0.006f * scale;
+        _camShakeAmount = Mathf.Max(_camShakeAmount, 0.25f * scale);
+        _fpGunKick      = Mathf.Min(_fpGunKick + 0.35f * scale, 1.6f);
+    }
+
+    void ApplyAimAssist(float maxCorrectionDeg = 15f)
+    {
+        float maxCorrection = maxCorrectionDeg * Mathf.Pi / 180f;
+        const float ScanRadius  = 8f;
+        const float ConeHalfCos = 0.5f;   // cos(60°) — search ±60° in front
+
+        var    fwd     = ForwardVector;
+        Node3D? best   = null;
+        float   bestDot = ConeHalfCos;
+
+        foreach (var node in GetTree().GetNodesInGroup("enemies"))
+        {
+            if (node is not Node3D target) continue;
+            var   toTarget = target.GlobalPosition - GlobalPosition;
+            toTarget.Y     = 0f;
+            float dist     = toTarget.Length();
+            if (dist > ScanRadius || dist < 0.001f) continue;
+            float dot = fwd.Dot(toTarget / dist);
+            if (dot > bestDot) { bestDot = dot; best = target; }
+        }
+
+        if (best == null) return;
+
+        var   toEnemy   = best.GlobalPosition - GlobalPosition;
+        toEnemy.Y       = 0f;
+        toEnemy         = toEnemy.Normalized();
+        float targetYaw = Mathf.Atan2(-toEnemy.X, -toEnemy.Z);
+        float delta     = Mathf.Atan2(Mathf.Sin(targetYaw - _yaw), Mathf.Cos(targetYaw - _yaw));
+        _yaw += Mathf.Clamp(delta, -maxCorrection, maxCorrection);
+        ApplyLook();
+    }
+
+    // ── Remote puppet support ─────────────────────────────────────────────────
+    public bool  IsRemotePuppet { get; set; } = false;
+
+    /// Trigger a strike animation on this puppet ("swing" network message).
+    /// idx 0 = grounded lunge, 1 = aerial glide.
+    public void TriggerPuppetSwing(int idx)
+    {
+        if (idx == 1) _animator.PlayAerialLunge();
+        else          _animator.PlayAttack(0);
+        SpawnSwingArc(idx);
+    }
+    /// Legacy "lunge" network message — maps to an aerial strike.
+    public void TriggerPuppetLunge() => TriggerPuppetSwing(1);
+
+    /// Spawn the cosmetic swing-trail crescent in world space at this character.
+    void SpawnSwingArc(int idx) => SwingArc.Spawn(GetParent<Node3D>() ?? this, GlobalPosition, _yaw, idx);
+
+    /// Show this puppet firing — the opponent shot on their machine, so play the
+    /// shoot pose and a muzzle flash on our screen. Damage arrives separately via
+    /// the existing {"t":"hit"} relay, so this is purely cosmetic.
+    // ── Puppet movement audio ─────────────────────────────────────────────────
+    // The local player's step/jump/land sounds are NON-positional (they're your
+    // own body) and fire from code paths a puppet never runs. The opponent's
+    // version is derived here from the relayed velocity stream and played
+    // through positional emitters on the puppet, so you can HEAR where they are
+    // and what their feet are doing — the classic info channel of every shooter.
+    AudioStreamPlayer3D? _puppetStepSfx, _puppetJumpSfx, _puppetLandSfx;
+    AudioStream? _puppetWalkStream, _puppetRunStream;
+    float _puppetStepDist, _puppetPrevVy;
+
+    void TickPuppetAudio(float dt)
+    {
+        if (_puppetStepSfx == null)
+        {
+            AudioStreamPlayer3D Mk(float maxDist)
+            {
+                var p = new AudioStreamPlayer3D { MaxDistance = maxDist };
+                AddChild(p);
+                return p;
+            }
+            _puppetStepSfx    = Mk(22f);
+            _puppetJumpSfx    = Mk(26f);
+            _puppetLandSfx    = Mk(30f);
+            _puppetWalkStream = GD.Load<AudioStream>("res://assets/audio/sfx/movement/Walk.wav");
+            _puppetRunStream  = GD.Load<AudioStream>("res://assets/audio/sfx/movement/Run.wav");
+            if (ResourceLoader.Exists("res://assets/audio/sfx/movement/Jump.wav"))
+                _puppetJumpSfx.Stream = GD.Load<AudioStream>("res://assets/audio/sfx/movement/Jump.wav");
+            if (ResourceLoader.Exists("res://assets/audio/sfx/movement/Land.wav"))
+                _puppetLandSfx.Stream = GD.Load<AudioStream>("res://assets/audio/sfx/movement/Land.wav");
+        }
+
+        float vy   = _puppetTargetVel.Y;
+        float hSpd = new Vector2(_puppetTargetVel.X, _puppetTargetVel.Z).Length();
+        bool  grounded = Mathf.Abs(vy) < 1.5f;   // no real floor query on a mirror
+
+        // Footsteps by distance travelled, like a real cadence — not a timer, so
+        // a slow walk ticks slowly and a sprint drums.
+        if (grounded && hSpd > 0.8f)
+        {
+            _puppetStepDist += hSpd * dt;
+            if (_puppetStepDist >= 2.6f)
+            {
+                _puppetStepDist = 0f;
+                var stream = hSpd > 7f ? _puppetRunStream : _puppetWalkStream;
+                if (stream != null && _puppetStepSfx != null)
+                {
+                    _puppetStepSfx.Stream = stream;
+                    _puppetStepSfx.Play();
+                }
+            }
+        }
+        else if (!grounded) _puppetStepDist = 0f;
+
+        // Jump on the rising edge, land on the fall arrest.
+        if (vy > 4.5f && _puppetPrevVy <= 4.5f) _puppetJumpSfx?.Play();
+        if (_puppetPrevVy < -4f && vy > -0.5f)  _puppetLandSfx?.Play();
+        _puppetPrevVy = vy;
+    }
+
+    public void TriggerPuppetShot() => TriggerPuppetShot(null);
+
+    /// Replay the opponent's shot on THIS client with the same visual language
+    /// they saw: pose, flash, tracer/casing for hitscan, backblast + a cosmetic
+    /// projectile for rockets. `endPoint` is the relayed ray end; without it
+    /// (older peer, dropped field) we still show pose + flash.
+    public void TriggerPuppetShot(Vector3? endPoint)
+    {
+        _animator.PlayShoot();
+        SpawnPuppetMuzzleFlash();
+        PulseTpShot();
+        // Their gunshot, from their position, through their gun's own 3D emitter
+        // — distance attenuation and the per-gun report come free.
+        _combat?.PlayFireSfx();
+
+        if (endPoint == null || _combat == null) return;
+
+        var muzzle = GetMuzzleWorldPoint();
+        var dir    = (endPoint.Value - muzzle).Normalized();
+        if (dir.LengthSquared() < 0.5f) return;
+
+        var def = _combat.Def;
+        if (def.Mode == GunCombat.FireMode.Projectile)
+        {
+            GunFx.Backblast(this, muzzle, dir);
+            var r = Rocket.Spawn(GetTree().Root, muzzle + dir * 0.3f, dir, def, _combat);
+            r.CosmeticOnly = true;   // damage already travels on the hit relay
+        }
+        else
+        {
+            GunFx.Tracer(this, muzzle, endPoint.Value);
+            GunFx.Casing(this, muzzle, dir);
+        }
+    }
+
+    /// Show this puppet reloading, so the opponent's reload is readable as a
+    /// window to push them.
+    public void TriggerPuppetReload()
+    {
+        _animator.PlayReload();
+        // The reload SOUND is the "push now" cue — it must be audible, not just visible.
+        _combat?.PlayReloadSfx();
+        PulseTpReload(_combat?.ReloadDur ?? 1.6f);
+    }
+
+    /// Opponent clicked on an empty magazine — the quiet little tell that they
+    /// are helpless RIGHT NOW, worth more than any HUD element.
+    public void TriggerPuppetDryFire() => _combat?.PlayDrySfx();
+
+    /// Opponent's death, shown on this client. The match-end overlay follows a
+    /// beat later, but the body dropping is what makes the kill feel real.
+    public void PlayPuppetDeath() => _animator?.PlayDeath();
+
+    /// Relayed sprint-carry state: an opponent with their weapon lowered is not
+    /// ready to fire — the single most useful thing to read at a glance.
+    public void SetPuppetSprinting(bool on) { _animSprinting = on; _animator?.SetSprinting(on); }
+
+    /// Relayed ADS state. Drives the puppet's GunCombat so pose logic (sprint
+    /// gating, future scope glint) sees the same truth the real player has.
+    public void SetPuppetAiming(bool on) => _combat?.SetAiming(on);
+
+    /// What the pos broadcast reads on the sending side.
+    public bool IsSprintCarrying => _sprintBlend > 0.5f;
+    public bool IsAimingNow      => _combat?.IsAiming ?? false;
+
+    void SpawnPuppetMuzzleFlash()
+    {
+        // Same muzzle-anchored flash the shooter sees on their own screen — the
+        // puppet's TP weapon supplies the muzzle point.
+        GunFx.MuzzleFlash(this, GetMuzzleWorldPoint(), ForwardVector);
+    }
+
+    public float Yaw   => _yaw;
+    public float Pitch => _pitch;
+
+    Vector3 _puppetTargetPos   = Vector3.Zero;
+    Vector3 _puppetTargetVel   = Vector3.Zero;
+    float   _puppetTargetYaw   = 0f;
+    float   _puppetTargetPitch = 0f;
+    ulong   _puppetReceiveMs   = 0;   // local Time.GetTicksMsec at receive
+    bool    _puppetHasTarget   = false;
+
+    const float PuppetExtrapolateCapSec = 0.2f;   // cap forward prediction at 200 ms
+    const float PuppetSnapDistance      = 2.0f;   // snap if extrapolated target drifts > 2 m
+
+    /// Set puppet target with velocity for extrapolation. Velocity is in world units/sec.
+    public void SetPuppetTarget(Vector3 pos, Vector3 velocity, float yaw, float pitch)
+    {
+        _puppetTargetPos   = pos;
+        _puppetTargetVel   = velocity;
+        _puppetTargetYaw   = yaw;
+        _puppetTargetPitch = pitch;
+        _puppetReceiveMs   = Time.GetTicksMsec();
+        _puppetHasTarget   = true;
+    }
+
+    /// The opponent's last self-reported position (puppets only). Hit claims are
+    /// stamped with THIS, not the puppet's rendered position — the render is an
+    /// extrapolated guess, but this is a spot the victim's client actually
+    /// broadcast, so their validation can hold a tight tolerance.
+    public Vector3 PuppetLastNetPos => _puppetTargetPos;
+
+    // ── Position history (victim-side hit validation) ─────────────────────────
+    // The local body's recent positions, sampled every physics tick. When a hit
+    // claim arrives over the relay it names where the shooter saw us; if we were
+    // never near that spot inside the window, the claim is too stale to honour.
+    const float HitClaimWindowMs  = 300f;
+    const float HitClaimTolerance = 1.5f;   // metres, centre-to-centre
+    readonly (ulong ms, Vector3 pos)[] _posHistory = new (ulong, Vector3)[24];
+    int _posHistoryIdx = 0;
+
+    void RecordPosHistory()
+    {
+        _posHistory[_posHistoryIdx] = (Time.GetTicksMsec(), GlobalPosition);
+        _posHistoryIdx = (_posHistoryIdx + 1) % _posHistory.Length;
+    }
+
+    /// Was this body within HitClaimTolerance of `claimed` at any point in the
+    /// last HitClaimWindowMs? Entries with ms == 0 are unfilled slots.
+    public bool WasRecentlyNear(Vector3 claimed)
+    {
+        ulong now = Time.GetTicksMsec();
+        foreach (var (ms, pos) in _posHistory)
+        {
+            if (ms == 0 || now - ms > (ulong)HitClaimWindowMs) continue;
+            if (pos.DistanceTo(claimed) <= HitClaimTolerance) return true;
+        }
+        return false;
+    }
+
+    /// Index of the local player's current animation state — broadcast for puppet sync.
+    public int CurrentAnimStateIndex => (int)(_animator?.CurrentState ?? PlayerAnimator.AnimState.Idle);
+
+    /// Apply a remote animation state to this puppet. `speed` should match the
+    /// horizontal walking/running speed so the locomotion blend tree picks the right clip.
+    public void ApplyPuppetAnimState(int stateIndex, float speed)
+    {
+        if (!IsRemotePuppet || _animator == null) return;
+        var state = (PlayerAnimator.AnimState)stateIndex;
+        _animator.ApplyPuppetState(state, speed);
+    }
+
+    /// Re-assert this player's camera as current and re-capture the mouse.
+    public void MakeActive()
+    {
+        (_tpMode ? _tpCam : _cam).MakeCurrent();
+        Input.MouseMode = Input.MouseModeEnum.Captured;
+    }
+
+    /// Register a callback that fires on every shot, with the gun's id.
+    public void AddShotListener(Action<string> cb) => _combat.OnFired += cb;
+    /// Register a callback with each shot's ray endpoint — what the net layer
+    /// relays so the opponent's client can draw the identical tracer/rocket.
+    public void AddShotEndpointListener(Action<Vector3> cb) => _combat.OnShotEndpoint += cb;
+    /// Register a callback for dry-fire clicks (empty mag) — relayed so the
+    /// opponent can HEAR that helpless click too.
+    public void AddDryFireListener(Action cb) => _combat.OnDryFire += cb;
+    /// Register a callback that fires when a reload begins.
+    public void AddReloadListener(Action cb)       => _combat.OnReloadStart += cb;
+
+    /// Give this player a specific gun by id (see GunCombat.Defs).
+    public void EquipGun(string id) => _combat?.Equip(id);
+
+    /// Test-only: drive the third-person pose through a named beat so
+    /// TestThirdPerson can film what an opponent actually sees. Not used by the
+    /// game — it exists so "is this readable in a fight" is a check, not a guess.
+    public void DebugDriveThirdPerson(string beat, float dt)
+    {
+        if (_combat == null || _animator == null) return;
+
+        // Full locomotion state, not just speed: the whole point of the upper-body
+        // split is that legs keep doing walk / run / jump / wall-run / slide while
+        // the arms hold the gun, so the harness has to be able to drive every one
+        // of those states independently.
+        float speed       = 0f;
+        bool  onFloor     = true;
+        bool  sliding     = false;
+        bool  wallRunning = false;
+        float wallRoll    = 0f;
+        float verticalVel = 0f;
+        bool  sprinting   = false;
+
+        switch (beat)
+        {
+            case "AIM UP":      _pitch =  0.85f; break;
+            case "AIM DOWN":    _pitch = -0.85f; break;
+            case "SHOOTING":    _pitch = 0f; _combat.RequestAttack(); break;
+            case "RELOADING":   _pitch = 0f; _combat.RequestReload(); break;
+            case "WALKING":     _pitch = 0f; speed = 4f; break;
+            case "RUNNING":     _pitch = 0f; speed = 9f; break;
+            case "RUN + SHOOT": _pitch = 0.15f; speed = 9f; _combat.RequestAttack(); break;
+
+            case "JUMPING":
+                _pitch = 0f; speed = 6f; onFloor = false; verticalVel =  6f; break;
+            case "FALLING":
+                _pitch = 0f; speed = 6f; onFloor = false; verticalVel = -6f; break;
+            case "WALL RUN":
+                _pitch = 0f; speed = 12f; onFloor = false; wallRunning = true;
+                wallRoll = 1f; break;
+            case "SLIDING":
+                _pitch = 0f; speed = 10f; sliding = true; break;
+            case "SPRINTING":
+                _pitch = 0f; speed = 14f; sprinting = true; break;
+            case "SCOPED":
+                _pitch = 0f; _combat.SetAiming(true); break;
+
+            default: _pitch = 0f; break;
+        }
+
+        // Mirror the real tick's aim/scope blends so the harness can film ADS and
+        // the scope overlay, which are otherwise only driven by live input.
+        _sprintBlend = Mathf.MoveToward(_sprintBlend, sprinting ? 1f : 0f, 6f * dt);
+        _animSprinting = sprinting;
+        _animator.SetSprinting(sprinting);
+        SeatTpGrip();
+        _adsBlend   = Mathf.MoveToward(_adsBlend, _combat.IsAiming ? 1f : 0f, 7f * dt);
+        _scopeBlend = Mathf.MoveToward(_scopeBlend, _combat.IsAiming ? 1f : 0f,
+                                       ScopeBlendRate * dt);
+        float harnessFov = GameSettings.Instance?.FOV ?? 90f;
+        if (_scopeBlend > 0.001f)
+            _cam.Fov = Mathf.Lerp(harnessFov, _combat.Def.ScopeFov, _scopeBlend);
+        else
+            // Mirror the live tick's else-branch. Without it the FOV freezes at
+            // whatever the last blended value was (≈77) the frame the blend snaps
+            // to 0, which makes scope-out captures look like a zoom bug.
+            _cam.Fov = Mathf.MoveToward(_cam.Fov, harnessFov, 200f * dt);
+
+        var origin = _cam.GlobalPosition;
+        var dir    = -_cam.GlobalTransform.Basis.Z;
+        _combat.Tick(dt, origin, dir, speed, !onFloor);
+
+        _animator.SetAimPitch(_pitch);
+        _animator.Tick(dt, onFloor, sliding, wallRunning,
+                       wallRollSign: wallRoll, hasWeapon: true, speed: speed,
+                       verticalVel: verticalVel);
+        ApplyLook();
+        AnimateFpGun(dt);
+    }
+
+    // ── Spawn ─────────────────────────────────────────────────────────────────
+    public static PlayerController Spawn(Node parent, Vector3 pos, float yawDeg = 180f)
+    {
+        // Position BEFORE AddChild so the physics body never exists at the origin
+        // (same spawn-overlap hazard as EnemyController.Spawn).
+        var p = new PlayerController { Name = "Player" };
+        p.Position = pos;
+        p._yaw     = yawDeg * Mathf.Pi / 180f;
+        parent.AddChild(p);
+        p.ResetPhysicsInterpolation();
+        return p;
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+    public override void _Ready()
+    {
+        AddToGroup("players");
+        AddChild(new GrassInteractor { Name = "GrassBend" });   // bends arena grass
+
+        var shape = new CapsuleShape3D { Radius = 0.35f, Height = 1.6f };
+        AddChild(new CollisionShape3D { Shape = shape, Name = "Body" });
+        CollisionMask  = 0xFFFFFFFF;
+        MotionMode     = MotionModeEnum.Grounded;
+        UpDirection    = Vector3.Up;
+        FloorMaxAngle  = 68f * Mathf.Pi / 180f;  // allow climbing stair ramps (current ramp ~61°)
+        FloorSnapLength = 1.5f;                   // snap down to next stair tread (~0.52m drop)
+
+        _mount = new Node3D { Name = "CamMount", Position = new(0, EyeHeight, 0) };
+        AddChild(_mount);
+        // FP camera: sits exactly at the eye socket (no forehead hack needed — body is on layer 2).
+        // CullMask excludes layer 2 (player body) so the camera never sees its own mesh.
+        _cam = new Camera3D { Name = "PlayerCam", Fov = GameSettings.Instance?.FOV ?? 90f, Near = 0.04f, Far = 500f };
+        _cam.CullMask = ~2u;           // all layers except layer 2 (player body)
+        _mount.AddChild(_cam);
+
+        // The FP gun viewmodel is built by RebuildFpGun, which fires off
+        // GunCombat.OnEquipped once the combat node is wired up below.
+
+        _playerBody = BuildPlayerBody();
+        _playerBody.Visible = true;
+        AddChild(_playerBody);
+        // Put every mesh in the player body on visual layer 2 — invisible to FP cam
+        SetLayersRecursive(_playerBody, 2u);
+
+        _animator = new PlayerAnimator();
+        AddChild(_animator);
+        var modelRoot = _playerBody.GetNodeOrNull<Node3D>("CharacterModel");
+        if (modelRoot != null) _animator.Init(modelRoot);
+
+        // FP arms — camera-space, layer 3; only exists once UAL1_FpArms.glb is exported
+        _fpArmsModel = BuildFpArmsModel();
+        if (_fpArmsModel != null)
+        {
+            _cam.AddChild(_fpArmsModel);
+            _animator.InitFpArms(_fpArmsModel);
+        }
+
+        // TP camera: sees world (1) + player body (2), NOT the FP-only weapon (4)
+        _tpCam = new Camera3D { Name = "TpCam", Fov = 75f, Near = 0.1f, Far = 500f };
+        _tpCam.CullMask = ~4u;         // all layers except layer 3 (FP weapon)
+        AddChild(_tpCam);
+
+        _combat = new GunCombat();
+
+        // Wire every callback BEFORE AddChild: GunCombat._Ready() equips the
+        // default gun immediately, and OnEquipped is what builds the viewmodel.
+        // Subscribing afterwards would miss that first equip.
+        _combat.OnFired += _ =>
+        {
+            ApplyRecoil(_combat.RecoilKick);
+            _animator.PlayShoot();
+            PulseTpShot();   // the hand model observers see cycles its slide too
+            // Muzzle flash/tracer/casing are drawn by GunCombat via GunFx, at the
+            // actual muzzle — not here at the eye.
+        };
+        _combat.OnReloadStart += () =>
+        {
+            _animator.PlayReload(_combat.ReloadDur);
+            PulseTpReload(_combat.ReloadDur);
+        };
+        // Visuals originate at the muzzle; hits stay camera-true.
+        _combat.GetMuzzleWorld = GetMuzzleWorldPoint;
+        // Rocket self-knockback — this is what makes rocket jumping work.
+        _combat.ApplyImpulse += imp => Velocity += imp;
+        // Swapping guns rebuilds both weapon models and picks the pose family —
+        // only the one-handed sidearm uses the pistol set.
+        _combat.OnEquipped += id =>
+        {
+            RebuildFpGun(id);
+            RebuildTpGun(id);
+            if (GunCombat.Defs.TryGetValue(id, out var d))
+                _animator?.SetAnimFamily(d.AnimFamily);
+        };
+
+        AddChild(_combat);
+
+        // Add health component + HUD
+        var health = new PlayerHealth { Name = "PlayerHealth" };
+        AddChild(health);
+        var hud = new PlayerHUD();
+        AddChild(hud);
+        health.DamageDealt += amount =>
+        {
+            if (!IsRemotePuppet)
+            {
+                _hitSfx.Play();
+                hud.TriggerHitFlash();
+                _animator.PlayHurt();
+                _combat.InterruptByHit();
+                // Small backward push scaled with damage
+                var back = new Vector3(Mathf.Sin(_yaw), 0.25f, Mathf.Cos(_yaw)).Normalized();
+                Velocity += back * Mathf.Clamp(amount / 22f, 1.0f, 5.0f);
+                // Camera shake scaled with damage
+                _camShakeAmount = Mathf.Clamp(amount / 30f, 0.3f, 2.5f);
+            }
+            else
+            {
+                // The SHOOTER damages this puppet directly on their own client —
+                // play the flinch so they see the target react. Anim only: sfx,
+                // HUD, knockback and shake are the victim's own client's story,
+                // relayed back through the pos stream.
+                _animator.PlayHurt();
+            }
+        };
+
+        _walkSfx = MakeSfx("res://assets/audio/sfx/movement/Walk.wav");
+        _runSfx  = MakeSfx("res://assets/audio/sfx/movement/Run.wav");
+        _jumpSfx = MakeSfx("res://assets/audio/sfx/movement/Jump.wav");
+        _landSfx = MakeSfx("res://assets/audio/sfx/movement/Land.wav");
+        _hitSfx  = MakeSfx("res://assets/audio/sfx/combat/swordfleshimpact.wav");
+
+        _animator.StepTaken += spd =>
+        {
+            if (!IsRemotePuppet)
+                (spd > 7f ? _runSfx : _walkSfx).Play();
+        };
+
+        ApplyLook();
+        _cam.MakeCurrent();
+        Input.MouseMode = Input.MouseModeEnum.Captured;
+
+        // Players spawn already armed. Online matches overwrite this with a shared
+        // roll via EquipStarterGun; solo/training just uses the first pool entry.
+        // GunCombat._Ready already equipped its default gun and built the
+        // viewmodel; this just marks the player as armed. The owning scene
+        // (TrainingArena / OnlineDungeonArena) then calls EquipStarterGun with the
+        // real roll, so we deliberately do not equip a second time here.
+        PickupWeapon();
+    }
+
+    AudioStreamPlayer MakeSfx(string path)
+    {
+        var sfx    = new AudioStreamPlayer();
+        var stream = GD.Load<AudioStream>(path);
+        if (stream != null) sfx.Stream = stream;
+        AddChild(sfx);
+        return sfx;
+    }
+
+    /// When true, the player ignores all input and stops physics — used to lock
+    /// movement / mouse / swings while the end-of-match overlay is up.
+    public bool Frozen { get; set; } = false;
+
+    public override void _Input(InputEvent ev)
+    {
+        if (IsRemotePuppet || _isDead || Frozen) return;
+        if (ev is InputEventMouseMotion mm && Input.MouseMode == Input.MouseModeEnum.Captured)
+        {
+            _frameMouseDelta += mm.Relative;   // accumulate for weapon sway
+
+            var  gs   = GameSettings.Instance;
+            float sens = MouseSensBase * (gs?.MouseSensitivity ?? DefaultSens);
+            // Scoped/ADS aim gets its own multiplier so a low-sens zoom feel does
+            // not force the same slowdown on hip-fire.
+            if (HasWeapon && _combat.IsAiming) sens *= gs?.AdsSensMultiplier ?? 1f;
+            float pitchDir = (gs?.InvertY ?? false) ? -1f : 1f;
+
+            _yaw   -= mm.Relative.X * sens;
+            _pitch  = Mathf.Clamp(_pitch - mm.Relative.Y * sens * pitchDir, -PitchClamp, PitchClamp);
+            ApplyLook();
+        }
+        if (ev is InputEventKey pauseKey && pauseKey.Keycode == Key.Escape && pauseKey.Pressed && !pauseKey.Echo)
+            Input.MouseMode = Input.MouseMode == Input.MouseModeEnum.Captured
+                ? Input.MouseModeEnum.Visible
+                : Input.MouseModeEnum.Captured;
+        if (ev.IsActionPressed("toggle_camera") && !(ev is InputEventKey ek && ek.Echo))
+            ToggleCameraMode();
+
+        // ── Weapon wheel ──────────────────────────────────────────────────────
+        // Handled as an EVENT, not polled in _PhysicsProcess. A wheel "press"
+        // and its release arrive within a frame of each other, so polling
+        // IsActionJustPressed drops fast scrolls and can double-count slow
+        // ones — that is what made scrolling feel clunky. Event handling sees
+        // every notch exactly once.
+        //
+        // Still guarded by TrainingConfig: in training the hold-Tab weapon
+        // wheel (GunSwitcher) owns the scroll wheel.
+        if (HasWeapon && !TrainingConfig.AllowGunSwitch)
+        {
+            if      (ev.IsActionPressed("weapon_next")) CycleWeapon(+1);
+            else if (ev.IsActionPressed("weapon_prev")) CycleWeapon(-1);
+        }
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        // Keep the hit-validation history warm even while dead/frozen — a claim
+        // can arrive for damage dealt an instant before the state changed.
+        if (!IsRemotePuppet) RecordPosHistory();
+
+        if (_isDead || Frozen) return;
+
+        if (IsRemotePuppet)
+        {
+            float dt2 = (float)delta;
+            if (_puppetHasTarget)
+            {
+                // Extrapolate forward by time since packet arrived, capped to 200 ms.
+                float elapsedSec = (Time.GetTicksMsec() - _puppetReceiveMs) / 1000f;
+                if (elapsedSec > PuppetExtrapolateCapSec) elapsedSec = PuppetExtrapolateCapSec;
+                Vector3 predicted = _puppetTargetPos + _puppetTargetVel * elapsedSec;
+
+                // Snap on big jumps (respawn / teleport / packet loss recovery).
+                if (GlobalPosition.DistanceTo(predicted) > PuppetSnapDistance)
+                    GlobalPosition = predicted;
+                else
+                    GlobalPosition = GlobalPosition.Lerp(predicted, 20f * dt2);
+            }
+            _yaw   = Mathf.LerpAngle(_yaw,   _puppetTargetYaw,   20f * dt2);
+            _pitch = Mathf.Lerp(_pitch, _puppetTargetPitch, 20f * dt2);
+            ApplyLook();
+            _playerBody.Rotation = new Vector3(0f, _yaw, 0f);
+
+            // The telegraphs the opponent reads: the barrel tracks the relayed
+            // pitch, and the upper-body layer keeps running (full Tick never
+            // executes for puppets — its state selection would fight the relayed
+            // locomotion — but without upper maintenance the gun-pose state
+            // machine never starts and the avatar shows rest-pose arms).
+            _animator.SetAimPitch(_pitch);
+            _animator.TickUpperOnly(dt2);
+            // The wallhack outline lives on the PUPPET (the claimer marks their
+            // opponent), so its timer/spin must tick on this early-return path
+            // too — parked after it, the marking never expired.
+            TickWallhack(dt2);
+            TickPuppetAudio(dt2);
+            return;
+        }
+
+        float dt         = (float)delta;
+        bool  onFloor    = IsOnFloor();
+        bool  justLanded = onFloor && !_wasOnFloor;  // capture before coyote overwrites
+
+        // ── Coyote time ───────────────────────────────────────────────────────
+        if (onFloor) _coyote = CoyoteTime;
+        else         _coyote = Mathf.MoveToward(_coyote, 0f, dt);
+
+        // ── Track fall speed for landing-slide ────────────────────────────────
+        if (!onFloor && Velocity.Y < 0f)
+            _airFallSpeed = Mathf.Abs(Velocity.Y);
+
+        // ── Wall-run cooldown ─────────────────────────────────────────────────
+        if (_wallCooldown > 0) _wallCooldown -= dt;
+        if (_airBoostTimer > 0) _airBoostTimer -= dt;   // trampoline air-control window
+
+        // ── Landing-slide trigger — only fires when Ctrl is held on landing ─────
+        if (justLanded && !_sliding && Input.IsActionPressed("slide"))
+        {
+            var hv       = new Vector3(Velocity.X, 0, Velocity.Z);
+            var slideDir = hv.Length() > 0.5f ? hv
+                         : new Vector3(-Mathf.Sin(_yaw), 0f, -Mathf.Cos(_yaw));
+            float entrySpeed = Mathf.Clamp(hv.Length() * SlideBoostFactor, SlideMinEntry, SlideMaxEntry);
+            _momentum += MomentumSlideBonus + 0.10f;
+            StartSlide(slideDir, entrySpeed);
+        }
+        if (onFloor) _airFallSpeed = 0f;
+
+        // ── Land cancels wall-run ─────────────────────────────────────────────
+        if (onFloor && _wallRunning) EndWallRun();
+
+        Vector3 vel = Velocity;
+
+        // ── Landing friction spike ────────────────────────────────────────────
+        // Bleed carried air velocity on touchdown so you stop crisply instead of
+        // ice-drifting from your landing spot. Skipped while sliding (slide owns
+        // its own physics) and skipped when a movement key is held, so bhop chains
+        // — which land steering into a direction — keep their momentum.
+        if (justLanded && !_sliding &&
+            Input.GetVector("move_left", "move_right", "move_forward", "move_back") == Vector2.Zero)
+        {
+            vel.X *= LandFriction;
+            vel.Z *= LandFriction;
+        }
+
+        // ── Gravity ───────────────────────────────────────────────────────────
+        if (!onFloor && !_wallRunning)
+            vel.Y -= Gravity * dt;
+        else if (onFloor && !_sliding)
+            vel.Y = -0.5f;
+
+        // ── State dispatch ────────────────────────────────────────────────────
+        if (_wallRunning)
+            WallRunTick(ref vel, dt);
+        else if (_sliding)
+            SlideTick(ref vel, dt, onFloor);
+        else
+            NormalTick(ref vel, dt, onFloor);
+
+        _wasOnFloor = onFloor;
+
+        // ── Hold R to teleport back to maze start ─────────────────────────────
+        if (Input.IsKeyPressed(Key.R))
+        {
+            _resetHoldTime += dt;
+            if (_resetHoldTime >= ResetHoldThreshold)
+            {
+                _resetHoldTime = 0f;
+                var startPos = DungeonBuilder.MazeStartPosition;
+                if (startPos != Vector3.Zero)
+                {
+                    Position = startPos;
+                    vel      = Vector3.Zero;
+                    _sliding        = false;
+                    _wallRunning    = false;
+                    _airFallSpeed   = 0f;
+                    _coyote         = 0f;
+                }
+            }
+        }
+        else
+        {
+            _resetHoldTime = 0f;
+        }
+
+        AdjustStairVelocity(ref vel, dt);
+        TryStepUp(vel, dt);
+
+        // Aiming down sights trades mobility for accuracy — the cone tightens
+        // (GunCombat.AdsSpreadMult) but you can no longer outrun a bullet.
+        // IsAiming is already false on every gun without a scope, so this only
+        // ever bites on the AWP.
+        if (HasWeapon && _combat.IsAiming && onFloor)
+        {
+            float adsCap = 4.5f;
+            var   horiz  = new Vector3(vel.X, 0f, vel.Z);
+            if (horiz.Length() > adsCap)
+            {
+                horiz = horiz.Normalized() * adsCap;
+                vel.X = horiz.X;
+                vel.Z = horiz.Z;
+            }
+        }
+
+        Velocity = vel;
+        // Push Tile — a steady shove along the tile's facing, applied after all other
+        // movement so it fights the player's input rather than being folded into it.
+        if (_trapPush != Vector3.Zero)
+            Velocity += _trapPush * dt;
+        MoveAndSlide();
+
+        if (IsOnFloor()) _prevFloorY = GlobalPosition.Y - 0.8f;
+
+        // Greased Walls forbids STARTING a wall-run; a run already in progress is
+        // allowed to finish so you are never yanked off a wall mid-move.
+        if (!IsOnFloor() && !_wallRunning && _wallCooldown <= 0 && !_trapNoWallRun)
+            TryStartWallRun();
+
+        // ── Gunplay ───────────────────────────────────────────────────────────
+        if (HasWeapon)
+        {
+            // Remote puppets never resolve shots — the owning client already did,
+            // and damage arrives over the {"t":"hit"} relay.
+            if (!IsRemotePuppet && !Frozen)
+            {
+                if (Input.IsActionPressed("attack"))         _combat.RequestAttack();
+                if (Input.IsActionJustPressed("reload"))      _combat.RequestReload();
+                _combat.SetAiming(Input.IsActionPressed("aim"));
+                // Slot swap — but in training with the weapon wheel enabled, Tab
+                // belongs to GunSwitcher (hold-to-open), so stay off it there.
+                if (Input.IsActionJustPressed("gun_switch") && !TrainingConfig.AllowGunSwitch)
+                    SwitchWeapon();
+
+                // Direct slot keys: 1 = primary (arena prize), 2 = secondary
+                // (starter). Unguarded by TrainingConfig — unlike Tab and the
+                // wheel these collide with nothing.
+                if (Input.IsActionJustPressed("weapon_primary"))   SelectPrimary();
+                if (Input.IsActionJustPressed("weapon_secondary")) SelectSecondary();
+
+            }
+
+            var  aimOrigin = _cam.GlobalPosition;
+            var  aimDir    = -_cam.GlobalTransform.Basis.Z;
+            float horizSpd = new Vector3(Velocity.X, 0f, Velocity.Z).Length();
+            _combat.Tick(dt, aimOrigin, aimDir, horizSpd, !onFloor);
+
+            _adsBlend  = Mathf.MoveToward(_adsBlend, _combat.IsAiming ? 1f : 0f, 7f * dt);
+            _fpGunKick = Mathf.MoveToward(_fpGunKick, 0f, 6f * dt);
+
+            // Feed camera pitch into the Pistol_Aim_Down/Neutral/Up blend so the
+            // body actually points the barrel where the player is looking.
+            _animator.SetAimPitch(_pitch);
+        }
+
+        TickWallhack(dt);
+
+        // ── Smooth camera height ───────────────────────────────────────────────
+        float targetH = _sliding ? SlideEyeH : _crouching ? CrouchEyeH : EyeHeight;
+        _camH = Mathf.MoveToward(_camH, targetH, 6f * dt);
+        _mount.Position = new(0f, _camH, 0f);
+
+        // ── Camera roll during wall-run ────────────────────────────────────────
+        float targetRoll = _wallRunning ? _wallRollSign * 12f * Mathf.Pi / 180f : 0f;
+        _camRoll = Mathf.Lerp(_camRoll, targetRoll, 5f * dt);
+
+        // ── Camera shake decay ─────────────────────────────────────────────────
+        if (_camShakeAmount > 0f)
+            _camShakeAmount = Mathf.MoveToward(_camShakeAmount, 0f, 7f * dt);
+        ApplyLook();
+
+        // ── Momentum update ────────────────────────────────────────────────────
+        // Momentum is built only by discrete events (bhop, slide, wall-run).
+        // Sprint alone drains it slowly; stopping drains it fast.
+        var  hSpd     = new Vector2(Velocity.X, Velocity.Z).Length();
+        bool inFreefall  = !IsOnFloor() && !_sliding;   // includes wall-run
+        bool hasInput    = Input.GetVector("move_left", "move_right", "move_forward", "move_back") != Vector2.Zero;
+        bool isBraking   = IsOnFloor() && !_sliding && (!hasInput || hSpd < SprintSpeed * 0.4f);
+        if (inFreefall)
+            _momentum = Mathf.Max(_momentum - MomentumAirDecayRate * dt, 0f);
+        else if (isBraking)
+            _momentum = Mathf.Max(_momentum - MomentumDecayRate * dt, 0f);
+        else if (!_sliding)
+            _momentum = Mathf.Max(_momentum - MomentumSprintDecay * dt, 0f);
+        _momentum = Mathf.Min(_momentum, MomentumMax);
+
+        // ── Animate player body ────────────────────────────────────────────────
+        _animator.Tick(dt, IsOnFloor(), _sliding, _wallRunning, _wallRollSign, HasWeapon, hSpd, Velocity.Y);
+        SeatTpGrip();   // one-shot, needs a posed skeleton — cheap no-op after
+
+        // ── Land sound (local player only) ───────────────────────────────────
+        if (!IsRemotePuppet && justLanded && _airFallSpeed > 1.0f)
+            _landSfx.Play();
+
+        // ── Camera bob + weapon sway ──────────────────────────────────────────
+        if (!_tpMode)
+        {
+            UpdateCameraBob(dt, hSpd, IsOnFloor());
+            UpdateWeaponSway(dt);
+            AnimateFpGun(dt);
+
+            // Scoped AWP: viewmodel is hidden once the scope overlay fully covers
+            // the screen, same as any scoped shooter — you don't see the gun.
+            if (_heldWeapon != null)
+                _heldWeapon.Visible = HasWeapon && _scopeBlend < 0.999f;
+        }
+
+        // ── FP FOV swell — expands with speed + momentum for visceral feedback ────
+        bool isSpr = Input.IsActionPressed("sprint") && hSpd > WalkSpeed && IsOnFloor();
+        // Drives the sprint carry on the viewmodel (see FpArmsPosSprint).
+        _sprintBlend = Mathf.MoveToward(_sprintBlend,
+            (isSpr && !_combat.IsAiming) ? 1f : 0f, 6f * dt);
+        // Same signal drives the authored <Fam>_Sprint carry on the upper body,
+        // so first- and third-person always agree about when you are sprinting.
+        _animSprinting = isSpr && !_combat.IsAiming;
+        _animator.SetSprinting(_animSprinting);
+        float baseFov   = GameSettings.Instance?.FOV ?? 90f;
+        float fovMom    = Mathf.Min(_momentum, 3f);   // visual cap — FOV readable up to 3× momentum
+        float targetFov = _sliding ? (baseFov + 5f  + fovMom * 15f)
+                        : isSpr    ? (baseFov + 2f  + fovMom * 12f)
+                        : baseFov;
+
+        // AWP scope zoom — its own fast blend (ScopeBlendRate, ~0.08 s) instead of
+        // the 5/sec swell lerp above, so scoping in/out reads as a snap. Blending
+        // targetFov → ScopeFov (rather than jumping straight to it) means the zoom
+        // still rides on top of whatever swell FOV you already had.
+        bool scoped = HasWeapon && _combat.IsAiming;
+        _scopeBlend = Mathf.MoveToward(_scopeBlend, scoped ? 1f : 0f, ScopeBlendRate * dt);
+        if (_scopeBlend > 0.001f)
+            _cam.Fov = Mathf.Lerp(targetFov, _combat.Def.ScopeFov, _scopeBlend);
+        else
+            _cam.Fov = Mathf.Lerp(_cam.Fov, targetFov, 5f * dt);
+
+        // ── Player body yaw tracks look direction ──────────────────────────────
+        _playerBody.Rotation = new(0f, _yaw, 0f);
+
+        // ── TP camera follows behind player ────────────────────────────────────
+        if (_tpMode)
+        {
+            // Pull the third-person camera in while aiming so the sights matter.
+            bool aiming = HasWeapon && _combat.IsAiming;
+            float targetDist = aiming ? TpDistanceBlock : TpDistance;
+            float targetElev = _sliding  ? TpElevationSlide : TpElevation;
+            _tpDistCurrent = Mathf.MoveToward(_tpDistCurrent, targetDist, 8f * dt);
+            _tpElevCurrent = Mathf.MoveToward(_tpElevCurrent, targetElev, 4f * dt);
+
+            var pivot = GlobalPosition + Vector3.Up * (EyeHeight * 0.7f);
+            // Orbit on yaw AND pitch. `back` used to be yaw-only with a fixed
+            // +Up elevation, which is exactly what locked the third-person view:
+            // looking up or down swung the aim ray but never moved the camera,
+            // so the shot went somewhere the player could not see. At pitch 0
+            // this is identical to the old framing.
+            float tpPitch = Mathf.Clamp(_pitch, -TpPitchClamp, TpPitchClamp);
+            float cp = Mathf.Cos(tpPitch), sp = Mathf.Sin(tpPitch);
+            var back  = new Vector3(Mathf.Sin(_yaw) * cp, -sp, Mathf.Cos(_yaw) * cp);
+            _tpCam.GlobalPosition = pivot + back * _tpDistCurrent + Vector3.Up * _tpElevCurrent;
+            _tpCam.LookAt(pivot, Vector3.Up);
+
+            UpdateAimPoint();
+        }
+    }
+
+    // ── Normal movement ───────────────────────────────────────────────────────
+    void NormalTick(ref Vector3 vel, float dt, bool onFloor)
+    {
+        Vector2 input    = Input.GetVector("move_left", "move_right", "move_forward", "move_back");
+        // Sprint only works on the ground — in the air your speed is whatever you
+        // launched with (bhop momentum), never an active sprint.
+        bool isSprinting = Input.IsActionPressed("sprint") && input != Vector2.Zero && onFloor;
+        bool slideHeld   = Input.IsActionPressed("slide");
+
+        // Sprint grace — feed while sprinting, decay only on ground (not in air)
+        if (isSprinting)
+            _sprintGraceTimer = SprintGrace;
+        else if (onFloor && !_sliding)
+            _sprintGraceTimer = Mathf.MoveToward(_sprintGraceTimer, 0f, dt);
+
+        // Track sustained sprint time — bonus kicks in after SprintRampTime seconds
+        if (isSprinting && onFloor)
+            _sprintTime += dt;
+        else if (!isSprinting)
+            _sprintTime = 0f;
+        float ramp = _sprintTime >= SprintRampTime ? SprintRampBonus : 0f;
+
+        // Sprint speed is a flat baseline (+ sustained-sprint ramp). It deliberately
+        // does NOT scale with momentum — bhopping is the way to exceed sprint speed.
+        float speed = isSprinting ? SprintSpeed * (1f + ramp)
+            : slideHeld ? CrouchSpeed
+            : WalkSpeed;
+        speed *= _trapSpeedMul;   // Slow Field
+
+        var hVelNow = new Vector3(vel.X, 0, vel.Z);
+        // Only crouch-walk when slide is held with no significant movement (not sprinting)
+        _crouching = slideHeld && !isSprinting && hVelNow.Length() < 2f && !_sliding;
+
+        var fwd   = new Vector3(-Mathf.Sin(_yaw), 0f, -Mathf.Cos(_yaw));
+        var right = new Vector3( Mathf.Cos(_yaw), 0f, -Mathf.Sin(_yaw));
+        var wish  = (fwd * (-input.Y) + right * input.X).Normalized();
+
+        bool jumping = Input.IsActionJustPressed("jump") && _coyote > 0f;
+
+        var hVel = new Vector3(vel.X, 0, vel.Z);
+        if (onFloor)
+        {
+            if (wish.LengthSquared() > 0.01f)
+            {
+                // Accelerate toward target — sprint uses a slightly lower accel for the
+                // "momentum buildup" feel; walk/crouch snap to speed more responsively.
+                float accel = (isSprinting ? SprintAccel : GroundAccel) * _trapAccelMul;
+                float cur   = hVel.Length();
+                // Carrying bhop speed above sprint: preserve it through the jump frame,
+                // and bleed it only gently while grounded. This is what lets chained
+                // hops out-run sprint instead of being clamped back down on every landing.
+                float goalMag = cur > speed
+                    ? (jumping ? cur : Mathf.MoveToward(cur, speed, BhopBleed * dt))
+                    : speed;
+                hVel = hVel.MoveToward(wish * goalMag, accel * dt);
+            }
+            else
+            {
+                // No input — apply friction so momentum carries briefly then stops
+                hVel = hVel.MoveToward(Vector3.Zero, GroundFriction * _trapFrictionMul * dt);
+            }
+        }
+        else
+        {
+            // Air control — redirect only, no in-air sprinting. The cap is the speed
+            // you launched with (never below WalkSpeed), so momentum/bhop/slide-jump
+            // speed is preserved and steerable, but you can NOT accelerate up to
+            // sprint speed while airborne.
+            // A fresh trampoline launch grants a brief window of much stronger air
+            // control — a higher accel and a raised cap — so the player can steer to a
+            // doorway on the way up rather than only arcing. Outside that window this
+            // is the normal redirect-only air control.
+            bool boosted = _airBoostTimer > 0f;
+            float accel  = boosted ? AirBoostAccel : AirAccel;
+            float airCap = Mathf.Max(hVel.Length(), boosted ? AirBoostCap : WalkSpeed);
+            hVel += wish * accel * dt;
+            if (hVel.Length() > airCap) hVel = hVel.Normalized() * airCap;
+        }
+        vel.X = hVel.X;
+        vel.Z = hVel.Z;
+
+        // Jump — each hop adds a momentum-scaled forward boost so chained bhops
+        // accelerate past sprint, capped at BhopMaxSpeed.
+        if (jumping)
+        {
+            vel.Y   = JumpSpeed;
+            _coyote = 0f;
+            _jumpSfx.Play();
+            _momentum += MomentumJumpBonus;
+            var hv = new Vector3(vel.X, 0f, vel.Z);
+            if (hv.LengthSquared() > 0.01f)
+            {
+                float boosted = Mathf.Min(hv.Length() + JumpFwdBoost + _momentum * BhopJumpScale,
+                                          BhopMaxSpeed);
+                hv    = hv.Normalized() * boosted;
+                vel.X = hv.X;
+                vel.Z = hv.Z;
+            }
+        }
+
+        // Slide — only available during/after sprint (grace window).
+        // Instant if held while sprinting; fresh press works within grace period.
+        bool canSlide            = isSprinting || _sprintGraceTimer > 0f;
+        bool slideJustPressed    = Input.IsActionJustPressed("slide");
+        bool slideWhileSprinting = slideHeld && isSprinting && !_sliding;
+        if (canSlide && (slideJustPressed || slideWhileSprinting) && onFloor)
+        {
+            var slideDir = hVel.Length() > 1f ? hVel
+                         : new Vector3(-Mathf.Sin(_yaw), 0f, -Mathf.Cos(_yaw));
+            float entrySpeed = Mathf.Clamp(hVel.Length() * SlideBoostFactor, SlideMinEntry, SlideMaxEntry);
+            _momentum += MomentumSlideBonus;
+            StartSlide(slideDir, entrySpeed);
+        }
+    }
+
+    // ── Slide ─────────────────────────────────────────────────────────────────
+    void StartSlide(Vector3 hVel, float speed)
+    {
+        _sliding        = true;
+        _crouching      = false;
+        _slideDir       = hVel.Normalized();
+        _slideSp        = speed;
+        _slideGraceLeft = SlideGrace;
+        _slideMinTimer  = 1.0f;   // locked in for 1 second
+    }
+
+    void SlideTick(ref Vector3 vel, float dt, bool onFloor)
+    {
+        _slideMinTimer = Mathf.MoveToward(_slideMinTimer, 0f, dt);
+
+        if (!onFloor) { EndSlide(ref vel); return; }  // falling off a ledge always ends it
+
+        // Key release and speed-floor only end the slide after the lock-in window
+        if (!Input.IsActionPressed("slide") && _slideMinTimer <= 0f) { EndSlide(ref vel); return; }
+
+        if (_slideGraceLeft > 0f)
+            _slideGraceLeft -= dt;
+        else
+            _slideSp = Mathf.MoveToward(_slideSp, 0f, SlideFriction * dt);
+
+        if (_slideSp < SlideMinSpeed && _slideMinTimer <= 0f) { EndSlide(ref vel); return; }
+
+        vel.X = _slideDir.X * _slideSp;
+        vel.Z = _slideDir.Z * _slideSp;
+        vel.Y = -0.5f;
+
+        if (Input.IsActionJustPressed("jump"))
+        {
+            vel.X     = _slideDir.X * _slideSp;
+            vel.Z     = _slideDir.Z * _slideSp;
+            vel.Y     = SlideJumpV;
+            _momentum += 0.35f;   // slide-jump: big immediate momentum burst
+            _sliding  = false;
+            _jumpSfx.Play();
+        }
+    }
+
+    void EndSlide(ref Vector3 vel) => _sliding = false;
+
+    // ── Wall-run ──────────────────────────────────────────────────────────────
+    void TryStartWallRun()
+    {
+        var hVel = new Vector3(Velocity.X, 0, Velocity.Z);
+        if (hVel.Length() < 3f) return;
+
+        // Primary: slide collisions from MoveAndSlide (player ran directly into wall)
+        for (int i = 0; i < GetSlideCollisionCount(); i++)
+        {
+            var col = GetSlideCollision(i);
+            Vector3 n = col.GetNormal();
+            if (Mathf.Abs(n.Y) > 0.3f) continue;
+            float alongWall = hVel.Dot(new Vector3(-n.Z, 0f, n.X));
+            if (Mathf.Abs(alongWall) < 1f) continue;
+            BeginWallRun(n);
+            return;
+        }
+
+        // Fallback: TestMove toward each side using the body's own capsule shape.
+        // IMPORTANT: IntersectRay does NOT detect ConcavePolygonShape3D (dungeon walls
+        // are concave trimesh). TestMove uses MoveAndSlide's detection path which does.
+        var rightVec = new Vector3(Mathf.Cos(_yaw), 0f, -Mathf.Sin(_yaw));
+        foreach (var side in new[] { rightVec, -rightVec })
+        {
+            var col = new KinematicCollision3D();
+            if (!TestMove(GlobalTransform, side * 0.5f, col)) continue;
+            var n = col.GetNormal();
+            if (Mathf.Abs(n.Y) > 0.3f) continue;
+            float alongWall = hVel.Dot(new Vector3(-n.Z, 0f, n.X));
+            if (Mathf.Abs(alongWall) < 1f) continue;
+            BeginWallRun(n);
+            return;
+        }
+    }
+
+    void BeginWallRun(Vector3 wallNormal)
+    {
+        _wallRunning  = true;
+        _wallRunTimer = WallRunTime;
+        _wallNormal   = wallNormal;
+        // No momentum bonus — wall run duration is driven by existing momentum
+        var rightVec  = new Vector3(Mathf.Cos(_yaw), 0f, -Mathf.Sin(_yaw));
+        _wallRollSign = -Mathf.Sign(wallNormal.Dot(rightVec));
+    }
+
+    void WallRunTick(ref Vector3 vel, float dt)
+    {
+        _wallRunTimer -= dt;
+        if (_wallRunTimer <= 0f) { EndWallRun(); return; }
+
+        // End immediately if no wall is physically present — no floating in gaps
+        if (!HasWallContact()) { EndWallRun(); return; }
+
+        // Wall gravity scales with momentum loss: full momentum = weightless on wall,
+        // zero momentum = full WallRunGravity pull. Momentum drains in air ~0.4/s.
+        float wallGrav = WallRunGravity * Mathf.Max(0f, 1f - _momentum);
+        if (vel.Y > 0f) vel.Y = 0f;
+        vel.Y = Mathf.MoveToward(vel.Y, -wallGrav, WallRunGravity * dt);
+
+        // Gradually accelerate along the wall (not instant snap)
+        var hVel = new Vector3(vel.X, 0, vel.Z);
+        hVel -= _wallNormal * hVel.Dot(_wallNormal);
+        float currentSpd = hVel.Length();
+        float targetSpd  = Mathf.MoveToward(currentSpd, WallRunSpeed, WallRunAccel * dt);
+        if (currentSpd > 0.01f)
+            hVel = hVel.Normalized() * Mathf.Max(currentSpd, targetSpd);
+        vel.X = hVel.X;
+        vel.Z = hVel.Z;
+
+        if (Input.IsActionJustPressed("jump"))
+        {
+            // 70% look direction, 30% wall normal — goes where you're pointing,
+            // with a slight peel-off so you can't clip back into the same wall.
+            var lookFwd  = new Vector3(-Mathf.Sin(_yaw), 0f, -Mathf.Cos(_yaw));
+            var launchDir = (lookFwd * 0.7f + _wallNormal * 0.3f).Normalized();
+            float launchSpd = WallJumpOff * (1f + _momentum * 0.6f);  // momentum-scaled
+            vel.X = launchDir.X * launchSpd;
+            vel.Z = launchDir.Z * launchSpd;
+            vel.Y = WallJumpUp;
+            EndWallRun();
+            _jumpSfx.Play();
+        }
+    }
+
+    bool HasWallContact()
+    {
+        // TestMove asks: "would this body collide if nudged 0.5m toward the wall?"
+        // Returns true only when something physical is there — reliable, no ray quirks.
+        return TestMove(GlobalTransform, -_wallNormal * 0.5f);
+    }
+
+    void EndWallRun()
+    {
+        _wallRunning  = false;
+        _wallCooldown = WallRunCooldown;
+        _wallRollSign = 0f;
+    }
+
+    // ── Stair step-up ────────────────────────────────────────────────────────
+    // When the player walks into a stair riser, teleport the capsule above it
+    // so MoveAndSlide can proceed onto the tread. FloorSnapLength then snaps
+    // the player back down to the tread surface each frame.
+    void TryStepUp(Vector3 vel, float dt)
+    {
+        if (!IsOnFloor() || _sliding || _wallRunning) return;
+        var hv = new Vector3(vel.X, 0f, vel.Z);
+        if (hv.LengthSquared() < 0.01f) return;
+
+        var dir  = hv.Normalized();
+        float dist = Mathf.Max(hv.Length() * dt + 0.1f, 0.15f);
+
+        // Only act when there's an obstacle in the movement direction
+        if (!TestMove(GlobalTransform, dir * dist)) return;
+
+        // Confirm the floor ahead is HIGHER than current floor (ascending step, not descending).
+        // ProbeReach must be > capsuleRadius (0.35) so the probe lands inside the stair cell,
+        // past the riser face, rather than in the corridor behind the player.
+        const float HalfCapsule = 0.8f;
+        const float ProbeReach  = 0.55f;
+        float currentFloorY = GlobalPosition.Y - HalfCapsule;
+        // Skip if the player's floor is lower than last frame — they are descending stairs.
+        if (currentFloorY < _prevFloorY - 0.05f) return;
+        var spaceState = GetWorld3D().DirectSpaceState;
+        var probeFrom  = GlobalPosition + dir * ProbeReach + Vector3.Up  * StairStepHeight;
+        var probeTo    = GlobalPosition + dir * ProbeReach - Vector3.Up  * StairStepHeight;
+        var probeQ     = PhysicsRayQueryParameters3D.Create(probeFrom, probeTo, CollisionMask);
+        probeQ.Exclude = new Godot.Collections.Array<Rid> { GetRid() };
+        var probeHit   = spaceState.IntersectRay(probeQ);
+        if (probeHit.Count == 0) return; // no floor ahead — genuine wall or void
+        float floorAheadY = ((Vector3)probeHit["position"]).Y;
+        if (floorAheadY <= currentFloorY + 0.05f) return; // flat or descending — don't step up
+
+        // Skip if no headroom for the step-up
+        if (TestMove(GlobalTransform, Vector3.Up * StairStepHeight)) return;
+        // Skip if the raised path is still blocked (solid wall, not a step)
+        var upXf = GlobalTransform;
+        upXf.Origin.Y += StairStepHeight;
+        if (TestMove(upXf, dir * dist)) return;
+
+        // Valid ascending step — pop the capsule above the riser
+        GlobalPosition = upXf.Origin;
+    }
+
+    // ── Stair speed regulation ────────────────────────────────────────────────
+    // Going uphill: no speed penalty — momentum carries through at full speed.
+    // Adds gravity boost when sliding downhill.
+    // Only fires on steep floors (stairs ~51°, so floorNormal.Y ≈ 0.63).
+    void AdjustStairVelocity(ref Vector3 vel, float dt)
+    {
+        if (!IsOnFloor()) return;
+        var fn = GetFloorNormal();
+        if (fn.Y > 0.85f) return;   // flat floor, skip
+
+        // XZ component of floor normal points downhill
+        var downhillXZ = new Vector3(fn.X, 0f, fn.Z);
+        if (downhillXZ.LengthSquared() < 0.01f) return;
+        downhillXZ = downhillXZ.Normalized();
+
+        var velXZ = new Vector3(vel.X, 0f, vel.Z);
+        float slopeSign = velXZ.Dot(downhillXZ); // +ve = going downhill, -ve = going uphill
+
+        if (slopeSign < 0f)
+        {
+            // Going uphill: no penalty — allow momentum-driven stair climbing at any speed.
+            // (No cap applied; let the player carry full sprint momentum up stairs.)
+        }
+        else if (_sliding)
+        {
+            // Sliding downhill: gravity assist accelerates the slide
+            velXZ += downhillXZ * StairDownBoost * dt;
+            vel.X  = velXZ.X;
+            vel.Z  = velXZ.Z;
+            _slideSp = velXZ.Length();   // sync slide speed so friction tracks correctly
+        }
+    }
+
+    // ── FP gun viewmodel ──────────────────────────────────────────────────────
+    // Axes: X=right, Y=up, Z=back (negative Z = into screen / forward).
+    //
+    // The Styloo models ship with NO animation clips, but every gun is modelled in
+    // separate parts, so the whole "animated gun" read is procedural: the slide or
+    // bolt cycles on the fire timer, the magazine drops and reseats on the reload
+    // timer, the trigger pulls, and the shotgun's pump racks between shells. All of
+    // it is driven by GunCombat's own timers, so it stays locked to whatever fire
+    // rate and reload duration are tuned — something baked clips could not do.
+    static readonly Vector3 FpGunPosHip = new( 0.22f, -0.20f, -0.45f);
+    static readonly Vector3 FpGunRotHip = new( 0.00f,  0.00f,  0.00f);
+
+    // ADS: gun pulled to the centre of the screen and closer to the eye.
+    static readonly Vector3 FpGunPosAds = new( 0.00f, -0.10f, -0.30f);
+    static readonly Vector3 FpGunRotAds = Vector3.Zero;
+
+    // Cached part nodes + their rest transforms, refreshed on every gun swap.
+    Node3D? _gunSlide, _gunMag, _gunTrigger, _gunPump;
+    Vector3 _gunSlideRest, _gunMagRest, _gunTriggerRest, _gunPumpRest;
+
+    // Where the gun sits inside the hand bone. The holder stays at IDENTITY
+    // rotation on purpose: BuildFpGun already applies the +90° Y that points the
+    // barrel down -Z, so rotating here too would double it and turn the gun
+    // sideways. Same arrangement as the third-person holder.
+    // ── First-person viewmodel alignment (live-tunable) ───────────────────────
+    // These four vectors are the entire "does the gun sit in the hand" problem,
+    // and it is pure taste — no amount of reasoning beats dragging them while
+    // looking at the screen. [Export] puts them in the remote inspector so they
+    // can be adjusted DURING PLAY and the result read straight off the viewmodel;
+    // copy the values you like back here as the new defaults.
+    //
+    // Gun offsets are in the hand bone's space, arm offsets in camera space
+    // (+Y up, -Z into the screen).
+    [Export] public Vector3 FpGunInHandPos = new(0f, 0.01f, -0.03f);
+    [Export] public Vector3 FpGunInHandRot = Vector3.Zero;
+
+    // Where the ARMS sit when the gun is bone-attached. Recoil, ADS and sway move
+    // this root, carrying hands and weapon together as one rigid unit.
+    // Offsets are in CAMERA space (+Y up, -Z into the screen). The aim clips pose
+    // the hands at chest height, which sits below the eye — so the whole arms root
+    // is lifted and pushed forward to bring the weapon into the lower third of the
+    // frame, the way any viewmodel is cheated into view.
+    [Export] public Vector3 FpArmsPosHip = new( 0.02f, 0.10f, -0.24f);
+    [Export] public Vector3 FpArmsPosAds = new(-0.04f, 0.13f, -0.14f);
+
+    // Halo-style sprint carry: weapon dropped and canted across the body so it
+    // reads instantly as "not ready to fire". Sprinting is the one movement state
+    // worth telegraphing to yourself, because you cannot shoot out of it cleanly.
+    // Mild on purpose, two reasons: the arms ROOT is a whole body's origin ~1.6 m
+    // below the camera, so rotation there swings the hands through a huge arc —
+    // and the authored <Fam>_Sprint_Loop clips now POSE the arms per family
+    // (low-ready, high port, log carry), so the root only adds a small
+    // frame-composition nudge instead of doing the whole carry itself.
+    [Export] public Vector3 FpArmsPosSprint = new( 0.05f, 0.16f, -0.08f);
+    [Export] public Vector3 FpArmsRotSprint = new(-0.03f, 0.05f, -0.04f);
+
+    float _sprintBlend = 0f;   // 0 = ready, 1 = full sprint carry
+
+    /// How trustworthy a grip seat is.
+    ///   None        — never measured; the weapon stays hidden.
+    ///   Provisional — measured from whatever pose happened to be live when the
+    ///                 settle window expired. Right only by luck.
+    ///   Final       — measured against the canonical reference pose.
+    internal enum SeatQuality { None, Provisional, Final }
+
+    SeatQuality _fpSeat = SeatQuality.None;
+
+    /// Widest camera pitch that still counts as "looking level" for seating.
+    /// PlayerAnimator.SetAimPitch maps +/-60 deg onto the full -1..1 aim blend,
+    /// so 9 deg is a blend of 0.15 — near enough to neutral that the residual
+    /// error is smaller than the idle sway we deliberately keep.
+    const float SeatMaxPitchRad = 9f * Mathf.Pi / 180f;
+
+    /// Last value handed to PlayerAnimator.SetSprinting — the seat needs to know
+    /// the arms are NOT in a sprint carry, and the animator has no getter.
+    bool _animSprinting = false;
+
+    /// Is the skeleton in the pose the seat is allowed to use as its reference?
+    ///
+    /// SeatGrip bakes a correction relative to the HAND BONE's live orientation,
+    /// so the reference only means anything in the pose the weapon is supposed
+    /// to point forward in: standing, looking level, not mid-action. Measuring
+    /// during a sprint carry or a steep aim baked THAT pose in permanently and
+    /// left the gun canted for the rest of the equip — the "sideways gun".
+    ///
+    /// Pure and internal so test/TestSeatGate.cs can exercise it without a
+    /// skeleton, a camera or an animation tree.
+    internal static bool IsSeatReferenceValid(bool sprinting, float pitchRadians,
+                                              GunCombat.Phase phase)
+        => !sprinting
+        && Mathf.Abs(pitchRadians) <= SeatMaxPitchRad
+        && phase == GunCombat.Phase.Idle;
+
+    /// Bones whose posed positions define where a closed fist actually grips.
+    /// Godot humanoid-profile names (the rig is retargeted on import).
+    static readonly string[] GripBones =
+    {
+        "RightIndexProximal",  "RightIndexIntermediate",
+        "RightMiddleProximal", "RightMiddleIntermediate",
+        "RightRingProximal",   "RightRingIntermediate",
+        "RightLittleProximal", "RightLittleIntermediate",
+        "RightThumbProximal",  "RightThumbMetacarpal",
+    };
+
+    /// Slide the weapon so its TRIGGER sits exactly where the fingers close.
+    ///
+    /// The UAL1 hand is already curled around an invisible pistol — that is what
+    /// the clip was animated holding — so the job is not to invent an offset but
+    /// to find that existing grip point and put each gun's grip on it. The finger
+    /// joints give the grip; every Styloo model's `trigger` node gives the gun's
+    /// grip. Measured live from the posed skeleton rather than hand-tuned, so it
+    /// adapts per gun and survives any animation change.
+    /// Where a closed fist actually grips, measured live from a posed skeleton:
+    /// the average of the right hand's finger-joint positions. Returns false if
+    /// the skeleton has no finger bones (nothing to measure).
+    static bool TryGetGripPoint(Skeleton3D skel, out Vector3 gripWorld)
+    {
+        var sum = Vector3.Zero;
+        int n   = 0;
+        foreach (var bn in GripBones)
+        {
+            int idx = skel.FindBone(bn);
+            if (idx < 0) continue;
+            sum += (skel.GlobalTransform * skel.GetBoneGlobalPose(idx)).Origin;
+            n++;
+        }
+        gripWorld = n > 0 ? sum / n : Vector3.Zero;
+        return n > 0;
+    }
+
+    /// Seat `model` (a child of `holder`) into the fist: FIRST orient its barrel
+    /// to `fwd`, THEN shift it so `trigger` lands on the finger-centroid grip
+    /// point. Shared by the FP viewmodel and the TP hand weapon.
+    ///
+    /// The rotation seat exists because the holder inherits the HAND BONE's
+    /// orientation, and every animation family poses that bone differently — a
+    /// fixed holder rotation that pointed the AK forward left the shotgun
+    /// sideways. Seating against the character's actual forward at the posed aim
+    /// frame guarantees "facing forward" for every weapon in every family, and
+    /// carry/reload tilts still read because they are hand-bone DELTAS from the
+    /// seated reference.
+    static bool SeatGrip(Skeleton3D skel, Node3D holder, Node3D model,
+                         Node3D trigger, Vector3 fwd)
+    {
+        if (!TryGetGripPoint(skel, out var gripWorld)) return false;
+
+        // World basis whose +X (every Styloo barrel) is `fwd`, +Y kept upright.
+        fwd = fwd.Normalized();
+        var up = Vector3.Up;
+        if (Mathf.Abs(fwd.Dot(up)) > 0.99f) up = Vector3.Back;
+        var z = fwd.Cross(up).Normalized();          // right-handed: Z = X × Y
+        var y = z.Cross(fwd).Normalized();
+        var world = new Basis(fwd, y, z);
+
+        var scale = model.Scale;
+        model.Basis = holder.GlobalTransform.Basis.Orthonormalized().Inverse() * world;
+        model.Scale = scale;
+
+        // Position AFTER rotation — rotating moved the trigger.
+        var delta = holder.GlobalTransform.Basis.Inverse()
+                  * (gripWorld - trigger.GlobalPosition);
+        model.Position += delta;
+
+        // Verify, not hope: report where the barrel actually ended up pointing.
+        var barrel = (model.GlobalTransform.Basis * Vector3.Right).Normalized();
+        GD.Print($"[Seat] barrel=({barrel.X:F2},{barrel.Y:F2},{barrel.Z:F2}) " +
+                 $"wanted=({fwd.X:F2},{fwd.Y:F2},{fwd.Z:F2}) " +
+                 $"dot={barrel.Dot(fwd):F3}");
+        return true;
+    }
+
+    // Both seats wait ~a third of a second after equip: the family aim pose
+    // XFADES in, and seating mid-blend would capture a half-blended rotation
+    // as the reference. 20 physics frames comfortably outlasts the 0.2 s fade.
+    int _fpSeatDelay = 20;
+    int _tpSeatDelay = 20;
+
+    void SeatGripInHand()
+    {
+        if (_fpSeat == SeatQuality.Final || _fpHandAttach == null ||
+            _heldWeapon == null || _fpArmsModel == null) return;
+
+        bool canonical = IsSeatReferenceValid(_animSprinting, _pitch,
+                                              _combat?.CombatPhase ?? GunCombat.Phase.Idle);
+        // Seat on the first canonical frame. Failing that, once the settle
+        // window lapses take a PROVISIONAL seat so the weapon is not invisible
+        // while the player sprints — then upgrade the moment they settle.
+        bool settled = _fpSeatDelay-- <= 0;
+        if (!canonical && !(settled && _fpSeat == SeatQuality.None)) return;
+
+        var skel  = FindFirst<Skeleton3D>(_fpArmsModel);
+        var model = _heldWeapon.GetChildOrNull<Node3D>(0);
+        if (skel != null && model != null)
+            // Anchor fallback: not every gun has a trigger node (the quad pod
+            // doesn't) — without this it never seated at all and rendered with
+            // the raw hand-bone orientation, i.e. "oriented weird".
+            SeatGrip(skel, _heldWeapon, model, _gunTrigger ?? model,
+                     -_cam.GlobalTransform.Basis.Z);   // straight down the camera
+        // Final only when the reference pose was actually canonical; otherwise
+        // this is a stopgap that the next settled frame replaces. THIS is the
+        // fix for the sideways gun: a bad measurement is no longer permanent.
+        _fpSeat = canonical ? SeatQuality.Final : SeatQuality.Provisional;
+    }
+
+    // ── TP grip seating — what the OPPONENT sees ──────────────────────────────
+    SeatQuality _tpSeat = SeatQuality.None;
+    Node3D? _tpTrigger;
+
+    void SeatTpGrip()
+    {
+        if (_tpSeat == SeatQuality.Final || _tpWeapon == null || _playerBody == null) return;
+
+        bool canonical = IsSeatReferenceValid(_animSprinting, _pitch,
+                                              _combat?.CombatPhase ?? GunCombat.Phase.Idle);
+        bool settled = _tpSeatDelay-- <= 0;
+        if (!canonical && !(settled && _tpSeat == SeatQuality.None)) return;
+
+        var skel  = FindFirst<Skeleton3D>(_playerBody);
+        var model = _tpWeapon.GetChildOrNull<Node3D>(0);
+        if (skel != null && model != null)
+        {
+            if (SeatGrip(skel, _tpWeapon, model, _tpTrigger ?? model, ForwardVector))
+                GD.Print("[Player] TP grip seated");
+            model.Visible = true;   // was hidden through the settle window
+        }
+        _tpSeat = canonical ? SeatQuality.Final : SeatQuality.Provisional;
+    }
+
+    void AnimateFpGun(float dt)
+    {
+        if (_heldWeapon == null || !HasWeapon || _combat == null) return;
+        SeatGripInHand();
+
+        // With real arms the weapon is welded to the hand bone, so posing the gun
+        // directly would slide it out of the fist. Drive the arms root instead.
+        if (_fpHandAttach != null && _fpArmsModel != null)
+        {
+            // Scoped: you look through the optic, not past your own hands. Hiding
+            // the arms as well as the gun is what stops a forearm sitting inside
+            // the lens.
+            bool hideForScope = _scopeBlend >= 0.999f;
+            _fpArmsModel.Visible = !hideForScope;
+            // Hidden until the grip seat has run: the 20-frame settle window
+            // otherwise SHOWS the unseated (wrongly oriented) gun on every swap.
+            _heldWeapon.Visible  = HasWeapon && !_tpMode && !hideForScope && _fpSeat != SeatQuality.None;
+
+            var armPos  = FpArmsPosHip.Lerp(FpArmsPosAds, _adsBlend)
+                        + new Vector3(0f, 0.010f * _fpGunKick, 0.040f * _fpGunKick);
+            var armRot  = new Vector3(-0.14f * _fpGunKick, 0f, 0f);
+
+            // Sprint carry wins over the hip pose but never over aiming — you
+            // cannot be sprinting and scoped at once.
+            float sprintW = _sprintBlend * (1f - _adsBlend);
+            armPos = armPos.Lerp(FpArmsPosSprint, sprintW);
+            // Per-gun tuck on top — the pistol's high-port parks a fist in the
+            // middle of the screen without it.
+            armPos += _combat.Def.FpSprintTuck * sprintW;
+            armRot += FpArmsRotSprint * sprintW;
+
+            float swayA = (1f - 0.75f * _adsBlend) * (1f + 0.6f * sprintW);
+            armPos += new Vector3(_swayOffset.X, _swayOffset.Y, 0f) * swayA;
+
+            float ta = Mathf.Clamp(18f * dt, 0f, 1f);
+            var restPos = new Vector3(0f, ModelYOff - EyeHeight, 0f);
+            _fpArmsModel.Position = _fpArmsModel.Position.Lerp(restPos + armPos, ta);
+            _fpArmsModel.Rotation = _fpArmsModel.Rotation.Lerp(
+                new Vector3(0f, Mathf.Pi, 0f) + armRot, ta);
+
+            if (_heldWeapon != null)
+            {
+                // Re-applied per frame so the [Export] values above can be dragged
+                // live in the remote inspector and take effect immediately.
+                _heldWeapon.Position        = FpGunInHandPos + _combat.Def.FpSeatOffset;
+                _heldWeapon.RotationDegrees = FpGunInHandRot;
+            }
+
+            AnimateGunParts();
+            return;
+        }
+
+        // ── Whole-gun pose: hip ↔ ADS, plus recoil kick and look-sway ──────────
+        var basePos = FpGunPosHip.Lerp(FpGunPosAds, _adsBlend);
+        var baseRot = FpGunRotHip.Lerp(FpGunRotAds, _adsBlend);
+
+        // Recoil shoves the gun back toward the eye and tips the muzzle up.
+        var kickPos = new Vector3(0f, 0.012f * _fpGunKick, 0.045f * _fpGunKick);
+        var kickRot = new Vector3(-0.18f * _fpGunKick, 0f, 0f);
+
+        // Sway is damped while aiming — steadier sights.
+        float swayScale = 1f - 0.75f * _adsBlend;
+        var   swayDelta = new Vector3(_swayOffset.X, _swayOffset.Y, 0f) * swayScale;
+
+        float t = Mathf.Clamp(18f * dt, 0f, 1f);
+        _heldWeapon.Position = _heldWeapon.Position.Lerp(basePos + kickPos + swayDelta, t);
+        _heldWeapon.Rotation = _heldWeapon.Rotation.Lerp(baseRot + kickRot, t);
+
+        AnimateGunParts();
+    }
+
+    /// Move the individual gun parts. Everything here is a pure function of
+    /// GunCombat's fire/reload progress, so it never drifts out of sync.
+    void AnimateGunParts()
+    {
+        var def = _combat.Def;
+
+        // Slide / bolt: snaps fully back the instant the shot goes off, then rides
+        // forward over the first ~35% of the fire interval.
+        if (_gunSlide != null)
+        {
+            float cycle = Mathf.Clamp(_combat.FireCycle / 0.35f, 0f, 1f);
+            float back  = 1f - cycle;                       // 1 = fully rearward
+            _gunSlide.Position = _gunSlideRest + new Vector3(0f, 0f, back * 0.055f);
+        }
+
+        // Pump (shotgun): racks back and returns over the whole fire interval —
+        // slower and more deliberate than a slide, which is the point.
+        if (_gunPump != null)
+        {
+            float c    = _combat.FireCycle;
+            float rack = Mathf.Sin(Mathf.Clamp(c, 0f, 1f) * Mathf.Pi);
+            _gunPump.Position = _gunPumpRest + new Vector3(0f, 0f, rack * 0.075f);
+        }
+
+        // Trigger: quick pull on the shot, springs back.
+        if (_gunTrigger != null)
+        {
+            float pull = 1f - Mathf.Clamp(_combat.FireCycle / 0.2f, 0f, 1f);
+            _gunTrigger.Rotation = _gunTriggerRest + new Vector3(pull * 0.35f, 0f, 0f);
+        }
+
+        // Magazine: drops out and away in the first third of the reload, is gone
+        // through the middle, then slams home over the last third.
+        if (_gunMag != null)
+        {
+            float p    = _combat.ReloadProgress;
+            float drop = !_combat.IsReloading ? 0f
+                       : p < 0.33f            ? p / 0.33f              // falling out
+                       : p < 0.70f            ? 1f                     // out of the gun
+                       :                        1f - (p - 0.70f) / 0.30f; // slamming back
+            _gunMag.Position = _gunMagRest + new Vector3(0f, -drop * 0.20f, 0f);
+        }
+    }
+
+    /// Swap the first-person viewmodel to a new gun and re-cache its moving parts.
+    void RebuildFpGun(string gunId)
+    {
+        if (_cam == null) return;
+
+        _gunSlide = _gunMag = _gunTrigger = _gunPump = null;
+
+        if (_heldWeapon != null)
+        {
+            _heldWeapon.QueueFree();
+            _heldWeapon = null;
+        }
+
+        if (!GunCombat.Defs.TryGetValue(gunId, out var def)) return;
+
+        _heldWeapon = BuildFpGun(def);
+        // Prefer the hand bone so the grip tracks the animated hand; fall back to
+        // camera-space only when the arms model is absent (then it is a floating
+        // weapon, which is what this was before the arms existed).
+        if (_fpHandAttach != null)
+        {
+            _fpHandAttach.AddChild(_heldWeapon);
+            _heldWeapon.Position        = FpGunInHandPos;
+            _heldWeapon.RotationDegrees = FpGunInHandRot;
+        }
+        else
+        {
+            _cam.AddChild(_heldWeapon);
+        }
+        _heldWeapon.Visible = HasWeapon && !_tpMode;
+
+        // Barrel tip in model-local space, for muzzle-anchored effects.
+        {
+            var a = GunCombat.MeasureAabb(_heldWeapon.GetChildOrNull<Node3D>(0) ?? _heldWeapon);
+            _fpMuzzleLocal = new Vector3(a.Position.X + a.Size.X,
+                                         a.Position.Y + a.Size.Y * 0.5f,
+                                         a.Position.Z + a.Size.Z * 0.5f);
+        }
+
+        // Cache the moving parts by the node names baked into the GunDef.
+        _gunSlide   = FindDescendant(_heldWeapon, def.PartSlide);
+        _gunMag     = FindDescendant(_heldWeapon, def.PartMag);
+        _gunTrigger = FindDescendant(_heldWeapon, def.PartTrigger);
+        _gunPump    = FindDescendant(_heldWeapon, def.PartPump);
+
+        // Grip auto-seating happens in AnimateFpGun once the skeleton has a real
+        // pose — measuring finger positions here would read the rest pose.
+        _fpSeat      = SeatQuality.None;
+        _fpSeatDelay = 20;
+
+        if (_gunSlide   != null) _gunSlideRest   = _gunSlide.Position;
+        if (_gunMag     != null) _gunMagRest     = _gunMag.Position;
+        if (_gunTrigger != null) _gunTriggerRest = _gunTrigger.Rotation;
+        if (_gunPump    != null) _gunPumpRest    = _gunPump.Position;
+
+        GD.Print($"[Player] FP gun '{def.Display}' — parts: " +
+                 $"slide={_gunSlide != null} mag={_gunMag != null} " +
+                 $"trigger={_gunTrigger != null} pump={_gunPump != null}");
+    }
+
+    /// Shared hand-alignment correction for every gun, applied on top of the
+    /// barrel-forward rotation. Swept empirically by test/TestGunHold.tscn rather
+    /// than derived — the humanoid rig's RightHand bone axes are not documented
+    /// anywhere we control.
+    public static Vector3 TpHandRot = new(0f, 0f, 0f);
+
+    /// Swap the third-person (hand-attached) gun model. This is what the OPPONENT
+    /// sees, so it matters as much as the viewmodel in a 1v1.
+    void RebuildTpGun(string gunId)
+    {
+        if (_tpWeapon == null) return;
+        foreach (Node c in _tpWeapon.GetChildren()) c.QueueFree();
+
+        if (!GunCombat.Defs.TryGetValue(gunId, out var def)) return;
+        if (!ResourceLoader.Exists(def.Model)) return;
+
+        var scene = GD.Load<PackedScene>(def.Model);
+        if (scene == null) return;
+
+        var model = scene.Instantiate<Node3D>();
+        var aabb  = GunCombat.MeasureAabb(model);
+        float maxD = Mathf.Max(aabb.Size.X, Mathf.Max(aabb.Size.Y, aabb.Size.Z));
+        // Same TrueLength as the viewmodel — first and third person must agree
+        // about how big a weapon is, and a 0.6 m AWP read as a toy.
+        model.Scale = maxD > 0.01f ? Vector3.One * (def.TrueLength / maxD) : Vector3.One * 0.01f;
+        // Same +90° Y as the viewmodel puts the barrel (+X in every Styloo model)
+        // onto -Z; TpRot then seats it in the hand, whose bone axes are not camera
+        // space. TpHandRot is the shared correction found by TestGunHold.
+        model.RotationDegrees = new Vector3(0f, 90f, 0f) + TpHandRot + def.TpRot;
+        FixStylooMaterials(model);
+        _tpWeapon.AddChild(model);
+        SetLayersRecursive(_playerBody, 2u);   // keep the body off the FP camera
+
+        _tpMuzzleLocal = new Vector3(aabb.Position.X + aabb.Size.X,
+                                     aabb.Position.Y + aabb.Size.Y * 0.5f,
+                                     aabb.Position.Z + aabb.Size.Z * 0.5f);
+
+        // Grip seating runs later, from a POSED skeleton — measuring here would
+        // read the rest pose (same rule as the FP seat). Hidden until then so a
+        // swap never shows the unseated orientation.
+        model.Visible = false;
+        _tpTrigger    = FindDescendant(model, def.PartTrigger);
+        _tpSeat       = SeatQuality.None;
+        _tpSeatDelay  = 20;
+
+        // Moving parts on the HAND model, so shots and reloads read on the gun
+        // itself from the outside — the FP viewmodel already animates these, but
+        // an observer (the opponent, or the third-person camera) was watching a
+        // completely rigid weapon.
+        _tpSlidePart = FindDescendant(model, def.PartSlide) ?? FindDescendant(model, def.PartPump);
+        _tpMagPart   = FindDescendant(model, def.PartMag);
+        _tpSlideRest = _tpSlidePart?.Position ?? Vector3.Zero;
+        _tpMagRest   = _tpMagPart?.Position ?? Vector3.Zero;
+    }
+
+    // ── Third-person gun part pulses ──────────────────────────────────────────
+    // Tween one-shots rather than per-frame timer reads: a puppet's GunCombat
+    // never actually fires or reloads (events arrive over the net), so there is
+    // no local FireCycle/ReloadProgress to sample — but a tween only needs the
+    // event edge, which is exactly what the relay delivers.
+    Node3D? _tpSlidePart, _tpMagPart;
+    Vector3 _tpSlideRest, _tpMagRest;
+
+    void PulseTpShot()
+    {
+        if (_tpSlidePart == null || !IsInstanceValid(_tpSlidePart)) return;
+        _tpSlidePart.Position = _tpSlideRest;
+        var tw = _tpSlidePart.CreateTween();
+        tw.TweenProperty(_tpSlidePart, "position",
+            _tpSlideRest + new Vector3(0f, 0f, 0.055f), 0.03f);
+        tw.TweenProperty(_tpSlidePart, "position", _tpSlideRest, 0.10f);
+    }
+
+    void PulseTpReload(float dur)
+    {
+        if (_tpMagPart == null || !IsInstanceValid(_tpMagPart)) return;
+        _tpMagPart.Position = _tpMagRest;
+        var tw   = _tpMagPart.CreateTween();
+        var down = _tpMagRest + new Vector3(0f, -0.20f, 0f);
+        tw.TweenProperty(_tpMagPart, "position", down, dur * 0.30f);
+        tw.TweenInterval(dur * 0.40f);
+        tw.TweenProperty(_tpMagPart, "position", _tpMagRest, dur * 0.30f);
+    }
+
+    static Node3D? FindDescendant(Node root, string name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        if (root.Name == name && root is Node3D hit) return hit;
+        foreach (Node child in root.GetChildren())
+        {
+            var found = FindDescendant(child, name);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    /// Build the camera-space gun. The Styloo readme warns that a metallic/rough
+    /// workflow washes these textures out, so every material is forced to
+    /// roughness 1 / metallic 0 as the pack recommends.
+    Node3D BuildFpGun(GunCombat.GunDef def)
+    {
+        var holder = new Node3D
+        {
+            Name     = "HeldWeapon",
+            Position = FpGunPosHip,
+            Visible  = false,
+        };
+
+        var scene = ResourceLoader.Exists(def.Model) ? GD.Load<PackedScene>(def.Model) : null;
+        if (scene != null)
+        {
+            var model = scene.Instantiate<Node3D>();
+            model.Name = "HeldWeaponMesh";
+
+            // Normalise every gun to a consistent on-screen size.
+            var  aabb = GunCombat.MeasureAabb(model);
+            float maxD = Mathf.Max(aabb.Size.X, Mathf.Max(aabb.Size.Y, aabb.Size.Z));
+            // Scale to the weapon's REAL length. Normalising every gun to one
+            // size made the pistol as long as the AK; with real hands on screen
+            // as a reference, per-gun true scale is what reads correctly.
+            model.Scale = maxD > 0.01f ? Vector3.One * (def.TrueLength * def.FpScale / maxD)
+                                       : Vector3.One * 0.01f;
+            // Every Styloo gun is modelled with its barrel along +X (verified by
+            // dumping each model's AABB — all seven report longest=X). A +90° Y
+            // rotation maps local +X onto -Z, i.e. straight into the screen, so
+            // the muzzle points downrange instead of across it. Per-gun tweaks go
+            // in GunDef.FpRot.
+            model.RotationDegrees = new Vector3(0f, 90f, 0f) + def.FpRot;
+
+            FixStylooMaterials(model);
+            SetLayersRecursive(model, 4u);   // layer 3 — FP camera only
+            holder.AddChild(model);
+            return holder;
+        }
+
+        GD.PrintErr($"[Player] Gun model missing: {def.Model} — using placeholder box");
+        var box = new MeshInstance3D
+        {
+            Name = "HeldWeaponMesh",
+            Mesh = new BoxMesh { Size = new Vector3(0.08f, 0.12f, 0.42f) },
+        };
+        box.SetSurfaceOverrideMaterial(0, new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.22f, 0.22f, 0.25f), Metallic = 0f, Roughness = 1f,
+        });
+        box.Layers = 4u;
+        holder.AddChild(box);
+        return holder;
+    }
+
+    /// Per the pack's readme: a metal/rough workflow washes the colour out. Force
+    /// roughness 1 / metallic 0 so the textures read as authored. Public so the
+    /// HUD's weapon-slot icons render the same models the same way.
+    public static void FixStylooMaterials(Node node)
+    {
+        if (node is MeshInstance3D mi && mi.Mesh != null)
+        {
+            for (int s = 0; s < mi.Mesh.GetSurfaceCount(); s++)
+            {
+                if (mi.Mesh.SurfaceGetMaterial(s) is StandardMaterial3D src)
+                {
+                    var m = (StandardMaterial3D)src.Duplicate();
+                    m.Metallic  = 0f;
+                    m.Roughness = 1f;
+                    mi.SetSurfaceOverrideMaterial(s, m);
+                }
+            }
+        }
+        foreach (Node child in node.GetChildren()) FixStylooMaterials(child);
+    }
+
+
+    // ── Camera head bob ────────────────────────────────────────────────────────
+    void UpdateCameraBob(float dt, float speed, bool onFloor)
+    {
+        if (onFloor && speed > 0.5f)
+        {
+            float freq = speed > 7f ? 14f : 9f;
+            float ampY = speed > 7f ? 0.030f : 0.016f;
+            float ampX = ampY * 0.45f;
+            // Scoped = braced. Bob fades out with ADS so the zoomed sight
+            // picture stays steady while strafing — accuracy is already
+            // movement-free (GunCombat.CurrentSpread); this keeps the FEEL
+            // matching it. Mouse sway is damped the same way at _adsBlend use.
+            ampY *= 1f - _adsBlend;
+            ampX *= 1f - _adsBlend;
+            _camBobPhase += dt * freq;
+            // Y: heel-strike pattern (always downward — Abs keeps it below the baseline)
+            float bobY = -Mathf.Abs(Mathf.Sin(_camBobPhase)) * ampY;
+            float bobX =  Mathf.Sin(_camBobPhase * 0.5f) * ampX;
+            _camBobOffset = _camBobOffset.Lerp(new Vector3(bobX, bobY, 0f), 16f * dt);
+        }
+        else
+        {
+            _camBobOffset = _camBobOffset.Lerp(Vector3.Zero, 8f * dt);
+        }
+        // Camera sits at eye socket; bob is the only positional offset
+        _cam.Position = _camBobOffset;
+    }
+
+    // ── Weapon inertia (spring simulation) ────────────────────────────────────
+    void UpdateWeaponSway(float dt)
+    {
+        // Spring force pulls sway back to zero; damping prevents oscillation
+        _swayVelocity += (-_swayOffset * SwaySpring - _swayVelocity * SwayDamp) * dt;
+        // Mouse input adds an impulse (X=yaw, Y=pitch → invert X so sway opposes motion)
+        _swayVelocity += new Vector2(-_frameMouseDelta.X, _frameMouseDelta.Y) * SwayScale;
+        _swayOffset   += _swayVelocity * dt;
+        _swayOffset    = _swayOffset.Clamp(Vector2.One * -SwayLimit, Vector2.One * SwayLimit);
+        _frameMouseDelta = Vector2.Zero;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    void ApplyLook()
+    {
+        _mount.Rotation = new(0f, _yaw, 0f);
+        if (_camShakeAmount > 0.005f)
+        {
+            double t  = Time.GetUnixTimeFromSystem() * 48.0;
+            float shX = (float)Mathf.Sin(t * 3.1) * _camShakeAmount * 0.045f;
+            float shY = (float)Mathf.Sin(t * 2.7) * _camShakeAmount * 0.022f;
+            _cam.Rotation = new(_pitch + shX, shY, _camRoll);
+        }
+        else
+        {
+            _cam.Rotation = new(_pitch, 0f, _camRoll);
+        }
+    }
+
+    public void PickupWeapon()
+    {
+        HasWeapon = true;
+
+        // The hand-held gun is part of the character body, which lives on visual
+        // layer 2 — the owner's own FP camera already excludes that layer. So it
+        // can just always be visible while armed, and MUST be: it is what the
+        // OPPONENT sees. Gating it on _tpMode (a leftover from before the layer
+        // split) meant every remote puppet rendered empty-handed, so you could
+        // never tell what weapon you were up against.
+        if (_tpWeapon != null) _tpWeapon.Visible = true;
+
+        // The camera-space viewmodel is first-person only.
+        if (_heldWeapon != null) _heldWeapon.Visible = !_tpMode;
+    }
+
+    // ── Sword tiers ────────────────────────────────────────────────────────────
+    // Players spawn with the weaker sword (half damage, no lifesteal).
+    // Grabbing the arena pickup upgrades them to the middle sword (full damage + 10% lifesteal)
+    // and briefly grants a wallhack outline of the opponent.
+
+    const float WallhackDuration = 10f;
+
+    Node3D?              _wallhackOutline;            // root node holding the skinned outline meshes
+    List<MeshInstance3D> _wallhackMeshes = new();     // duplicated MeshInstance3Ds that mirror the skeleton
+    Node3D?              _wallhackMarker;             // spinning red diamond over the head
+    float           _wallhackTimer = 0f;
+
+    // ── Loadout slots ─────────────────────────────────────────────────────────
+    // The spawn roll is your SECONDARY; the arena prize is your PRIMARY. Claiming
+    // the prize keeps the starter — `gun_switch` (Tab) swaps between the two.
+
+    /// Arena prize slot — null until the middle pickup is claimed.
+    public string? PrimaryGunId   { get; private set; }
+    /// Spawn-roll slot.
+    public string? SecondaryGunId { get; private set; }
+    public bool     HasBothGuns   => PrimaryGunId != null && SecondaryGunId != null;
+
+    /// Fired when the LOCAL player swaps slots, with the newly held gun id —
+    /// the online arena relays it so the opponent's puppet shows the right gun.
+    public event Action<string>? WeaponSwitched;
+
+    /// Spawn loadout — a gun rolled from GunCombat.StarterPool. The caller passes
+    /// the id so both players in a match can be given the SAME roll. Resets the
+    /// whole loadout: secondary = the roll, primary empty, mags forgotten.
+    public void EquipStarterGun(string gunId)
+    {
+        PickupWeapon();
+        SecondaryGunId = gunId;
+        PrimaryGunId   = null;
+        _combat.ResetStoredAmmo();
+        _combat.Equip(gunId);
+        _combat.DamageMultiplier = 1.0f;
+        _combat.Lifesteal        = 0f;
+    }
+
+    /// The arena prize — a gun rolled from GunCombat.ArenaPool. Fills the PRIMARY
+    /// slot and switches to it; the starter stays holstered in SECONDARY. Also
+    /// lights the opponent up through walls for a few seconds, as the arena
+    /// sword used to.
+    public void EquipArenaGun(string gunId)
+    {
+        PickupWeapon();
+        PrimaryGunId = gunId;
+        _combat.SwitchTo(gunId);
+        _combat.DamageMultiplier = 1.0f;
+        _combat.Lifesteal        = 0.10f;
+        TriggerOpponentWallhack();
+    }
+
+    /// Tab / mouse wheel: swap the held slot. No-op until both slots are filled.
+    public void SwitchWeapon()
+    {
+        if (!HasBothGuns) return;
+        SelectGun(_combat.Def.Id == PrimaryGunId ? SecondaryGunId : PrimaryGunId);
+    }
+
+    /// Scroll a step through the carried weapons, wrapping at both ends —
+    /// CS-style `invnext` / `invprev`. `dir` is +1 (wheel down) or -1 (wheel up).
+    ///
+    /// Written as an ordered ring over the FILLED slots rather than a two-way
+    /// toggle so that direction is meaningful the moment a third slot exists,
+    /// and so scrolling with only the starter in hand is a no-op instead of a
+    /// swap to nothing.
+    public void CycleWeapon(int dir)
+    {
+        // Plain array, not stackalloc — string is a managed type.
+        var ring = new string?[2];
+        int n = 0;
+        if (PrimaryGunId   != null) ring[n++] = PrimaryGunId;     // slot 1
+        if (SecondaryGunId != null) ring[n++] = SecondaryGunId;   // slot 2
+        if (n < 2) return;                                        // nothing to cycle
+
+        string cur = _combat.Def.Id;
+        int at = -1;
+        for (int i = 0; i < n; i++) if (ring[i] == cur) { at = i; break; }
+        if (at < 0) at = 0;   // holding something not in a slot: treat as slot 1
+
+        // Mathf.PosMod, not %: C# % yields -1 for (0 - 1) % 2 and would index
+        // out of the ring when scrolling up from the first weapon.
+        SelectGun(ring[Mathf.PosMod(at + dir, n)]);
+    }
+
+    /// Key 1 — the arena prize. No-op before it is claimed (slot empty).
+    public void SelectPrimary()   => SelectGun(PrimaryGunId);
+
+    /// Key 2 — the starter gun. Always present from spawn.
+    public void SelectSecondary() => SelectGun(SecondaryGunId);
+
+    /// One path for every slot change, so the WeaponSwitched relay can never be
+    /// skipped by a new caller — the opponent's puppet would then show the
+    /// wrong gun for the rest of the match.
+    void SelectGun(string? id)
+    {
+        if (id == null || _combat.Def.Id == id) return;
+        _combat.SwitchTo(id);
+        WeaponSwitched?.Invoke(id);
+    }
+
+    // ── Muzzle point ──────────────────────────────────────────────────────────
+    // The barrel tip in MODEL-LOCAL space, cached per equip from the measured
+    // AABB (max-X face centre — every Styloo barrel runs along +X). World
+    // position falls out of the model's live transform, so it tracks every
+    // animation frame for free.
+    Vector3 _fpMuzzleLocal, _tpMuzzleLocal;
+
+    /// Where the equipped weapon's muzzle is RIGHT NOW. Prefers the FP viewmodel
+    /// for the local first-person player, the hand model otherwise (third-person
+    /// toggle and remote puppets). Falls back to just ahead of the eye if no
+    /// model exists yet — e.g. during the seat-settle window after a swap.
+    public Vector3 GetMuzzleWorldPoint()
+    {
+        Node3D? model = null;
+        Vector3 local = Vector3.Zero;
+
+        if (!_tpMode && !IsRemotePuppet && _heldWeapon != null && _heldWeapon.Visible)
+        {
+            model = _heldWeapon.GetChildOrNull<Node3D>(0);
+            local = _fpMuzzleLocal;
+        }
+        if (model == null && _tpWeapon != null)
+        {
+            model = _tpWeapon.GetChildOrNull<Node3D>(0);
+            local = _tpMuzzleLocal;
+        }
+
+        if (model != null)
+            return model.GlobalTransform * local;
+        return GlobalPosition + Vector3.Up * EyeHeight + ForwardVector * 0.6f;
+    }
+
+    void TriggerOpponentWallhack()
+    {
+        // Find the opposing player in the scene (the only PlayerController that isn't us)
+        var scene = GetTree().CurrentScene;
+        if (scene == null) return;
+        foreach (var node in GetTree().GetNodesInGroup("players"))
+        {
+            if (node is PlayerController pc && pc != this)
+                pc.ShowWallhackOutline(WallhackDuration);
+        }
+    }
+
+    /// Makes this player's character mesh visible through walls for `seconds`.
+    /// Called on the OPPONENT when the local player grabs the middle sword.
+    /// Each MeshInstance3D in the character model is mirrored by a duplicate that
+    /// shares the same Mesh + Skin + Skeleton — so the outline follows the live
+    /// animation pose (no T-pose, no capsule).
+    public void ShowWallhackOutline(float seconds)
+    {
+        if (_wallhackOutline == null)
+            BuildSkinnedWallhackOutline();
+        if (_wallhackOutline == null)
+        {
+            // Loud, not silent: if the model hierarchy ever renames again the
+            // claim's marking package quietly vanishing is a playtest mystery.
+            GD.PushWarning("[Wallhack] No CharacterModel/skinned meshes found — outline not shown.");
+            return;
+        }
+        SetWallhackVisible(true);
+        _wallhackTimer = seconds;
+    }
+
+    void BuildSkinnedWallhackOutline()
+    {
+        var characterModel = _playerBody?.GetNodeOrNull<Node3D>("CharacterModel");
+        if (characterModel == null) return;
+
+        var srcMeshes = new List<MeshInstance3D>();
+        CollectSkinnedMeshes(characterModel, srcMeshes);
+        if (srcMeshes.Count == 0) return;
+
+        // Unshaded red, emissive, draws through walls. Cull Front gives a faint
+        // "shell silhouette" feel so it reads as an outline rather than a flat tint.
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor              = new Color(1.0f, 0.30f, 0.30f, 0.85f),
+            ShadingMode              = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            NoDepthTest              = true,
+            EmissionEnabled          = true,
+            Emission                 = new Color(1.0f, 0.20f, 0.20f),
+            EmissionEnergyMultiplier = 2.0f,
+            Transparency             = BaseMaterial3D.TransparencyEnum.Alpha,
+            CullMode                 = BaseMaterial3D.CullModeEnum.Front,
+        };
+
+        // The marker node doubles as the "already built" flag; the actual wallhack
+        // meshes live next to each source mesh so they inherit the same skeleton.
+        _wallhackOutline = new Node3D { Name = "WallhackOutlineMarker" };
+        AddChild(_wallhackOutline);
+        _wallhackMeshes.Clear();
+
+        // Floating red diamond over the head — the classic "marked" glyph. Two
+        // apex-to-apex 4-sided cones under the marker node, so visibility and
+        // the spin/bob in TickWallhack come along for free. NoDepthTest: it is
+        // part of the wallhack package, so it reads through walls too.
+        _wallhackMarker = new Node3D { Name = "WallhackDiamond", Position = new Vector3(0f, 1.35f, 0f) };
+        _wallhackOutline.AddChild(_wallhackMarker);
+        var dmat = new StandardMaterial3D
+        {
+            AlbedoColor              = new Color(1f, 0.15f, 0.15f, 0.95f),
+            ShadingMode              = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            NoDepthTest              = true,
+            EmissionEnabled          = true,
+            Emission                 = new Color(1f, 0.10f, 0.10f),
+            EmissionEnergyMultiplier = 2.5f,
+            Transparency             = BaseMaterial3D.TransparencyEnum.Alpha,
+        };
+        foreach (bool topHalf in new[] { true, false })
+        {
+            var cone = new MeshInstance3D
+            {
+                Mesh = new CylinderMesh
+                {
+                    TopRadius      = topHalf ? 0f : 0.16f,
+                    BottomRadius   = topHalf ? 0.16f : 0f,
+                    Height         = 0.22f,
+                    RadialSegments = 4,
+                },
+                Position   = new Vector3(0f, topHalf ? 0.11f : -0.11f, 0f),
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            };
+            cone.SetSurfaceOverrideMaterial(0, dmat);
+            _wallhackMarker.AddChild(cone);
+        }
+
+        foreach (var src in srcMeshes)
+        {
+            var dup = new MeshInstance3D
+            {
+                Name             = src.Name + "_Wallhack",
+                Mesh             = src.Mesh,
+                Skin             = src.Skin,
+                MaterialOverride = mat,
+                Layers           = 1u,                                  // world layer 1 (visible to both cameras)
+                Transform        = src.Transform,
+                Visible          = false,
+            };
+            src.GetParent()?.AddChild(dup);
+            // Same parent → the relative Skeleton NodePath from src points to the same Skeleton3D.
+            dup.Skeleton = src.Skeleton;
+            _wallhackMeshes.Add(dup);
+        }
+    }
+
+    void SetWallhackVisible(bool visible)
+    {
+        foreach (var mi in _wallhackMeshes)
+            if (IsInstanceValid(mi)) mi.Visible = visible;
+        if (_wallhackOutline != null && IsInstanceValid(_wallhackOutline))
+            _wallhackOutline.Visible = visible;   // marker, no children of its own
+    }
+
+    static void CollectSkinnedMeshes(Node node, List<MeshInstance3D> sink)
+    {
+        if (node is MeshInstance3D mi && mi.Mesh != null) sink.Add(mi);
+        foreach (Node child in node.GetChildren()) CollectSkinnedMeshes(child, sink);
+    }
+
+    void TickWallhack(float dt)
+    {
+        if (_wallhackOutline == null || !_wallhackOutline.Visible) return;
+        if (_wallhackMarker != null)
+        {
+            _wallhackMarker.RotateY(2.6f * dt);
+            _wallhackMarker.Position = new Vector3(
+                0f, 1.35f + Mathf.Sin(_wallhackTimer * 3f) * 0.08f, 0f);
+        }
+        _wallhackTimer -= dt;
+        if (_wallhackTimer <= 0f) SetWallhackVisible(false);
+    }
+
+    public void ToggleCameraMode()
+    {
+        _tpMode = !_tpMode;
+        // _playerBody is always visible — real model provides FP body awareness
+        if (_tpMode)
+        {
+            _tpCam.MakeCurrent();
+            if (_heldWeapon  != null) _heldWeapon.Visible  = false;
+            if (_tpWeapon    != null) _tpWeapon.Visible    = HasWeapon;
+            if (_fpArmsModel != null) _fpArmsModel.Visible = false;
+        }
+        else
+        {
+            _cam.MakeCurrent();
+            if (_heldWeapon  != null) _heldWeapon.Visible  = HasWeapon;
+            // Stays visible: layer 2 keeps it out of our own FP view, and it is
+            // what everyone else sees us holding.
+            if (_tpWeapon    != null) _tpWeapon.Visible    = HasWeapon;
+            if (_fpArmsModel != null) _fpArmsModel.Visible = true;
+        }
+    }
+
+    // ── Model config ──────────────────────────────────────────────────────────
+    // UAL1 mannequin is used as the character — its skeleton perfectly matches its own
+    // animations, so no retargeting mismatch (armored_guard had rest-pose orientation issues).
+    const string ModelPath    = "res://playerModels/animations/Universal Animation Library[Standard]/Unreal-Godot/UAL1_Standard.glb";
+    const string FpArmsPath   = "res://playerModels/UAL1_FpArms.glb";
+    const string SwordGlbPath    = "res://assets/all_dmc2_swords_remade.glb";
+    const string ArenaSword      = "plane_001_merciless";   // starting (weaker) sword
+    const string ZweihanderPath  = "res://assets/zweihander.glb";  // middle sword
+    const float  ModelScale   = 1.0f;
+    const float  ModelYOff    = -0.9f;
+
+    // ── FP arms model (camera-space, layer 3) ─────────────────────────────────
+    // Requires playerModels/UAL1_FpArms.glb — exported from Blender by deleting
+    // all non-arm geometry from UAL1_Standard.glb (keep forearms + hands only).
+    //
+    // Y offset math: eye socket = ModelYOff + EyeHeight above model root.
+    // To put eye at camera origin: model Y = -(EyeHeight + |ModelYOff|) = -1.64m.
+    Node3D? BuildFpArmsModel()
+    {
+        if (!ResourceLoader.Exists(FpArmsPath)) return null;
+        var scene = GD.Load<PackedScene>(FpArmsPath);
+        if (scene == null) return null;
+        var model = scene.Instantiate<Node3D>();
+        model.Name            = "FpArmsModel";
+        model.Scale           = Vector3.One * ModelScale;
+        model.Position        = new Vector3(0f, ModelYOff - EyeHeight, 0f);   // -1.64m
+        model.RotationDegrees = new Vector3(0f, 180f, 0f);
+        SetLayersRecursive(model, 4u);   // layer 3 — FP camera only
+
+        // Hang an attachment off the right hand. The viewmodel gun parents to
+        // THIS rather than to the camera, so hand and weapon are welded together
+        // by the skeleton — they cannot drift apart when the aim clips move the
+        // arms (a camera-space gun stays put while the hand pitches away from it).
+        var skel = FindFirst<Skeleton3D>(model);
+        if (skel != null)
+        {
+            string handBone = "";
+            for (int i = 0; i < skel.GetBoneCount(); i++)
+            {
+                var bn = skel.GetBoneName(i);
+                if (bn.ToLowerInvariant().Contains("hand") && !bn.ToLowerInvariant().Contains("left"))
+                { handBone = bn; break; }
+            }
+            if (handBone.Length > 0)
+            {
+                _fpHandAttach = new BoneAttachment3D { Name = "FpHandAttach", BoneName = handBone };
+                skel.AddChild(_fpHandAttach);
+                GD.Print($"[Player] FpArms hand attachment on '{handBone}'");
+            }
+            else GD.PrintErr("[Player] FpArms: no right-hand bone found");
+        }
+
+        GD.Print("[Player] FpArms model loaded");
+        return model;
+    }
+
+    BoneAttachment3D? _fpHandAttach;   // viewmodel gun mounts here when arms exist
+
+    Node3D BuildPlayerBody()
+    {
+        var root = new Node3D { Name = "PlayerBody", Visible = false };
+
+        var scene = GD.Load<PackedScene>(ModelPath);
+        if (scene != null)
+        {
+            var model = scene.Instantiate<Node3D>();
+            model.Name              = "CharacterModel";
+            model.Scale             = Vector3.One * ModelScale;
+            model.Position          = new Vector3(0f, ModelYOff, 0f);
+            model.RotationDegrees   = new Vector3(0f, 180f, 0f);
+            root.AddChild(model);
+
+            // Attach sword to the right-hand bone
+            var skel = FindFirst<Skeleton3D>(model);
+            GD.Print($"[Player] Skeleton found: {skel != null}");
+            if (skel != null)
+            {
+                // Try several common hand bone name variants
+                string handBone = "";
+                foreach (var candidate in new[] { "RightHand", "hand_r", "Hand_R", "R_Hand", "mixamorig:RightHand" })
+                {
+                    if (skel.FindBone(candidate) >= 0) { handBone = candidate; break; }
+                }
+                // If still not found, pick any bone whose name contains "hand" (case-insensitive)
+                if (handBone.Length == 0)
+                {
+                    for (int i = 0; i < skel.GetBoneCount(); i++)
+                    {
+                        var bn = skel.GetBoneName(i);
+                        if (bn.ToLowerInvariant().Contains("hand") && !bn.ToLowerInvariant().Contains("left"))
+                        { handBone = bn; break; }
+                    }
+                }
+                GD.Print($"[Player] Hand bone: '{handBone}' (of {skel.GetBoneCount()} bones)");
+
+                if (handBone.Length > 0)
+                {
+                    var attach = new BoneAttachment3D { Name = "WeaponAttach", BoneName = handBone };
+                    skel.AddChild(attach);
+
+                    // An empty holder on the hand bone. RebuildTpGun drops the
+                    // current gun model into it on every equip, so swapping guns
+                    // never needs to re-find the skeleton.
+                    // Identity on purpose: the old (0,180,-90) was a sword-specific
+                    // correction for a blade-along-Z mesh. All gun alignment now
+                    // lives in TpHandRot + GunDef.TpRot so there is one place to
+                    // tune it.
+                    _tpWeapon = new Node3D { Name = "TpWeapon", Visible = false };
+                    attach.AddChild(_tpWeapon);
+                    GD.Print($"[Player] Weapon holder attached to bone '{handBone}'");
+                }
+                else
+                {
+                    GD.PrintErr("[Player] No hand bone found — using floating placeholder");
+                    _tpWeapon = new Node3D { Name = "TpWeapon" };
+                    _tpWeapon.Position = new(0.32f, 0.80f, -0.15f);
+                    _tpWeapon.Visible  = false;
+                    root.AddChild(_tpWeapon);
+                }
+            }
+            else
+            {
+                GD.PrintErr("[Player] No Skeleton3D found in model");
+                _tpWeapon = new Node3D { Name = "TpWeapon" };
+                _tpWeapon.Position = new(0.32f, 0.80f, -0.15f);
+                _tpWeapon.Visible  = false;
+                root.AddChild(_tpWeapon);
+            }
+        }
+        else
+        {
+            // Fallback capsule body when GLB is missing
+            var mat = new StandardMaterial3D { AlbedoColor = new(0.25f, 0.30f, 0.45f), Roughness = 0.8f };
+            root.AddChild(new MeshInstance3D
+            {
+                Mesh     = new CapsuleMesh { Radius = 0.28f, Height = 0.80f },
+                Position = new(0f, 0.75f, 0f)
+            });
+            root.GetChild<MeshInstance3D>(0).SetSurfaceOverrideMaterial(0, mat);
+            _tpWeapon = new Node3D { Name = "TpWeapon" };
+            _tpWeapon.Position = new(0.32f, 0.80f, -0.15f);
+            _tpWeapon.Visible  = false;
+            root.AddChild(_tpWeapon);
+        }
+
+        return root;
+    }
+
+    // ── Asset helpers ─────────────────────────────────────────────────────────
+    static T? FindFirst<T>(Node node) where T : Node
+    {
+        if (node is T t) return t;
+        foreach (Node child in node.GetChildren())
+        {
+            var found = FindFirst<T>(child);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    static T? FindFirst<T>(Node node, string name) where T : Node
+    {
+        if (node is T t && node.Name == name) return t;
+        foreach (Node child in node.GetChildren())
+        {
+            var found = FindFirst<T>(child, name);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    static MeshInstance3D? LoadSwordMesh(string glbPath, string meshName)
+    {
+        var packed = GD.Load<PackedScene>(glbPath);
+        if (packed == null) return null;
+        var tempRoot = packed.Instantiate<Node3D>();
+        var src = FindFirst<MeshInstance3D>(tempRoot, meshName)
+               ?? FindFirst<MeshInstance3D>(tempRoot);
+        if (src == null) { tempRoot.Free(); return null; }
+        var inst = new MeshInstance3D { Name = "TpWeapon", Mesh = src.Mesh };
+        tempRoot.Free();
+        return inst;
+    }
+
+    static void SetLayersRecursive(Node node, uint layer)
+    {
+        if (node is VisualInstance3D vi) vi.Layers = layer;
+        foreach (Node child in node.GetChildren())
+            SetLayersRecursive(child, layer);
+    }
+
+    static MeshInstance3D MakePlaceholderSword()
+    {
+        var m = new MeshInstance3D
+        {
+            Name = "TpWeapon",
+            Mesh = new BoxMesh { Size = new(0.05f, 0.70f, 0.05f) },
+        };
+        m.SetSurfaceOverrideMaterial(0,
+            new StandardMaterial3D { AlbedoColor = new(0.6f, 0.6f, 0.65f), Metallic = 0.9f, Roughness = 0.25f });
+        return m;
+    }
+
+    // ── FP hands: camera-space arms at bottom screen corners ─────────────────
+    // Parented to the camera, so they can never clip through world geometry.
+    // Two forearm/gauntlet shapes sit at ±X, pushed down and slightly forward.
+    Node3D BuildFpHands()
+    {
+        var root = new Node3D { Name = "FpHands" };
+
+        var armMat = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.09f, 0.09f, 0.10f),
+            Metallic    = 0.80f,
+            Roughness   = 0.35f,
+        };
+        var gauntletMat = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.20f, 0.18f, 0.16f),
+            Metallic    = 0.55f,
+            Roughness   = 0.60f,
+        };
+
+        // Right arm — lower-right corner
+        var rFore = new MeshInstance3D
+        {
+            Mesh            = new CapsuleMesh { Radius = 0.043f, Height = 0.32f },
+            Position        = new Vector3( 0.29f, -0.46f, -0.38f),
+            RotationDegrees = new Vector3( 25f, -12f,  22f),
+        };
+        rFore.SetSurfaceOverrideMaterial(0, armMat);
+        var rKnuckle = new MeshInstance3D
+        {
+            Mesh     = new BoxMesh { Size = new Vector3(0.08f, 0.06f, 0.10f) },
+            Position = new Vector3( 0.27f, -0.34f, -0.44f),
+        };
+        rKnuckle.SetSurfaceOverrideMaterial(0, gauntletMat);
+        root.AddChild(rFore);
+        root.AddChild(rKnuckle);
+
+        // Left arm — lower-left corner
+        var lFore = new MeshInstance3D
+        {
+            Mesh            = new CapsuleMesh { Radius = 0.043f, Height = 0.32f },
+            Position        = new Vector3(-0.29f, -0.46f, -0.38f),
+            RotationDegrees = new Vector3( 25f,  12f, -22f),
+        };
+        lFore.SetSurfaceOverrideMaterial(0, armMat);
+        var lKnuckle = new MeshInstance3D
+        {
+            Mesh     = new BoxMesh { Size = new Vector3(0.08f, 0.06f, 0.10f) },
+            Position = new Vector3(-0.27f, -0.34f, -0.44f),
+        };
+        lKnuckle.SetSurfaceOverrideMaterial(0, gauntletMat);
+        root.AddChild(lFore);
+        root.AddChild(lKnuckle);
+
+        return root;
+    }
+
+    // ── FP legs: camera-space boots at screen bottom, shown only while sliding ─
+    Node3D BuildFpLegs()
+    {
+        var root = new Node3D { Name = "FpLegs", Visible = false };
+
+        var trouserMat = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.14f, 0.14f, 0.18f),
+            Roughness   = 0.85f,
+        };
+        var bootMat = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.08f, 0.08f, 0.10f),
+            Metallic    = 0.50f,
+            Roughness   = 0.55f,
+        };
+
+        foreach (var side in new[] { 1f, -1f })
+        {
+            float x = side * 0.16f;
+
+            // Shin/lower leg — angled forward as if extended during slide
+            var shin = new MeshInstance3D
+            {
+                Mesh            = new CapsuleMesh { Radius = 0.055f, Height = 0.34f },
+                Position        = new Vector3(x, -0.52f, -0.46f),
+                RotationDegrees = new Vector3(35f, 0f, side * 6f),
+            };
+            shin.SetSurfaceOverrideMaterial(0, trouserMat);
+            root.AddChild(shin);
+
+            // Boot — flat box at the foot
+            var boot = new MeshInstance3D
+            {
+                Mesh     = new BoxMesh { Size = new Vector3(0.10f, 0.07f, 0.24f) },
+                Position = new Vector3(x, -0.66f, -0.36f),
+            };
+            boot.SetSurfaceOverrideMaterial(0, bootMat);
+            root.AddChild(boot);
+        }
+
+        return root;
+    }
+
+    Node3D BuildFpArms()
+    {
+        var armMat = new StandardMaterial3D
+        {
+            AlbedoColor = new(0.10f, 0.10f, 0.11f),
+            Metallic    = 0.75f,
+            Roughness   = 0.45f,
+        };
+        var gauntletMat = new StandardMaterial3D
+        {
+            AlbedoColor = new(0.22f, 0.20f, 0.18f),
+            Metallic    = 0.6f,
+            Roughness   = 0.55f,
+        };
+
+        var root = new Node3D { Name = "FpArms", Visible = false };
+
+        // Right forearm — grips the sword
+        var rFore = new MeshInstance3D
+        {
+            Mesh             = new CapsuleMesh { Radius = 0.042f, Height = 0.36f },
+            Position         = new(0.30f, -0.52f, -0.32f),
+            RotationDegrees  = new(20f, -15f, 18f),
+        };
+        rFore.SetSurfaceOverrideMaterial(0, armMat);
+        root.AddChild(rFore);
+
+        var rHand = new MeshInstance3D
+        {
+            Mesh     = new SphereMesh { Radius = 0.046f, RadialSegments = 8, Rings = 6 },
+            Position = new(0.24f, -0.34f, -0.44f),
+        };
+        rHand.SetSurfaceOverrideMaterial(0, gauntletMat);
+        root.AddChild(rHand);
+
+        // Left forearm — supporting hand lower and further away
+        var lFore = new MeshInstance3D
+        {
+            Mesh            = new CapsuleMesh { Radius = 0.040f, Height = 0.33f },
+            Position        = new(-0.18f, -0.60f, -0.38f),
+            RotationDegrees = new(15f, 18f, -16f),
+        };
+        lFore.SetSurfaceOverrideMaterial(0, armMat);
+        root.AddChild(lFore);
+
+        var lHand = new MeshInstance3D
+        {
+            Mesh     = new SphereMesh { Radius = 0.042f, RadialSegments = 8, Rings = 6 },
+            Position = new(-0.14f, -0.45f, -0.46f),
+        };
+        lHand.SetSurfaceOverrideMaterial(0, gauntletMat);
+        root.AddChild(lHand);
+
+        return root;
+    }
+
+    public void TriggerDeath()
+    {
+        if (_isDead) return;
+        _isDead = true;
+        _animator.PlayDeath();
+    }
+
+    public void ReleaseMouse() => Input.MouseMode = Input.MouseModeEnum.Visible;
+    public Camera3D Camera    => _cam;
+
+    /// True while the third-person camera is the active one.
+    public bool     TpMode       => _tpMode;
+    /// The camera actually rendering, which is what the HUD must project through.
+    public Camera3D ActiveCamera => _tpMode ? _tpCam : _cam;
+    /// World point the current shot would land on. Only updated in third person
+    /// (see UpdateAimPoint) - in first person the aim ray IS the view ray, so a
+    /// screen-centred reticle is already exactly right and this is not needed.
+    public Vector3  AimPoint     { get; private set; }
+
+    /// Traces the aim ray so the third-person reticle can sit on the point the
+    /// shot will actually hit. The aim ray still comes from the FP camera at the
+    /// player's head - that is what GunCombat fires along - while the visible
+    /// camera sits behind and above, so screen centre and the real impact point
+    /// are different places on screen.
+    void UpdateAimPoint()
+    {
+        var origin = _cam.GlobalPosition;
+        var dir    = -_cam.GlobalTransform.Basis.Z;
+        var query  = PhysicsRayQueryParameters3D.Create(origin, origin + dir * AimTraceLen);
+        query.Exclude = new Godot.Collections.Array<Rid> { GetRid() };
+        var hit = GetWorld3D().DirectSpaceState.IntersectRay(query);
+        AimPoint = hit.Count > 0 ? (Vector3)hit["position"] : origin + dir * AimTraceLen;
+    }
+}

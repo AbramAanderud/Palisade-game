@@ -1,0 +1,314 @@
+const { WebSocketServer } = require('ws');
+const PORT = process.env.PORT || 3000;
+const wss = new WebSocketServer({ port: PORT });
+
+// rooms: code -> { host: ws, guest: ws|null }  — 1v1. Protocol UNCHANGED.
+const rooms = new Map();
+// parties: code -> { seats: (ws|null)[FFA_CAP], hostSeat, started }  — FFA, 3–4 players.
+// A party exists from party_create so the pre-game lobby can sync picks through it;
+// party_start marks it started. Game data inside a party is stamped with `from: seat`.
+const parties = new Map();
+const FFA_CAP = 4;
+const FFA_MIN = 3;
+// pendingInvites: "<code>:<targetId>"
+const pendingInvites = new Set();
+// lobby: playerId -> { ws, name }
+const lobby = new Map();
+// pendingChallenges: challengerId -> targetId
+const pendingChallenges = new Map();
+
+let nextId = 1;
+
+function makeCode() {
+  let c;
+  do { c = String(Math.floor(Math.random() * 900) + 100); }
+  while (rooms.has(c) || parties.has(c));
+  return c;
+}
+
+function send(ws, obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+// Busy = in a party. Extra `busy` field is ignored by older clients (they read
+// lobby entries with GetProperty("id"/"name")).
+function broadcastLobbyUpdate() {
+  const players = Array.from(lobby.entries())
+    .map(([id, p]) => ({ id, name: p.name, busy: !!p.ws._party }));
+  for (const [id, p] of lobby) {
+    send(p.ws, { type: 'lobby_update', players: players.filter(pl => pl.id !== id) });
+  }
+}
+
+// ── Party helpers ────────────────────────────────────────────────────────────
+function roster(party) {
+  const r = [];
+  party.seats.forEach((s, seat) => { if (s) r.push({ seat, id: s._id, name: s._name }); });
+  return r;
+}
+
+function partyInfo(code, party) {
+  return { code, hostSeat: party.hostSeat, cap: FFA_CAP, started: party.started, roster: roster(party) };
+}
+
+function sendPartyUpdate(code, party) {
+  const info = partyInfo(code, party);
+  for (const s of party.seats) if (s) send(s, { type: 'party_update', ...info });
+}
+
+function clearInvites(code) {
+  for (const k of pendingInvites) if (k.startsWith(code + ':')) pendingInvites.delete(k);
+}
+
+function isBusy(ws) { return !!(ws._party || ws._room); }
+
+// Removes ws from its party. Host hands over to the lowest occupied seat; the
+// party is deleted only when empty. Before start the others get party_update,
+// after start peer_left (the match continues without that seat).
+function leaveParty(ws) {
+  const code = ws._party;
+  if (!code) return;
+  const party = parties.get(code);
+  const seat = ws._seat;
+  ws._party = null;
+  ws._seat = null;
+  if (!party) return;
+  party.seats[seat] = null;
+  if (!party.seats.some(s => s)) {
+    parties.delete(code);
+    clearInvites(code);
+    console.log(`Party ${code} closed`);
+    return;
+  }
+  if (party.hostSeat === seat) party.hostSeat = party.seats.findIndex(s => s);
+  if (party.started) {
+    for (const s of party.seats) if (s) send(s, { type: 'peer_left', seat, hostSeat: party.hostSeat });
+  } else {
+    sendPartyUpdate(code, party);
+  }
+}
+
+wss.on('connection', ws => {
+  ws._room  = null;
+  ws._role  = null;
+  ws._party = null;
+  ws._seat  = null;
+  ws._id    = String(nextId++);
+  ws._name  = '';
+
+  ws.on('message', raw => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    if (msg.type === 'create') {
+      const code = makeCode();
+      rooms.set(code, { host: ws, guest: null });
+      ws._room = code;
+      ws._role = 'host';
+      send(ws, { type: 'room_created', code });
+      console.log(`Room ${code} created (manual)`);
+
+    } else if (msg.type === 'join') {
+      const room = rooms.get(msg.code);
+      if (!room) { send(ws, { type: 'error', reason: 'not_found' }); return; }
+      if (room.guest) { send(ws, { type: 'error', reason: 'full' }); return; }
+      room.guest = ws;
+      ws._room = msg.code;
+      ws._role = 'guest';
+      send(ws, { type: 'joined', code: msg.code });
+      send(room.host, { type: 'peer_connected' });
+      console.log(`Room ${msg.code} joined (manual)`);
+
+    } else if (msg.type === 'lobby_join') {
+      ws._name = (msg.name || 'Player').substring(0, 24);
+      lobby.set(ws._id, { ws, name: ws._name });
+      send(ws, { type: 'lobby_joined', playerId: ws._id });
+      broadcastLobbyUpdate();
+      console.log(`${ws._name} (${ws._id}) joined lobby — ${lobby.size} in lobby`);
+
+    } else if (msg.type === 'lobby_leave') {
+      lobby.delete(ws._id);
+      pendingChallenges.delete(ws._id);
+      broadcastLobbyUpdate();
+
+    } else if (msg.type === 'challenge') {
+      const target = lobby.get(msg.targetId);
+      if (!target) { send(ws, { type: 'challenge_failed', reason: 'not_found' }); return; }
+      // New: players in an FFA party can neither challenge nor be challenged.
+      if (ws._party || target.ws._party) { send(ws, { type: 'challenge_failed', reason: 'busy' }); return; }
+      if (pendingChallenges.has(ws._id)) { send(ws, { type: 'challenge_failed', reason: 'already_pending' }); return; }
+      pendingChallenges.set(ws._id, msg.targetId);
+      send(target.ws, { type: 'incoming_challenge', fromId: ws._id, fromName: ws._name });
+      console.log(`Challenge: ${ws._name} -> ${target.name}`);
+
+    } else if (msg.type === 'challenge_response') {
+      const challengerId = msg.challengerId;
+      const challenger = lobby.get(challengerId);
+      if (!challenger || pendingChallenges.get(challengerId) !== ws._id) return;
+      pendingChallenges.delete(challengerId);
+
+      // New: someone joined a party while the challenge was pending.
+      if (msg.accepted && (challenger.ws._party || ws._party)) {
+        send(challenger.ws, { type: 'challenge_declined' });
+        return;
+      }
+      if (msg.accepted) {
+        const code = makeCode();
+        rooms.set(code, { host: challenger.ws, guest: ws });
+        challenger.ws._room = code; challenger.ws._role = 'host';
+        ws._room = code; ws._role = 'guest';
+        lobby.delete(challengerId);
+        lobby.delete(ws._id);
+        broadcastLobbyUpdate();
+        // Each side gets the OTHER player's display name, so the game can say
+        // "You died to <name>" instead of an anonymous defeat.
+        send(challenger.ws, { type: 'match_made', code, isHost: true,  opponentName: ws._name });
+        send(ws,            { type: 'match_made', code, isHost: false, opponentName: challenger.ws._name });
+        console.log(`Match: ${challenger.ws._name} vs ${ws._name} → room ${code}`);
+      } else {
+        send(challenger.ws, { type: 'challenge_declined' });
+      }
+
+    } else if (msg.type === 'party_create') {
+      if (isBusy(ws)) { send(ws, { type: 'party_error', reason: 'busy' }); return; }
+      const code = makeCode();
+      const party = { seats: new Array(FFA_CAP).fill(null), hostSeat: 0, started: false };
+      party.seats[0] = ws;
+      parties.set(code, party);
+      ws._party = code;
+      ws._seat = 0;
+      send(ws, { type: 'party_created', seat: 0, ...partyInfo(code, party) });
+      broadcastLobbyUpdate();
+      console.log(`Party ${code} created by ${ws._name}`);
+
+    } else if (msg.type === 'party_invite') {
+      const party = ws._party ? parties.get(ws._party) : null;
+      if (!party || party.seats[party.hostSeat] !== ws || party.started) return;
+      const target = lobby.get(msg.targetId);
+      const fail = reason => send(ws, { type: 'party_invite_failed', targetId: msg.targetId, reason });
+      if (!target) return fail('not_found');
+      if (isBusy(target.ws)) return fail('busy');
+      if (!party.seats.includes(null)) return fail('full');
+      pendingInvites.add(`${ws._party}:${msg.targetId}`);
+      send(target.ws, { type: 'party_invited', code: ws._party, fromId: ws._id, fromName: ws._name });
+
+    } else if (msg.type === 'party_response') {
+      const key = `${msg.code}:${ws._id}`;
+      if (!pendingInvites.has(key)) return;
+      pendingInvites.delete(key);
+      const party = parties.get(msg.code);
+      if (!msg.accepted) {
+        if (party) send(party.seats[party.hostSeat], { type: 'party_declined', targetId: ws._id, name: ws._name });
+        return;
+      }
+      const fail = reason => send(ws, { type: 'party_invite_failed', code: msg.code, reason });
+      if (!party || party.started) return fail('gone');
+      if (isBusy(ws)) return fail('busy');
+      const seat = party.seats.indexOf(null);
+      if (seat < 0) return fail('full');
+      party.seats[seat] = ws;
+      ws._party = msg.code;
+      ws._seat = seat;
+      send(ws, { type: 'party_joined', seat, ...partyInfo(msg.code, party) });
+      sendPartyUpdate(msg.code, party);
+      broadcastLobbyUpdate();
+
+    } else if (msg.type === 'party_leave') {
+      leaveParty(ws);
+      broadcastLobbyUpdate();
+
+    } else if (msg.type === 'party_start') {
+      const code = ws._party;
+      const party = code ? parties.get(code) : null;
+      if (!party) return;
+      if (party.seats[party.hostSeat] !== ws) { send(ws, { type: 'party_error', reason: 'not_host' }); return; }
+      if (party.started) { send(ws, { type: 'party_error', reason: 'started' }); return; }
+      if (party.seats.filter(s => s).length < FFA_MIN) { send(ws, { type: 'party_error', reason: 'too_few' }); return; }
+      party.started = true;
+      clearInvites(code);
+      for (const s of party.seats) if (s) lobby.delete(s._id);
+      broadcastLobbyUpdate();
+      for (const s of party.seats) if (s) send(s, { type: 'ffa_start', seat: s._seat, ...partyInfo(code, party) });
+      console.log(`Party ${code} started with ${roster(party).length} players`);
+
+    } else if (msg.type === 'stats') {
+      // Population readout for the title screen. Deliberately does NOT add the
+      // asker to `lobby` — someone sitting on the main menu must not show up as
+      // challengeable to everyone in the matchmaking list.
+      send(ws, { type: 'stats', online: wss.clients.size, lobby: lobby.size, parties: parties.size });
+
+    } else if (ws._party) {
+      // FFA game data: stamp the sender's seat (overwriting anything the client
+      // claimed) and route to `to` if given, else every other seat.
+      const party = parties.get(ws._party);
+      if (!party) return;
+      msg.from = ws._seat;
+      const out = JSON.stringify(msg);
+      if (Number.isInteger(msg.to)) {
+        const t = party.seats[msg.to];
+        if (t && t !== ws && t.readyState === 1) t.send(out);
+      } else {
+        for (const s of party.seats) if (s && s !== ws && s.readyState === 1) s.send(out);
+      }
+
+    } else {
+      // Forward game data to peer in room (1v1 — verbatim, unchanged)
+      const room = ws._room ? rooms.get(ws._room) : null;
+      if (!room) return;
+      const other = ws._role === 'host' ? room.guest : room.host;
+      if (other && other.readyState === 1) other.send(raw.toString());
+    }
+  });
+
+  ws.on('close', () => {
+    // Clean up lobby membership
+    if (lobby.has(ws._id)) {
+      lobby.delete(ws._id);
+
+      // If this player was challenging someone, notify the target so their
+      // incoming-challenge dialog can dismiss cleanly.
+      if (pendingChallenges.has(ws._id)) {
+        const targetId = pendingChallenges.get(ws._id);
+        const target   = lobby.get(targetId);
+        if (target) send(target.ws, { type: 'challenge_cancelled', fromId: ws._id });
+        pendingChallenges.delete(ws._id);
+      }
+
+      // If this player was the target of a pending challenge, tell the challenger.
+      for (const [cId, tId] of pendingChallenges) {
+        if (tId === ws._id) {
+          const challenger = lobby.get(cId);
+          if (challenger) send(challenger.ws, { type: 'challenge_declined' });
+          pendingChallenges.delete(cId);
+        }
+      }
+    }
+
+    // Pending party invites addressed to this player count as declined.
+    for (const k of pendingInvites) {
+      if (k.endsWith(':' + ws._id)) {
+        pendingInvites.delete(k);
+        const party = parties.get(k.split(':')[0]);
+        if (party) send(party.seats[party.hostSeat], { type: 'party_declined', targetId: ws._id, name: ws._name });
+      }
+    }
+
+    // Leave the FFA party (host handover / peer_left / delete-when-empty).
+    leaveParty(ws);
+    broadcastLobbyUpdate();
+
+    // Clean up 1v1 room
+    const code = ws._room;
+    if (!code) return;
+    const room = rooms.get(code);
+    if (!room) return;
+    const other = ws._role === 'host' ? room.guest : room.host;
+    send(other, { type: 'peer_disconnected' });
+    rooms.delete(code);
+    console.log(`Room ${code} closed`);
+  });
+
+  ws.on('error', () => {});
+});
+
+console.log(`Palisade relay listening on port ${PORT}`);

@@ -1,0 +1,74 @@
+using Godot;
+
+/// res://test/TestTask.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Loadout-slots HUD check, filmed from the player's own FP camera.
+/// Beats:
+///   0–2 s  starter only     → SECONDARY card held (gold), PRIMARY a dim "?"
+///                             "IN THE MIDDLE" teaser, no TAB hint
+///   2–4 s  arena prize      → PRIMARY (AWP) held + gold, SECONDARY dimmed
+///                             with its remembered mag count, TAB hint visible
+///   4–6 s  after SwitchWeapon → gold frame back on SECONDARY, AWP dimmed
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTask : Node3D
+{
+    PlayerController? _player;
+    float _t;
+    int   _beat;
+
+    public override void _Ready()
+    {
+        var env = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.30f, 0.36f, 0.45f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(1f, 1f, 1f),
+            AmbientLightEnergy = 0.9f,
+        };
+        AddChild(new WorldEnvironment { Environment = env });
+
+        var sun = new DirectionalLight3D { LightEnergy = 2.0f };
+        sun.RotationDegrees = new Vector3(-45f, 30f, 0f);
+        AddChild(sun);
+
+        var floor = new StaticBody3D();
+        floor.AddChild(new CollisionShape3D
+        {
+            Shape = new BoxShape3D { Size = new Vector3(40f, 1f, 40f) },
+        });
+        var mi = new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(40f, 1f, 40f) } };
+        mi.SetSurfaceOverrideMaterial(0, new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.30f, 0.32f, 0.30f),
+            Roughness   = 1f,
+            Metallic    = 0f,
+        });
+        floor.AddChild(mi);
+        AddChild(floor);
+        floor.GlobalPosition = new Vector3(0f, -0.5f, 0f);
+
+        _player = PlayerController.Spawn(this, new Vector3(0f, 0.2f, 0f), 0f);
+        _player.Frozen = true;                 // no input, no mouse capture
+        _player.EquipStarterGun("pew");
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_player == null) return;
+        _t += (float)delta;
+
+        if (_beat == 0 && _t >= 2f)
+        {
+            _beat = 1;
+            _player.EquipArenaGun("awp");
+            GD.Print($"[Task] t={_t:F1} claimed arena AWP — primary={_player.PrimaryGunId} secondary={_player.SecondaryGunId}");
+        }
+        if (_beat == 1 && _t >= 4f)
+        {
+            _beat = 2;
+            _player.SwitchWeapon();
+            GD.Print($"[Task] t={_t:F1} swapped — holding {_player.Gun?.Def.Id}");
+        }
+    }
+}

@@ -1,0 +1,118 @@
+using Godot;
+
+/// res://scripts/MazeSign.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Hanging plaque over a maze doorway in the online arena:
+///     Made by <author>
+///     Currently in: <players>
+/// OnlineDungeonArena hangs one over each maze's Start opening and one over its
+/// arena-side Exit, and pushes the occupant line whenever a player's zone
+/// changes (the opponent's arrives as a "zone" message).
+///
+/// Two text faces, back to back, so it reads from both sides of the doorway
+/// (Label3D's own DoubleSided shows the back mirrored). Visual only — no
+/// collision, hung high enough (HangHeight) that nobody walks into it.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class MazeSign : Node3D
+{
+    const float BoardW     = 5.0f;
+    const float BoardH     = 1.5f;
+    const float BoardT     = 0.14f;
+    const float PixelSize  = 0.006f;
+    /// Plaque centre above the floor (bottom edge ~3.5 m). From the Start
+    /// spawn, half a cell back, that is ~27° above eye line — in view under
+    /// the HUD/toast band; at 5.5 m it sat on the top screen edge.
+    public const float HangHeight = 4.2f;
+
+    static readonly Color AuthorColor   = new(1.00f, 0.82f, 0.45f);
+    static readonly Color OccupantColor = new(0.93f, 0.91f, 0.83f);
+
+    readonly Label3D[] _author   = new Label3D[2];
+    readonly Label3D[] _occupant = new Label3D[2];
+
+    /// `doorway` is the floor-level midpoint of the opening; `outward` is the
+    /// horizontal direction through it (either way works — both faces carry text).
+    public static MazeSign Spawn(Node parent, string name, Vector3 doorway, Vector3 outward, Font? font)
+    {
+        var sign = new MazeSign { Name = name };
+        parent.AddChild(sign);
+        sign.Position = doorway + Vector3.Up * HangHeight;
+        // Local +Z along `outward`: Label3D faces +Z by default.
+        sign.Rotation = new Vector3(0f, Mathf.Atan2(outward.X, outward.Z), 0f);
+        sign.Build(font);
+        return sign;
+    }
+
+    void Build(Font? font)
+    {
+        var wood = new StandardMaterial3D
+        {
+            AlbedoColor = new Color(0.16f, 0.10f, 0.06f),
+            Roughness   = 0.9f,
+            // A faint self-glow so the plaque's silhouette reads in the
+            // near-zero-ambient maze even away from a torch.
+            EmissionEnabled = true,
+            Emission        = new Color(0.10f, 0.06f, 0.03f),
+        };
+        AddChild(new MeshInstance3D
+        {
+            Mesh = new BoxMesh { Size = new Vector3(BoardW, BoardH, BoardT), Material = wood },
+        });
+
+        // Two iron rods up from the corners: reads as "hanging", not floating.
+        var iron = new StandardMaterial3D { AlbedoColor = new Color(0.12f, 0.12f, 0.13f), Metallic = 0.6f };
+        foreach (float x in new[] { -BoardW * 0.4f, BoardW * 0.4f })
+            AddChild(new MeshInstance3D
+            {
+                Mesh     = new CylinderMesh { TopRadius = 0.03f, BottomRadius = 0.03f, Height = 2.5f, Material = iron },
+                Position = new Vector3(x, BoardH * 0.5f + 1.25f, 0f),
+            });
+
+        for (int side = 0; side < 2; side++)
+        {
+            var face = new Node3D
+            {
+                Position = new Vector3(0f, 0f, (BoardT * 0.5f + 0.01f) * (side == 0 ? 1f : -1f)),
+                Rotation = new Vector3(0f, side == 0 ? 0f : Mathf.Pi, 0f),
+            };
+            AddChild(face);
+            _author[side]   = MakeLine(face, font, 44, AuthorColor,    0.30f);
+            _occupant[side] = MakeLine(face, font, 40, OccupantColor, -0.32f);
+        }
+        SetAuthor("");
+        SetOccupants("");
+    }
+
+    static Label3D MakeLine(Node3D face, Font? font, int size, Color color, float y)
+    {
+        var lbl = new Label3D
+        {
+            FontSize     = size,
+            PixelSize    = PixelSize,
+            Modulate     = color,
+            OutlineSize  = 8,
+            DoubleSided  = false,
+            Position     = new Vector3(0f, y, 0f),
+            AutowrapMode = TextServer.AutowrapMode.Off,
+            // Shrink-to-fit is not a Label3D feature; long names just run past
+            // the board edge rather than wrapping into the other line.
+            Width        = BoardW / PixelSize,
+        };
+        if (font != null) lbl.Font = font;
+        face.AddChild(lbl);
+        return lbl;
+    }
+
+    public void SetAuthor(string author)
+    {
+        string text = $"Made by {(author.Length > 0 ? author : "unknown")}";
+        foreach (var l in _author) l.Text = text;
+    }
+
+    /// Empty = nobody inside.
+    public void SetOccupants(string players)
+    {
+        string text = $"Currently in: {(players.Length > 0 ? players : "nobody")}";
+        foreach (var l in _occupant) l.Text = text;
+    }
+}

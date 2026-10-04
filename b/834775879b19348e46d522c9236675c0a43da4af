@@ -1,0 +1,180 @@
+using Godot;
+using System.Collections.Generic;
+using System.Linq;
+
+/// res://scripts/PropLibrary.cs
+/// Loads generated GLB props at runtime with caching. Returns null when a
+/// prop file is missing (gitignored assets) — callers must skip gracefully.
+public static class PropLibrary
+{
+    const string PropsDir = "res://assets/glb/props";
+
+    static readonly Dictionary<string, PackedScene?> _cache = new();
+    static bool? _propsAvailable;
+    static bool _warnedMissing;
+
+    // Per-prop uniform scale correction. Tripo3D output is normalized so the
+    // model's LONGEST axis measures 1.0 world unit, with no consistent real-
+    // world scale across props — measured against real GLBs (see
+    // .superpowers/sdd/prop-qa-report.md) via a temporary debug harness that
+    // printed each prop's raw GetAabb().Size. Every prop is Y-up (Tripo3D
+    // convention held for all 14), so height-anchored factor = targetHeight /
+    // rawAabb.Size.Y for upright props. Two exceptions:
+    //  - bookrow_a/b/c: left at 1.0 — ArenaBuilder.AddBookshelfRing already
+    //    measures the GLB AABB at runtime and rescales to fill boardLen, so a
+    //    static factor here would just get overridden.
+    //  - balustrade_a: raw AABB is (X=0.373, Y=0.910, Z=1.0) — Z (not Y) is
+    //    its longest axis (the horizontal span of the railing unit), and Y
+    //    (0.91) is close in magnitude to Z (1.0) — it's a squarish balcony-
+    //    rail tile, not an elongated fence panel. Scaling the WHOLE object
+    //    uniformly to hit the ~5.8m ring-bay span (per the original spec)
+    //    would blow its height up to ~5.3m — a wall, not a railing. Instead
+    //    this factor is height-anchored (rail sits ~1m tall) and
+    //    ArenaBuilder.AddSecondTier applies an additional local-Z-only
+    //    stretch (mirroring the bookrow AABB-based rescale pattern) so the
+    //    span still fills each ring bay without inflating the height.
+    static readonly Dictionary<string, float> _scale = new()
+    {
+        // torch_a/b + candelabra bumped for the Polish-Pass Task 2 sconce-as-
+        // primary-light change (2026-07-21): sconces replace the old
+        // procedural wall-torch bracket/flame as the visible light source, so
+        // they need to read clearly at corridor distance. 0.7m/1.6m -> 1.1m/1.9m.
+        { "torch_a", 1.1f / 1.0f }, { "torch_b", 1.1f / 1.0f },
+        { "candelabra_a", 1.9f / 1.0f }, { "candelabra_b", 1.9f / 1.0f },
+        { "plant_a", 1.2f / 1.0f }, { "plant_b", 1.2f / 1.0f },
+        // Polish Task 5: arena raised to ArenaWallH=36m; columns now span
+        // tier→dome-spring (ArenaWallH - tierY = 36 - 22 = 14m), up from the
+        // old 6m stub. Kept as a uniform height-anchored factor (matches every
+        // other Y-up prop in this table) so the model's real width/height
+        // ratio baked in by Tripo3D is preserved rather than stretched.
+        { "column_a", 14.0f / 1.0f },
+        { "balustrade_a", 1.0f / 0.910f },   // height-anchored; span stretched separately
+        { "bookrow_a", 1.0f }, { "bookrow_b", 1.0f }, { "bookrow_c", 1.0f },
+        { "clutter_bookstack", 0.3f / 1.0f },   // raw longest axis (X) = 1.0
+        { "clutter_goblet", 0.25f / 1.0f },     // raw Y (height) = 1.0
+        { "clutter_pot", 0.3f / 1.0f },         // raw longest axis (Z) = 1.0
+        // Task 7 (Polish): table_a raw AABB = (X=0.8596, Y=0.8633, Z=1.0) —
+        // measured via test/MeasureProps.cs. Longest axis is Z (1.0), not Y,
+        // same non-Y-longest case balustrade_a hit — so this is height-
+        // anchored (targetHeight / rawY) like that one, not longest-axis-
+        // anchored: 0.75m tall (side-table height) / 0.8633 ≈ 0.8688.
+        // table_b.glb doesn't exist yet (Tripo credits ran out mid-Task-7) —
+        // PieceVariants falls back to table_a whenever PropLibrary.Instance
+        // ("table_b") returns null, so this entry is an unverified placeholder
+        // (same factor as table_a) kept ready for whenever table_b lands;
+        // re-measure and correct then.
+        { "table_a", 0.75f / 0.8633f }, { "table_b", 0.75f / 0.8633f },
+    };
+
+    /// True once assets/glb/props holds at least one .glb. Checked once and
+    /// cached (a gitignored asset drop never happens mid-run). Also gates
+    /// procedural "prop-shaped" decor that doesn't itself load a GLB (e.g.
+    /// PieceVariants' velvet drape), so fallback mode adds zero new nodes
+    /// anywhere, not just zero GLB instances.
+    public static bool PropsAvailable
+    {
+        get
+        {
+            if (_propsAvailable.HasValue) return _propsAvailable.Value;
+            // Exports pack only imported resources — System.IO cannot see into
+            // the pck, so this directory probe was permanently false in every
+            // exported build and the arena shipped prop-less. Ask the resource
+            // system first; keep the raw-directory probe for dev states where
+            // the gitignored drop exists but was never imported.
+            bool any = ResourceLoader.Exists($"{PropsDir}/torch_a.glb");
+            if (!any)
+            {
+                var abs = ProjectSettings.GlobalizePath(PropsDir);
+                any = System.IO.Directory.Exists(abs)
+                    && System.IO.Directory.EnumerateFiles(abs, "*.glb").Any();
+            }
+            _propsAvailable = any;
+            if (!any) WarnOnce();
+            return any;
+        }
+    }
+
+    static void WarnOnce()
+    {
+        if (_warnedMissing) return;
+        _warnedMissing = true;
+        GD.Print("[PropLibrary] assets/glb/props absent — props disabled");
+    }
+
+    public static Node3D? Instance(string propName, bool withLight = false)
+    {
+        if (!PropsAvailable) return null;
+
+        if (!_cache.TryGetValue(propName, out var scene))
+        {
+            var path = $"{PropsDir}/{propName}.glb";
+            scene = ResourceLoader.Exists(path) ? GD.Load<PackedScene>(path) : null;
+            if (scene == null)
+            {
+                // runtime load fallback for un-imported files (headless captures)
+                var abs = ProjectSettings.GlobalizePath(path);
+                if (System.IO.File.Exists(abs))
+                {
+                    var gltf = new GltfDocument();
+                    var state = new GltfState();
+                    if (gltf.AppendFromFile(abs, state) == Error.Ok)
+                    {
+                        var node = gltf.GenerateScene(state);
+                        var ps = new PackedScene();
+                        ps.Pack(node);
+                        scene = ps;
+                    }
+                }
+            }
+            _cache[propName] = scene;
+        }
+        if (scene == null) return null;
+
+        var inst = scene.Instantiate<Node3D>();
+        float s = _scale.TryGetValue(propName, out var f) ? f : 1.0f;
+        if (s != 1.0f) inst.Scale = Vector3.One * s;
+        if (withLight)
+            // Sconces are now the primary corridor light source (Polish Pass
+            // Task 2) — bumped from 2.4/12 toward the old ambient torch's
+            // 2.8/14 reference so a lit sconce alone reads moody-but-navigable.
+            inst.AddChild(new OmniLight3D
+            {
+                Name = "FlameLight",
+                Position = new Vector3(0, 0.9f, 0),
+                LightColor = new Color(1.0f, 0.62f, 0.24f),
+                LightEnergy = 3.0f,
+                OmniRange = 14f,
+                OmniAttenuation = 0.7f,
+                ShadowEnabled = false,
+            });
+        return inst;
+    }
+
+    /// Combined AABB of a Node3D's visual geometry, in the node's OWN local
+    /// space (before any scale/position the caller applies afterward) — walks
+    /// all VisualInstance3D descendants and merges their AABBs through
+    /// accumulated local transforms. Returns a zero-size AABB (callers must
+    /// guard divide-by-zero) if there are no meshes. Mirrors the private copy
+    /// in ArenaBuilder.cs (kept separate there — pre-existing, out of scope
+    /// to refactor) so PieceVariants/ManorFurniture (Task 7, manor furniture)
+    /// have a public way to measure a PropLibrary.Instance() result without
+    /// duplicating the walk logic in every call site.
+    public static Aabb GetLocalAabb(Node3D root)
+    {
+        Aabb result = default;
+        bool first = true;
+        void Visit(Node n, Transform3D xform)
+        {
+            if (n is Node3D n3d) xform *= n3d.Transform;
+            if (n is VisualInstance3D vi)
+            {
+                var local = xform * vi.GetAabb();
+                result = first ? local : result.Merge(local);
+                first = false;
+            }
+            foreach (Node c in n.GetChildren()) Visit(c, xform);
+        }
+        Visit(root, Transform3D.Identity);
+        return result;
+    }
+}

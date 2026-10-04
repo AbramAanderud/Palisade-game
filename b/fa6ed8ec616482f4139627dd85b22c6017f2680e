@@ -1,0 +1,91 @@
+using Godot;
+
+/// res://test/TestGunOrient.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Orientation check-sheet. Lays every gun out in a row, rotated exactly the way
+/// PlayerController.BuildFpGun rotates the viewmodel, and views them from behind
+/// — the player's vantage. In a correct sheet every muzzle points AWAY from the
+/// camera (guns look foreshortened, grips nearest). Any gun showing its full side
+/// profile, or pointing back at the camera, has the wrong rotation.
+///
+/// One screenshot verifies all seven at once.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestGunOrient : Node3D
+{
+    static readonly string[] Guns =
+    {
+        "mac10", "pew", "shotgun", "awp", "ak47", "rocketlaucher", "quadrocket",
+    };
+
+    public override void _Ready()
+    {
+        // Flat lighting so shape reads clearly, not atmosphere.
+        var env = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.10f, 0.11f, 0.13f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(1f, 1f, 1f),
+            AmbientLightEnergy = 1.1f,
+        };
+        AddChild(new WorldEnvironment { Environment = env });
+
+        var key = new DirectionalLight3D { LightEnergy = 1.4f };
+        key.RotationDegrees = new Vector3(-40f, -35f, 0f);
+        AddChild(key);
+
+        float x = -(Guns.Length - 1) * 0.75f / 2f;
+        foreach (var id in Guns)
+        {
+            var def = GunCombat.Defs[id];
+            var holder = new Node3D();
+            AddChild(holder);
+            holder.Position = new Vector3(x, 0f, 0f);
+            x += 0.75f;
+
+            if (ResourceLoader.Exists(def.Model))
+            {
+                var scene = GD.Load<PackedScene>(def.Model);
+                if (scene != null)
+                {
+                    var model = scene.Instantiate<Node3D>();
+                    var  aabb = GunCombat.MeasureAabb(model);
+                    float maxD = Mathf.Max(aabb.Size.X, Mathf.Max(aabb.Size.Y, aabb.Size.Z));
+                    model.Scale = maxD > 0.01f ? Vector3.One * (0.45f / maxD) : Vector3.One * 0.01f;
+                    // Must stay in lockstep with PlayerController.BuildFpGun.
+                    model.RotationDegrees = new Vector3(0f, 90f, 0f) + def.FpRot;
+                    holder.AddChild(model);
+
+                    // Verify the rotation actually landed: measured in HOLDER
+                    // space (which includes the model's own transform), a correctly
+                    // rotated gun must now be longest along Z, not X.
+                    var post = GunCombat.MeasureAabb(holder);
+                    string longest = post.Size.X >= post.Size.Y && post.Size.X >= post.Size.Z ? "X"
+                                   : post.Size.Y >= post.Size.Z ? "Y" : "Z";
+                    GD.Print($"[Orient] {id,-16} rot={model.RotationDegrees} " +
+                             $"post-size=({post.Size.X:F2},{post.Size.Y:F2},{post.Size.Z:F2}) " +
+                             $"longest={longest} {(longest == "Z" ? "OK" : "*** WRONG ***")}");
+                }
+            }
+
+            holder.AddChild(new Label3D
+            {
+                Text      = def.Display,
+                FontSize  = 48,
+                Position  = new Vector3(0f, -0.30f, 0f),
+                Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+                Modulate  = new Color(1f, 0.9f, 0.6f),
+                PixelSize = 0.0016f,
+            });
+        }
+
+        // Camera BEHIND the row looking forward (-Z), matching the player's view
+        // down their own sights. Correct guns point away from us.
+        var cam = new Camera3D { Fov = 55f };
+        AddChild(cam);
+        cam.Position = new Vector3(0f, 0.35f, 3.2f);
+        cam.LookAt(new Vector3(0f, 0f, -1f), Vector3.Up);
+        cam.MakeCurrent();
+    }
+
+}

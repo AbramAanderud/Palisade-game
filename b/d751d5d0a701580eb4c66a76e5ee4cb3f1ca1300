@@ -1,0 +1,200 @@
+using Godot;
+
+/// Task 4 (Polish): Bookshelf-ring collision reproduction + fix-verification harness.
+///
+/// Playtest bug: "make the bookshelves collidable — you should run on them, not
+/// phase into them." AddBookshelfRing built the shelf ring (posts/boards/books)
+/// as visual-only meshes with zero collision, so the player phased straight
+/// through. AddShelfCollision (ArenaBuilder.cs) adds one flat StaticBody box per
+/// non-doorway bay at the shelf FRONT plane (the post/board protrusion — the
+/// true outermost physical surface, further out than the recessed books).
+///
+/// This harness builds a bare ArenaBuilder at the origin and drives a scripted
+/// CharacterBody3D — sized to match PlayerController's collision capsule
+/// (Radius=0.35, Height=1.6) — straight into the plain wall face at bay i=8
+/// (due east, midAngle=90 deg — same "control" bay TestArenaEscape's scenario A
+/// used; guaranteed far from either doorway).
+///
+/// Checks:
+///   1. RAYCAST — a ray fired at the shelf face confirms ShelfCollision geometry
+///      exists at the expected front-plane radius, and its hit normal is near-
+///      vertical (|n.Y| < 0.3) — the exact test PlayerController.TryStartWallRun
+///      uses to accept a wall-run surface, so a flat BoxShape3D face here passes
+///      the same gate a dungeon wall trimesh face would.
+///   2. DRIVE (no penetration) — capsule sprints into the shelf face at slide
+///      speed for several seconds; final resting radial distance must not
+///      exceed (shelf front radius + capsule radius + small epsilon), proving
+///      the sweep does not tunnel through the new collider.
+///   3. PRESS (settled contact) — after the drive phase the capsule keeps
+///      pushing into the wall every frame; radial distance must stay STABLE
+///      (not still climbing) over the last second, confirming a normal
+///      "leaning into a wall" contact rather than slow creep/penetration.
+public partial class TestShelfCollision : Node3D
+{
+    const float CapsuleRadius = 0.35f;
+    const float CapsuleHeight = 1.6f;
+    const float DriveSpeed    = 32.0f;   // PlayerController.SlideMaxEntry
+
+    const float TestDurationSec = 6.0f;
+    const int   SettleFrames    = 30;
+
+    // Must mirror ArenaBuilder.AddBookshelfRing / AddShelfCollision exactly.
+    const float ShelfDepth = 0.55f;
+    static float Apothem       => ArenaBuilder.Apothem;
+    static float ShelfFrontR   => Apothem - ShelfDepth;              // ~29.306
+    static float MaxAllowedRadial => ShelfFrontR + CapsuleRadius + 0.15f;  // small sweep epsilon
+
+    CharacterBody3D _capsule = null!;
+    int   _settleLeft = SettleFrames;
+    float _t;
+    int   _lastSecLogged = -1;
+    float _maxRadial;
+    float _radial1sAgo = -1f;
+    bool  _finished;
+
+    public override void _Ready()
+    {
+        var env = new WorldEnvironment
+        {
+            Environment = new Godot.Environment
+            {
+                AmbientLightSource = Godot.Environment.AmbientSource.Color,
+                AmbientLightColor  = new Color(0.4f, 0.4f, 0.4f),
+                AmbientLightEnergy = 1.0f,
+            }
+        };
+        AddChild(env);
+
+        var arena = new ArenaBuilder { Name = "Arena" };
+        AddChild(arena);
+        arena.Build(Vector3.Zero, openNorth: true, openSouth: true);
+
+        GD.Print($"[TestShelfCollision] Apothem={Apothem:F3} ShelfFrontR={ShelfFrontR:F3} MaxAllowedRadial={MaxAllowedRadial:F3}");
+
+        RaycastCheck();
+
+        // Floating (not Grounded): the pre-existing ArenaWallSkirt (Task 3) only
+        // covers y ~ -0.25..1.75 and protrudes 0.8m into the room — farther than
+        // this task's ShelfCollision slabs (0.55m front). A grounded drive at
+        // floor height would hit the OLD skirt first and never actually reach
+        // the NEW collider, giving a false pass. Driving at a fixed height well
+        // above the skirt (y=5, still well below topY=22) isolates the new
+        // ShelfCollision box specifically — this is the height band that
+        // matters for wall-running anyway.
+        const float DriveY = 5.0f;
+
+        _capsule = new CharacterBody3D { Name = "TestCapsule" };
+        _capsule.AddChild(new CollisionShape3D
+        {
+            Name  = "Body",
+            Shape = new CapsuleShape3D { Radius = CapsuleRadius, Height = CapsuleHeight },
+        });
+        _capsule.CollisionMask   = 0xFFFFFFFF;
+        _capsule.MotionMode      = CharacterBody3D.MotionModeEnum.Floating;
+        AddChild(_capsule);
+
+        // Start well inside, due east (bay i=8, midAngle=90deg — plain wall, no doorway).
+        _capsule.GlobalPosition = new Vector3(Apothem - 5f, DriveY, 0f);
+        _maxRadial = Apothem - 5f;
+
+        GD.Print($"[TestShelfCollision] start=({_capsule.GlobalPosition.X:F2},{_capsule.GlobalPosition.Y:F2},{_capsule.GlobalPosition.Z:F2}) driving +X into shelf face at y={DriveY} (above WallSkirt band, within ShelfCollision height)");
+    }
+
+    // Confirms ShelfCollision geometry physically exists at the expected radius
+    // and presents a near-vertical (wall-runnable) normal, independent of
+    // MoveAndSlide.
+    void RaycastCheck()
+    {
+        var space = GetWorld3D().DirectSpaceState;
+        var from = new Vector3(0f, 5f, 0f);          // y=5 is well within shelf collider height (0..22)
+        var to   = new Vector3(60f, 5f, 0f);          // due east
+        var q = PhysicsRayQueryParameters3D.Create(from, to);
+        var hit = space.IntersectRay(q);
+        if (hit.Count == 0)
+        {
+            GD.Print("[TestShelfCollision][RAYCAST] NO HIT — ShelfCollision missing or gap at bay i=8!");
+            return;
+        }
+        var colliderName = (hit["collider"].As<GodotObject>() as Node)?.Name.ToString() ?? "?";
+        var pos    = (Vector3)hit["position"];
+        var normal = (Vector3)hit["normal"];
+        bool wallRunnable = Mathf.Abs(normal.Y) < 0.3f;   // same gate as PlayerController.TryStartWallRun
+        GD.Print($"[TestShelfCollision][RAYCAST] collider={colliderName} pos=({pos.X:F3},{pos.Y:F3},{pos.Z:F3}) dist={pos.X:F3} normal=({normal.X:F2},{normal.Y:F2},{normal.Z:F2}) wallRunnable={wallRunnable}");
+        GD.Print($"[TestShelfCollision][RAYCAST] RESULT expectedFrontR={ShelfFrontR:F3} hitDist={pos.X:F3} matches={Mathf.Abs(pos.X - ShelfFrontR) < 0.05f} wallRunnable={wallRunnable}");
+
+        // Doorway-skip sanity: a ray straight north (the open arch, dead centre
+        // of the doorway) at the same shelf height must NOT hit ShelfCollision —
+        // proves the *1.7 doorway-skip test carried over correctly from
+        // AddBookshelfRing into AddShelfCollision.
+        var qNorth = PhysicsRayQueryParameters3D.Create(new Vector3(0f, 5f, 0f), new Vector3(0f, 5f, -60f));
+        var hitNorth = space.IntersectRay(qNorth);
+        if (hitNorth.Count == 0)
+        {
+            GD.Print("[TestShelfCollision][RAYCAST-NORTH] NO HIT (expected — doorway open, ray exits arena)");
+        }
+        else
+        {
+            var nName = (hitNorth["collider"].As<GodotObject>() as Node)?.Name.ToString() ?? "?";
+            var nPos  = (Vector3)hitNorth["position"];
+            bool hitShelf = nName == "ShelfCollision";
+            GD.Print($"[TestShelfCollision][RAYCAST-NORTH] collider={nName} pos=({nPos.X:F2},{nPos.Y:F2},{nPos.Z:F2}) hitShelfCollision={hitShelf} (must be False — doorway bay must be skipped)");
+        }
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_finished) return;
+        float dt = (float)delta;
+
+        if (_settleLeft > 0)
+        {
+            // Floating mode, no gravity — nothing to settle physically, just let
+            // a couple of frames of zero velocity pass before driving (mirrors
+            // the settle pattern in TestArenaEscape for consistency).
+            _capsule.Velocity = Vector3.Zero;
+            _capsule.MoveAndSlide();
+            _settleLeft--;
+            return;
+        }
+
+        // Drive east into the shelf face at slide speed, continuously, holding
+        // height constant — mirrors a player sprinting/sliding into the shelf
+        // and holding forward ("press against it" as well as "does it
+        // penetrate"). MotionMode.Floating means MoveAndSlide applies Velocity
+        // directly with no gravity/floor snapping, so this cleanly isolates the
+        // new ShelfCollision box from the pre-existing low WallSkirt.
+        _capsule.Velocity = new Vector3(DriveSpeed, 0f, 0f);
+        _capsule.MoveAndSlide();
+
+        _t += dt;
+        var pos = _capsule.GlobalPosition;
+        float radial = new Vector2(pos.X, pos.Z).Length();
+        if (radial > _maxRadial) _maxRadial = radial;
+
+        int sec = Mathf.FloorToInt(_t);
+        if (sec != _lastSecLogged && sec <= Mathf.CeilToInt(TestDurationSec))
+        {
+            _lastSecLogged = sec;
+            GD.Print($"[TestShelfCollision] t={sec}s pos=({pos.X:F3},{pos.Y:F3},{pos.Z:F3}) radial={radial:F3}");
+            if (sec == Mathf.CeilToInt(TestDurationSec) - 1) _radial1sAgo = radial;
+        }
+
+        if (_t >= TestDurationSec)
+            Finish(radial);
+    }
+
+    void Finish(float finalRadial)
+    {
+        _finished = true;
+        bool penetrated = _maxRadial > MaxAllowedRadial;
+        float drift = _radial1sAgo >= 0f ? Mathf.Abs(finalRadial - _radial1sAgo) : -1f;
+        bool stableContact = drift >= 0f && drift < 0.05f;   // settled, not still creeping in
+
+        GD.Print("[TestShelfCollision] ==== RESULT ====");
+        GD.Print($"[TestShelfCollision] maxRadial={_maxRadial:F3} finalRadial={finalRadial:F3} MaxAllowedRadial={MaxAllowedRadial:F3} penetrated={penetrated}");
+        GD.Print($"[TestShelfCollision] driftLastSecond={drift:F4} stableContact={stableContact}");
+        GD.Print($"[TestShelfCollision] PASS={(!penetrated && stableContact)}");
+        GD.Print("[TestShelfCollision] ==== DONE ====");
+        GetTree().Quit();
+    }
+}

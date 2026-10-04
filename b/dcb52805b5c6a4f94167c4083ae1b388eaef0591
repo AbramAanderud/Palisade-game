@@ -1,0 +1,241 @@
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// res://scripts/PitBuilder.cs — Geometry for one 3x3 vertical shaft.
+///
+/// A Pit is stored as ONE MazePiece at the shaft's centre cell. It claims a 3x3
+/// footprint across three floors (anchor floor, one up, one down), clipped to the
+/// world's floor range: a pit placed at the top floor simply loses its upper level
+/// and stays valid.
+///
+/// The ENTIRE 3x3 is open shaft. Any cell face on the shaft's perimeter, on any
+/// occupied floor, with a piece pointing at it becomes a floating doorway — you
+/// step through it into thin air. That is the intended feel.
+///
+/// The pit deals NO damage. It is a traversal piece: you drop, you land, you walk
+/// out through a doorway at the bottom level. Do not add damage here.
+///
+/// ── MESH SPLITTING ──────────────────────────────────────────────────────────
+/// A pit is 30m x 30m across and up to 54m tall — the worst case in the whole game
+/// for the GL per-object light cap (see DungeonBuilder.cs:156-160: a large merged
+/// mesh is only lit near its bounding-box centre, leaving corners dark).
+/// RoomBuilder hit this exact bug already and was fixed to emit geometry per cell —
+/// this class does the same: one StaticBody3D per (footprint cell, occupied floor),
+/// named `Cell_{x}_{y}_{floor}` to match DungeonBuilder.BuildFloor's convention.
+/// The shaft bottom splits across its 9 cells; each wall segment already belongs to
+/// exactly one cell and floor; the vault cap splits across the top level's 9 cells.
+///
+/// This changes only how triangles are PACKAGED, never which triangles are generated
+/// or where their vertices sit. In particular the vault's arch function is always
+/// evaluated against the FULL 30 m shaft span (shaftX0..shaftX1), never a single
+/// cell's own extent, so adjacent cells' slices meet at identical heights and the
+/// cap reads as one continuous vault with no ridge at the cell seams.
+public static class PitBuilder
+{
+    const float CS = DungeonBuilder.CellSize;
+    const float FH = DungeonBuilder.FloorHeight;
+    const float HW = DungeonBuilder.OpeningW * 0.5f;   // 3 m — half doorway width
+
+    /// Doorway opening height, matching the room treatment so the two read as a set.
+    const float DoorH = RoomBuilder.RoomDoorH;
+
+    static readonly Dir[] Faces = { Dir.N, Dir.E, Dir.S, Dir.W };
+
+    /// Floors this pit actually occupies, clipped to [floorMin, floorMax].
+    /// Ascending order. Always contains at least the anchor floor.
+    public static int[] OccupiedFloors(int anchorFloor, int floorMin, int floorMax)
+        => PieceDB.FloorSpan(PieceType.Pit)
+            .Select(d => anchorFloor + d)
+            .Where(f => f >= floorMin && f <= floorMax)
+            .OrderBy(f => f)
+            .ToArray();
+
+    /// True when this pit's clipped volume covers cell (x, y) on `floor`.
+    public static bool Occupies(MazePiece pit, int x, int y, int floor,
+                                int floorMin, int floorMax)
+    {
+        if (pit.Type != PieceType.Pit) return false;
+        if (!OccupiedFloors(pit.Floor, floorMin, floorMax).Contains(floor)) return false;
+        return PieceDB.Footprint(PieceType.Pit)
+            .Any(o => pit.X + o.dx == x && pit.Y + o.dy == y);
+    }
+
+    /// Builds one pit into `owner`, one StaticBody3D per (footprint cell, occupied
+    /// floor) — see the class doc comment for why per-cell packaging is required.
+    public static void Build(DungeonBuilder owner, MazePiece pit,
+                             Dictionary<(int, int, int), MazePiece> lookup,
+                             int floorMin, int floorMax)
+    {
+        int[] floors = OccupiedFloors(pit.Floor, floorMin, floorMax);
+        if (floors.Length == 0) return;
+
+        int botFloor = floors[0];
+        int topFloor = floors[^1];
+
+        // Full 30 m footprint extents — used only as the ArchY domain so every
+        // cell's vault slice agrees on height at shared edges (see class doc).
+        float shaftX0 = (pit.X - 1) * CS, shaftX1 = (pit.X + 2) * CS;
+        float yBot     = botFloor * FH;
+        float yTopBase = topFloor * FH;
+
+        var footprint = PieceDB.Footprint(PieceType.Pit);
+
+        foreach (int f in floors)
+        {
+            float fy0 = f * FH, fy1 = fy0 + FH;
+
+            foreach (var (dx, dy) in footprint)
+            {
+                int cx = pit.X + dx, cy = pit.Y + dy;
+                float cx0 = cx * CS, cz0 = cy * CS;
+                float cx1 = cx0 + CS, cz1 = cz0 + CS;
+
+                var wallST  = DungeonBuilder.MakeST();
+                var floorST = DungeonBuilder.MakeST();
+                var ceilST  = DungeonBuilder.MakeST();
+
+                // ── Shaft bottom ─────────────────────────────────────────────
+                // Solid landing at the lowest occupied floor, split into this
+                // cell's own 10x10 tile. Free traversal: you land here unhurt
+                // and walk out through a bottom-level doorway.
+                if (f == botFloor)
+                    DungeonBuilder.Quad(floorST, new(cx0, yBot, cz0), new(cx1, yBot, cz0),
+                                                 new(cx1, yBot, cz1), new(cx0, yBot, cz1));
+
+                // ── Shaft walls, one segment per perimeter face on this cell/floor ──
+                // Interior faces of the 3x3 (dx/dy pointing at a neighboring
+                // footprint cell) are skipped — that's the open shaft interior.
+                foreach (var face in Faces)
+                {
+                    if (!IsPerimeterFace(dx, dy, face)) continue;
+                    bool door = HasEntry(lookup, pit, cx, cy, f, face, floorMin, floorMax);
+                    AddWallSegment(wallST, cx, cy, fy0, fy1, face, door);
+                }
+
+                // ── Vault cap ─────────────────────────────────────────────────
+                // Only the top occupied floor's slice; same arch treatment as a
+                // room so the two new piece types share one ceiling language.
+                if (f == topFloor)
+                    AddVaultSlice(ceilST, cx0, cz0, cx1, cz1, shaftX0, shaftX1, yTopBase);
+
+                var body = new StaticBody3D { Name = $"Cell_{cx}_{cy}_{f}" };
+                owner.AddChild(body);
+                // The "Floor" PREFIX IS LOAD-BEARING: DungeonBuilder.AddMesh picks the
+                // material with name.StartsWith("Floor") || name.StartsWith("Stair").
+                // A name like "PitFloor_…" starts with "Pit" and would silently get
+                // the WALL material. This exact bug already shipped once in
+                // RoomBuilder — do not reintroduce it.
+                owner.AddMesh(body, DungeonBuilder.Commit(floorST), $"FloorPit_{cx}_{cy}", default);
+                owner.AddMesh(body, DungeonBuilder.Commit(wallST),  $"WallPit_{cx}_{cy}",  default);
+                owner.AddMesh(body, DungeonBuilder.Commit(ceilST),  $"CeilPit_{cx}_{cy}",  default);
+            }
+        }
+    }
+
+    /// True when the given face of footprint offset (dx, dy) is on the 3x3's outer edge.
+    static bool IsPerimeterFace(int dx, int dy, Dir face) => face switch
+    {
+        Dir.N => dy == -1,
+        Dir.S => dy ==  1,
+        Dir.W => dx == -1,
+        _     => dx ==  1,
+    };
+
+    /// True when a piece outside the pit points at this face on this floor.
+    /// Any piece with a matching opening qualifies — the requirement is
+    /// "any slot that could be connected is valid".
+    static bool HasEntry(Dictionary<(int, int, int), MazePiece> lookup, MazePiece pit,
+                         int cx, int cy, int floor, Dir face, int floorMin, int floorMax)
+    {
+        var (dx, dy) = PieceDB.Delta(face);
+        int nx = cx + dx, ny = cy + dy;
+
+        // Never open a doorway into our own volume.
+        if (Occupies(pit, nx, ny, floor, floorMin, floorMax)) return false;
+
+        if (!lookup.TryGetValue((nx, ny, floor), out var nb)) return false;
+        return PieceDB.HasSameFloorOpening(nb.Type, nb.Rotation, PieceDB.Opposite(face));
+    }
+
+    /// One 10 m wall segment: solid, or split around a 6 m doorway with a lintel above.
+    static void AddWallSegment(SurfaceTool st, int cx, int cy,
+                               float fy0, float fy1, Dir face, bool doorway)
+    {
+        float x0 = cx * CS, z0 = cy * CS;
+        float x1 = x0 + CS, z1 = z0 + CS;
+        float xc = x0 + CS * 0.5f, zc = z0 + CS * 0.5f;
+        float yDoor = fy0 + DoorH;
+
+        // normalSign points the wall's face INTO the shaft.
+        switch (face)
+        {
+            case Dir.N:
+                if (doorway)
+                {
+                    DungeonBuilder.EWWall(st, z0, x0, xc - HW, fy0, fy1, +1);
+                    DungeonBuilder.EWWall(st, z0, xc + HW, x1, fy0, fy1, +1);
+                    DungeonBuilder.EWWall(st, z0, xc - HW, xc + HW, yDoor, fy1, +1);
+                }
+                else DungeonBuilder.EWWall(st, z0, x0, x1, fy0, fy1, +1);
+                break;
+
+            case Dir.S:
+                if (doorway)
+                {
+                    DungeonBuilder.EWWall(st, z1, x0, xc - HW, fy0, fy1, -1);
+                    DungeonBuilder.EWWall(st, z1, xc + HW, x1, fy0, fy1, -1);
+                    DungeonBuilder.EWWall(st, z1, xc - HW, xc + HW, yDoor, fy1, -1);
+                }
+                else DungeonBuilder.EWWall(st, z1, x0, x1, fy0, fy1, -1);
+                break;
+
+            case Dir.W:
+                if (doorway)
+                {
+                    DungeonBuilder.NSWall(st, x0, z0, zc - HW, fy0, fy1, +1);
+                    DungeonBuilder.NSWall(st, x0, zc + HW, z1, fy0, fy1, +1);
+                    DungeonBuilder.NSWall(st, x0, zc - HW, zc + HW, yDoor, fy1, +1);
+                }
+                else DungeonBuilder.NSWall(st, x0, z0, z1, fy0, fy1, +1);
+                break;
+
+            default:   // Dir.E
+                if (doorway)
+                {
+                    DungeonBuilder.NSWall(st, x1, z0, zc - HW, fy0, fy1, -1);
+                    DungeonBuilder.NSWall(st, x1, zc + HW, z1, fy0, fy1, -1);
+                    DungeonBuilder.NSWall(st, x1, zc - HW, zc + HW, yDoor, fy1, -1);
+                }
+                else DungeonBuilder.NSWall(st, x1, z0, z1, fy0, fy1, -1);
+                break;
+        }
+    }
+
+    /// One cell's slice of the barrel vault capping the shaft. Arcs across X
+    /// (evaluated against the FULL shaft span so slices agree at shared edges),
+    /// runs flat along Z within this cell's own 10 m depth.
+    static void AddVaultSlice(SurfaceTool st, float x0, float z0, float x1, float z1,
+                              float shaftX0, float shaftX1, float yBase)
+    {
+        const int N = 8;   // 10 m cell / 8 slices == the same density as 24 slices over 30 m
+        for (int i = 0; i < N; i++)
+        {
+            float xa = x0 + (x1 - x0) * i / N;
+            float xb = x0 + (x1 - x0) * (i + 1) / N;
+            float ya = ArchY(xa, shaftX0, shaftX1, yBase);
+            float yb = ArchY(xb, shaftX0, shaftX1, yBase);
+            DungeonBuilder.Quad(st, new(xa, ya, z1), new(xb, yb, z1),
+                                    new(xb, yb, z0), new(xa, ya, z0));
+        }
+    }
+
+    static float ArchY(float v, float v0, float v1, float yBase)
+    {
+        float half = (v1 - v0) * 0.5f;
+        if (half <= 0.001f) return yBase + RoomBuilder.RoomPeakY;
+        float t = Mathf.Clamp((v - (v0 + half)) / half, -1f, 1f);
+        return yBase + RoomBuilder.RoomPeakY
+             - (RoomBuilder.RoomPeakY - RoomBuilder.RoomSpringY) * t * t;
+    }
+}

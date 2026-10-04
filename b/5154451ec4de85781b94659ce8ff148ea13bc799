@@ -1,0 +1,284 @@
+using Godot;
+using System.Collections.Generic;
+
+/// Task 3 (Polish): Arena slide-escape collision reproduction + fix-verification harness.
+///
+/// Playtest bug: "you can slide out of the arena by just sliding into the wall."
+///
+/// Builds a bare ArenaBuilder at the origin (both doorways open, no maze corridors) and
+/// drives a scripted CharacterBody3D — sized and configured to match
+/// PlayerController's collision capsule (Radius=0.35, Height=1.6 — this never changes
+/// during slide; PlayerController never resizes the CollisionShape3D) and slide physics
+/// (vel.Y = -0.5 while grounded, XZ pinned to slide direction * speed, no air friction)
+/// — at slide speed into the wall at several angles for TestDurationSec seconds each,
+/// logging the max radial distance from centre once per second. If a scenario's max
+/// radial exceeds Apothem+0.5, the capsule escaped the arena (bug reproduced).
+///
+/// Scenarios:
+///   A — perpendicular into a plain wall face (control: away from any doorway)
+///   B — diagonally into the north-arch east jamb corner
+///   C — diagonally into the south-arch east jamb corner
+///   D — perpendicular into a plain bay-seam vertex (wall-to-wall corner, no doorway —
+///       control case: this vertex is part of the SAME trimesh as its neighbours, so it
+///       should behave differently from the wall/floor seam if that's the real gap)
+///   E — tangential skim along the wall, grazing past the north-arch jamb corner
+///       (mirrors how a player actually slides — mostly parallel to the wall, drifting
+///       into it — rather than a dead head-on hit)
+///   F — doorway passability: straight north through the open arch (must reach outside)
+///   G — doorway passability: straight south through the open arch (must reach outside)
+public partial class TestArenaEscape : Node3D
+{
+    // ── Must mirror PlayerController._Ready's CollisionShape3D + slide physics exactly ──
+    const float CapsuleRadius = 0.35f;
+    const float CapsuleHeight = 1.6f;
+    const float SlideSpeed    = 32.0f;   // PlayerController.SlideMaxEntry
+    const float Gravity       = 22.0f;   // PlayerController.Gravity
+    const float FloorMaxAngleDeg = 68f;
+    const float FloorSnapLen  = 1.5f;
+
+    const float TestDurationSec = 8.0f;
+
+    static float Apothem => ArenaBuilder.Apothem;
+    static float EscapeThreshold => Apothem + 0.5f;
+
+    class Scenario
+    {
+        public string  Name = "";
+        public Vector3 Start;
+        public Vector3 Dir;
+        public bool    Passability;
+    }
+
+    const int SettleFrames = 30;   // ~0.5s grounding period before driving — matches a real
+                                    // player who is already sprinting on the floor before
+                                    // sliding, not one spawned mid-air.
+
+    readonly List<Scenario> _scenarios = new();
+    readonly List<string>   _summary   = new();
+    int   _idx = -1;
+    CharacterBody3D _capsule = null!;
+    Vector3 _dir;
+    float _t;
+    int   _lastSecLogged;
+    float _maxRadial;
+    float _minZ, _maxZ;
+    bool  _finished;
+    int   _settleLeft;
+
+    public override void _Ready()
+    {
+        var env = new WorldEnvironment
+        {
+            Environment = new Godot.Environment
+            {
+                AmbientLightSource = Godot.Environment.AmbientSource.Color,
+                AmbientLightColor  = new Color(0.4f, 0.4f, 0.4f),
+                AmbientLightEnergy = 1.0f,
+            }
+        };
+        AddChild(env);
+
+        var arena = new ArenaBuilder { Name = "Arena" };
+        AddChild(arena);
+        arena.Build(Vector3.Zero, openNorth: true, openSouth: true);
+
+        RaycastDiagnostic();
+
+        _capsule = new CharacterBody3D { Name = "TestCapsule" };
+        _capsule.AddChild(new CollisionShape3D
+        {
+            Name  = "Body",
+            Shape = new CapsuleShape3D { Radius = CapsuleRadius, Height = CapsuleHeight },
+        });
+        _capsule.CollisionMask   = 0xFFFFFFFF;
+        _capsule.MotionMode      = CharacterBody3D.MotionModeEnum.Grounded;
+        _capsule.UpDirection     = Vector3.Up;
+        _capsule.FloorMaxAngle   = FloorMaxAngleDeg * Mathf.Pi / 180f;
+        _capsule.FloorSnapLength = FloorSnapLen;
+        AddChild(_capsule);
+
+        float capY  = CapsuleHeight * 0.5f + 0.05f;   // rest height, bottom ~0.05m above floor
+        float jambX = Mathf.Sqrt(30f * 30f - Apothem * Apothem);  // ~2.939 — doorway-edge vertex X
+
+        GD.Print($"[TestArenaEscape] Apothem={Apothem:F3} EscapeThreshold={EscapeThreshold:F3} jambX={jambX:F3}");
+
+        // A — perpendicular into a plain wall face (due east, face midpoint i=8)
+        Add("A_plain_wall_perp", new Vector3(Apothem - 3f, capY, 0f), new Vector3(1, 0, 0));
+
+        // B — diagonally into the north-arch east jamb corner
+        var jambN = new Vector3(jambX, capY, -Apothem);
+        var startB = jambN + new Vector3(-3f, 0f, 3f);
+        Add("B_north_jamb_corner", startB, (jambN - startB).Normalized());
+
+        // C — diagonally into the south-arch east jamb corner
+        var jambS = new Vector3(jambX, capY, Apothem);
+        var startC = jambS + new Vector3(-3f, 0f, -3f);
+        Add("C_south_jamb_corner", startC, (jambS - startC).Normalized());
+
+        // D — perpendicular into a plain bay-seam vertex (outer[9], no doorway nearby)
+        float a9 = 2f * Mathf.Pi * 9f / 32f - Mathf.Pi / 32f;
+        var v9 = new Vector3(Mathf.Sin(a9) * 30f, 0f, -Mathf.Cos(a9) * 30f);
+        var dirD = v9.Normalized();
+        Add("D_plain_bay_seam", dirD * (30f - 3f) + new Vector3(0, capY, 0), dirD);
+
+        // E — tangential skim along the wall, grazing the north-arch jamb corner
+        var startE = new Vector3(-10f, capY, -(Apothem - 2f));
+        Add("E_tangential_jamb_skim", startE, new Vector3(3f, 0f, -1f).Normalized());
+
+        // F/G — doorway passability (must reach outside through the open arch)
+        Add("F_passability_north", new Vector3(0, capY, 0), new Vector3(0, 0, -1), passability: true);
+        Add("G_passability_south", new Vector3(0, capY, 0), new Vector3(0, 0, 1), passability: true);
+
+        StartScenario(0);
+    }
+
+    // Fires raycasts straight out from the centre at y=1 toward several angles to
+    // confirm, independent of MoveAndSlide, whether wall collision geometry
+    // physically exists at each bearing.
+    void RaycastDiagnostic()
+    {
+        var space = GetWorld3D().DirectSpaceState;
+        (string label, float degFromNorth)[] bearings =
+        {
+            ("east_face8_90deg",   90f),
+            ("west_face24_270deg", 270f),
+            ("north_open_0deg",     0f),
+            ("south_open_180deg", 180f),
+            ("ne_diag_45deg",       45f),
+            ("nw_diag_315deg",    315f),
+        };
+        foreach (var (label, deg) in bearings)
+        {
+            float rad = deg * Mathf.Pi / 180f;
+            var dir = new Vector3(Mathf.Sin(rad), 0f, -Mathf.Cos(rad));
+            var from = new Vector3(0, 1f, 0);
+            var to   = from + dir * 60f;
+            var q = PhysicsRayQueryParameters3D.Create(from, to);
+            var hit = space.IntersectRay(q);
+            if (hit.Count == 0)
+            {
+                GD.Print($"[TestArenaEscape][RAYCAST] {label}: NO HIT (ray to {to})");
+            }
+            else
+            {
+                var colliderName = (hit["collider"].As<GodotObject>() as Node)?.Name.ToString() ?? "?";
+                GD.Print($"[TestArenaEscape][RAYCAST] {label}: HIT collider={colliderName} pos={hit["position"]} dist={((Vector3)hit["position"] - from).Length():F2}");
+            }
+        }
+    }
+
+    void Add(string name, Vector3 start, Vector3 dir, bool passability = false)
+        => _scenarios.Add(new Scenario { Name = name, Start = start, Dir = dir, Passability = passability });
+
+    void StartScenario(int idx)
+    {
+        _idx = idx;
+        var s = _scenarios[idx];
+        _dir  = s.Dir;
+        _capsule.Velocity = Vector3.Zero;
+        _capsule.GlobalPosition = s.Start;
+        _capsule.ResetPhysicsInterpolation();
+        _t = 0f;
+        _lastSecLogged = -1;
+        _settleLeft = SettleFrames;
+        float r0 = new Vector2(s.Start.X, s.Start.Z).Length();
+        _maxRadial = r0;
+        _minZ = s.Start.Z;
+        _maxZ = s.Start.Z;
+        GD.Print($"[TestArenaEscape] === START {s.Name} start=({s.Start.X:F2},{s.Start.Y:F2},{s.Start.Z:F2}) dir=({_dir.X:F2},0,{_dir.Z:F2}) ===");
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_finished || _idx < 0 || _idx >= _scenarios.Count) return;
+        float dt = (float)delta;
+
+        bool onFloor = _capsule.IsOnFloor();
+        var vel = _capsule.Velocity;
+
+        if (_settleLeft > 0)
+        {
+            // ── Settle phase: no driving input, just let gravity + floor-snap ground
+            // the capsule (mirrors a real player who is already sprinting on solid
+            // ground before initiating a slide — not spawned mid-air).
+            vel.X = 0f; vel.Z = 0f;
+            vel.Y = onFloor ? -0.5f : vel.Y - Gravity * dt;
+            _capsule.Velocity = vel;
+            _capsule.MoveAndSlide();
+            _settleLeft--;
+            return;
+        }
+
+        // ── Drive phase: mirrors PlayerController.SlideTick exactly — while
+        // grounded, XZ is pinned to the slide direction at slide speed and Y is
+        // pinned to -0.5 (SlideTick's own onFloor branch). The INSTANT the capsule
+        // leaves the floor, SlideTick's real behaviour is to end the slide and
+        // leave velocity untouched that frame (EndSlide does not modify vel) — so
+        // here, once airborne, we stop re-forcing XZ (matches NormalTick's
+        // zero-input air control, which does not decelerate) and only gravity
+        // keeps acting on Y. This avoids a harness-only runaway where forcing
+        // full slide velocity into an airborne capsule forever would produce a
+        // false "escape" that the real slide mechanic could never cause.
+        if (onFloor)
+        {
+            vel.X = _dir.X * SlideSpeed;
+            vel.Z = _dir.Z * SlideSpeed;
+            vel.Y = -0.5f;
+        }
+        else
+        {
+            vel.Y -= Gravity * dt;
+        }
+        _capsule.Velocity = vel;
+        _capsule.MoveAndSlide();
+
+        _t += dt;
+        var pos = _capsule.GlobalPosition;
+        float radial = new Vector2(pos.X, pos.Z).Length();
+        if (radial > _maxRadial) _maxRadial = radial;
+        if (pos.Z < _minZ) _minZ = pos.Z;
+        if (pos.Z > _maxZ) _maxZ = pos.Z;
+
+        int sec = Mathf.FloorToInt(_t);
+        if (sec != _lastSecLogged && sec <= Mathf.CeilToInt(TestDurationSec))
+        {
+            _lastSecLogged = sec;
+            GD.Print($"[TestArenaEscape] {_scenarios[_idx].Name} t={sec}s pos=({pos.X:F2},{pos.Y:F2},{pos.Z:F2}) radial={radial:F3} onFloor={onFloor}");
+        }
+
+        if (_t >= TestDurationSec)
+            FinishScenario();
+    }
+
+    void FinishScenario()
+    {
+        var s = _scenarios[_idx];
+        string line;
+        if (s.Passability)
+        {
+            bool north = s.Name.Contains("north");
+            bool reachedOutside = north ? _minZ < -(Apothem + 3f) : _maxZ > (Apothem + 3f);
+            line = $"[TestArenaEscape] RESULT {s.Name}: minZ={_minZ:F2} maxZ={_maxZ:F2} reachedOutside={reachedOutside} (needs {(north ? "minZ < " + (-(Apothem+3f)).ToString("F2") : "maxZ > " + (Apothem+3f).ToString("F2"))})";
+        }
+        else
+        {
+            bool escaped = _maxRadial > EscapeThreshold;
+            line = $"[TestArenaEscape] RESULT {s.Name}: maxRadial={_maxRadial:F3} escaped={escaped} (threshold={EscapeThreshold:F3})";
+        }
+        GD.Print(line);
+        _summary.Add(line);
+
+        if (_idx + 1 < _scenarios.Count)
+        {
+            StartScenario(_idx + 1);
+        }
+        else
+        {
+            _finished = true;
+            GD.Print("[TestArenaEscape] ==== SUMMARY ====");
+            foreach (var l in _summary) GD.Print(l);
+            GD.Print("[TestArenaEscape] ==== DONE ====");
+            GetTree().Quit();
+        }
+    }
+}

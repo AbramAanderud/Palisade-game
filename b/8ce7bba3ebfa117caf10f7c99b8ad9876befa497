@@ -1,0 +1,13 @@
+/// Shared configuration for the training game mode.
+public static class TrainingConfig
+{
+    /// Bot difficulty tiers.
+    ///   Passive — just walk toward the player; never attack, block, or evade.
+    ///   Easy    — approach and swing, but no blocking, dodging, or leaping.
+    ///   Normal  — full combat kit at standard speed.
+    ///   Hard    — full kit, moves faster and presses harder.
+    public enum Difficulty { Passive, Easy, Normal, Hard }
+
+    public static int        DummyCount = 1;
+    public static Difficulty Level      = Difficulty.Normal;
+}

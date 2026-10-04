@@ -1,0 +1,131 @@
+using Godot;
+
+/// res://scripts/ProximityPrompt.cs
+/// Roblox-style interaction prompt: a billboarded ring that fills clockwise
+/// while the player holds the key, with the key's letter in the middle.
+///
+/// Self-contained and weapon-agnostic — it knows nothing about pickups, only
+/// how to render a 0..1 progress value. Drive it by setting Progress each
+/// frame; call SetKeyFromAction to label it with whatever key is actually bound
+/// (the interact action is rebindable in SettingsPanel, so hardcoding "E" would
+/// go stale the moment someone remaps it).
+public partial class ProximityPrompt : Node3D
+{
+    // Small on purpose: the prompt sits on the weapon, so a large ring hides
+    // the thing it is advertising. Roblox prompts read as a badge, not a plate.
+    const float Size = 0.44f;      // quad edge length in metres
+
+    // Ring gauge. Drawn procedurally so there is no texture asset to ship or
+    // keep in sync, and it stays crisp at any distance.
+    //
+    // depth_test_disabled: the prompt sits ON the weapon it belongs to, so
+    // without this the weapon's own mesh punches holes through the ring. It is
+    // only visible while the player is inside the pickup Area3D, so drawing
+    // over nearby geometry is not a problem in practice.
+    const string RingShader = @"
+shader_type spatial;
+render_mode unshaded, cull_disabled, blend_mix, depth_draw_never, depth_test_disabled;
+uniform float progress   : hint_range(0.0, 1.0) = 0.0;
+uniform vec3  fill_color : source_color = vec3(0.45, 0.78, 1.0);
+uniform vec3  track_color: source_color = vec3(0.06, 0.10, 0.16);
+uniform float alpha      : hint_range(0.0, 1.0) = 1.0;
+
+void vertex() {
+    // Standard Godot 4 billboard: replace the model's rotation with the
+    // camera's, keeping only its translation.
+    MODELVIEW_MATRIX = VIEW_MATRIX * mat4(
+        INV_VIEW_MATRIX[0], INV_VIEW_MATRIX[1], INV_VIEW_MATRIX[2], MODEL_MATRIX[3]);
+}
+
+void fragment() {
+    vec2  p = (UV - 0.5) * 2.0;      // -1..1
+    float r = length(p);
+
+    // Ring band.
+    float outer = 1.0;
+    float inner = 0.78;   // thin band
+    float aa    = fwidth(r) * 1.5;   // resolution-independent edge softening
+    float band  = smoothstep(inner - aa, inner + aa, r) *
+                  (1.0 - smoothstep(outer - aa, outer + aa, r));
+
+    // Angle 0 at 12 o'clock, increasing clockwise — matches how a radial
+    // timer is read.
+    float ang = atan(p.x, p.y) / 6.2831853 + 0.5;
+    ang = fract(ang + 0.5);
+    float filled = step(ang, progress);
+
+    // Dark disc behind the letter so it stays readable against bright scenery.
+    float disc = 1.0 - smoothstep(inner - aa, inner + aa, r);
+
+    // Fill belongs to the BAND only. Applying `filled` to the whole quad also
+    // tinted the inner disc, which made the prompt read as a filling pie rather
+    // than a ring gauge and washed out the key letter behind it.
+    vec3  ringCol = mix(track_color, fill_color, filled);
+    vec3  col     = mix(track_color, ringCol, band);
+    // Disc is only faintly opaque so the weapon stays visible through it.
+    float a       = max(band, disc * 0.34) * alpha;
+
+    ALBEDO = col;
+    ALPHA  = a;
+}";
+
+    ShaderMaterial _mat = null!;
+    Label3D        _key = null!;
+    float          _progress;
+
+    /// 0..1 ring fill.
+    public float Progress
+    {
+        get => _progress;
+        set
+        {
+            _progress = Mathf.Clamp(value, 0f, 1f);
+            _mat?.SetShaderParameter("progress", _progress);
+        }
+    }
+
+    public override void _Ready()
+    {
+        _mat = new ShaderMaterial { Shader = new Shader { Code = RingShader } };
+
+        AddChild(new MeshInstance3D
+        {
+            Name             = "Ring",
+            Mesh             = new QuadMesh { Size = new Vector2(Size, Size) },
+            MaterialOverride = _mat,
+            CastShadow       = GeometryInstance3D.ShadowCastingSetting.Off,
+        });
+
+        _key = new Label3D
+        {
+            Name          = "KeyLabel",
+            Text          = "E",
+            FontSize      = 96,
+            PixelSize     = 0.0016f,
+            Modulate      = new Color(1f, 1f, 1f),
+            OutlineSize   = 10,
+            OutlineModulate = new Color(0f, 0f, 0f, 0.85f),
+            Billboard     = BaseMaterial3D.BillboardModeEnum.Enabled,
+            NoDepthTest   = true,
+            Shaded        = false,
+            // Sits just in front of the ring quad so it never z-fights with it.
+            Position      = new Vector3(0f, 0f, 0.01f),
+        };
+        AddChild(_key);
+    }
+
+    /// Labels the prompt with the first physical key bound to `action`, so a
+    /// rebind in SettingsPanel is reflected here instead of always claiming "E".
+    public void SetKeyFromAction(string action)
+    {
+        if (!InputMap.HasAction(action)) return;
+        foreach (var ev in InputMap.ActionGetEvents(action))
+            if (ev is InputEventKey k)
+            {
+                var s = OS.GetKeycodeString(k.PhysicalKeycode != Key.None
+                    ? DisplayServer.KeyboardGetKeycodeFromPhysical(k.PhysicalKeycode)
+                    : k.Keycode);
+                if (!string.IsNullOrEmpty(s)) { if (_key != null) _key.Text = s; return; }
+            }
+    }
+}

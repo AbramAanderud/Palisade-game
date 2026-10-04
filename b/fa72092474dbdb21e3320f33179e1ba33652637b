@@ -1,0 +1,113 @@
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// res://scripts/FfaWorld.cs — shared builder for the 3–4 maze FFA "plus" world
+/// (arena, rotated mazes, hallways, torch systems, altar, pickups). Used by the
+/// offline dev scene and the online arena. Roster seats may be non-contiguous;
+/// the LAYOUT index of a seat is its position in the ascending seat list.
+public sealed class FfaWorld
+{
+    readonly List<int> _seats = new();
+    readonly Dictionary<int, MazeData> _rotated = new();
+    readonly Dictionary<int, DungeonBuilder> _builders = new();
+    readonly List<WeaponPickup> _pickups = new();
+    int _offset;
+
+    public PlusLayoutResult Layout { get; private set; } = null!;
+    public IReadOnlyList<int> SeatsInLayoutOrder => _seats;
+    public IReadOnlyList<WeaponPickup> Pickups => _pickups;
+    public Vector3 ArenaCentre { get; private set; }
+
+    public static FfaWorld Build(Node parent, Vector3 origin, IReadOnlyDictionary<int, MazeData> mazesBySeat, int rotationOffset)
+    {
+        var w = new FfaWorld { ArenaCentre = origin, _offset = rotationOffset };
+        w._seats.AddRange(mazesBySeat.Keys.OrderBy(k => k));
+        int n = w._seats.Count;
+        w.Layout = PlusLayout.Compute(w._seats.Select(s => MazeFootprint.From(mazesBySeat[s])).ToList(), ArenaBuilder.Apothem);
+
+        for (int i = 0; i < n; i++)
+        {
+            int seat = w._seats[i];
+            var s = w.Layout.Seats[i];
+            var data = MazeRotation.Rotate(mazesBySeat[seat], s.QuarterTurns);
+            w._rotated[seat] = data;
+            var b = new DungeonBuilder { Name = $"Maze{seat}" };
+            parent.AddChild(b);
+            b.Build(data, origin + s.Offset, s.ExitOpenDir);
+            w._builders[seat] = b;
+            var torch = new TorchSignalSystem { Name = $"TorchSignal{seat}" };
+            parent.AddChild(torch);
+            torch.Init(data, b);
+            HallwayBuilder.Build(parent, s, w.Layout.HallCells, origin, $"Hall{seat}");
+        }
+
+        var arena = new ArenaBuilder { Name = "Arena", GrassInnerRadius = AltarBuilder.BaseRadius };
+        parent.AddChild(arena);
+        arena.Build(origin, w.Layout.DoorAngles);
+
+        var altar = new AltarBuilder { Name = "Altar" };
+        parent.AddChild(altar);
+        altar.Build(origin);
+        int pickups = n - 1;
+        for (int i = 0; i < pickups; i++)
+        {
+            float a = Mathf.Tau * i / pickups;
+            var p = WeaponPickup.Spawn(parent, origin + AltarBuilder.WeaponAnchor +
+                                       new Vector3(Mathf.Sin(a), 0f, -Mathf.Cos(a)) * AltarBuilder.TopRadius * 0.55f);
+            p.Name = $"Pickup{i}";
+            w._pickups.Add(p);
+        }
+        return w;
+    }
+
+    public int LayoutIndexOf(int seat) => _seats.IndexOf(seat);
+
+    /// The maze seat run by `runnerSeat`: layout index (k + offset) % n.
+    public int MazeSeatRunBy(int runnerSeat) =>
+        _seats[(LayoutIndexOf(runnerSeat) + _offset) % _seats.Count];
+
+    public MazeData RotatedMaze(int mazeSeat) => _rotated[mazeSeat];
+    public DungeonBuilder MazeBuilder(int mazeSeat) => _builders[mazeSeat];
+
+    public Vector3 StartPosition(int mazeSeat)
+    {
+        var s = Layout.Seats[LayoutIndexOf(mazeSeat)];
+        var st = _rotated[mazeSeat].Pieces.First(p => p.Type == PieceType.Start);
+        return ArenaCentre + s.Offset + new Vector3((st.X + 0.5f) * DungeonBuilder.CellSize,
+                                                    st.Floor * DungeonBuilder.FloorHeight + 1f,
+                                                    (st.Y + 0.5f) * DungeonBuilder.CellSize);
+    }
+
+    public float StartYaw(int mazeSeat)
+    {
+        var st = _rotated[mazeSeat].Pieces.First(p => p.Type == PieceType.Start);
+        return DungeonArena.DirToYaw(PieceDB.GetOpenings(PieceType.Start, st.Rotation));
+    }
+
+    public int MazeAt(Vector3 worldPos)
+    {
+        int i = Layout.MazeAt(worldPos - ArenaCentre);
+        return i < 0 ? -1 : _seats[i];
+    }
+
+    /// Hide every maze except the one the viewer is inside, while the viewer is in
+    /// a maze BODY (not its hallway, not the arena). GL-compat has no occlusion, so
+    /// the other mazes would otherwise be drawn through the walls. Idempotent.
+    public void ApplyVisibility(Vector3 viewerWorldPos)
+    {
+        var rel = viewerWorldPos - ArenaCentre;
+        int li = Layout.MazeAt(rel);
+        bool inBody = li >= 0 && !(Layout.HallCells > 0 &&
+            PlusLayout.HallBox(Layout.Seats[li], Layout.HallLength).Grow(0.01f).HasPoint(rel));
+        int m = li < 0 ? -1 : _seats[li];
+        foreach (int seat in _seats)
+        {
+            var b = _builders[seat];
+            bool want = !inBody || seat == m;
+            if (b.Visible != want) b.Visible = want;
+        }
+    }
+
+    public Vector3 DoorOutward(int mazeSeat) => PlusLayout.DoorDir(Layout.Seats[LayoutIndexOf(mazeSeat)].Door);
+}

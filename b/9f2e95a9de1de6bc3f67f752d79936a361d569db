@@ -1,0 +1,128 @@
+using Godot;
+
+/// test/TestSeatGate.cs
+/// Gate for the "sideways gun" fix, plus the "always facing reticle" /
+/// "sprint face-carry" follow-up.
+///
+/// PlayerController.SeatGrip orients a weapon by baking a correction relative to
+/// the HAND BONE's orientation at the instant it runs. That reference is only
+/// meaningful in the pose the weapon should point forward in. The old code ran
+/// it on a fixed 20-frame timer with no check on which pose was live, so
+/// seating while sprinting or aiming steeply baked THAT pose in permanently.
+///
+/// IsSeatReferenceValid now answers two DIFFERENT questions behind one flag:
+///   - firstPerson: true  → the FP viewmodel, which must always chase the
+///     reticle. Pitch and sprint never gate it any more; only Reloading does.
+///   - firstPerson: false → the TP opponent read, which keeps the original
+///     sprint/pitch/phase gate exactly as before (a deliberate combat tell).
+///
+/// A gate is exactly the kind of thing that rots silently: loosen a bound or
+/// forget a term and the bug returns with no build error and no visible test
+/// failure. Hence this — pure, so it needs no skeleton, camera or AnimationTree.
+public partial class TestSeatGate : Node
+{
+    int _fail;
+    void Check(bool ok, string label)
+    {
+        GD.Print((ok ? "PASS  " : "FAIL  ") + label);
+        if (!ok) _fail++;
+    }
+
+    const float Deg = Mathf.Pi / 180f;
+
+    public override void _Ready()
+    {
+        GD.Print("── seat reference gate: THIRD PERSON (unchanged combat-read rules) ──");
+
+        // The one canonical case: standing still, looking level, idle.
+        Check(PlayerController.IsSeatReferenceValid(false, 0f, GunCombat.Phase.Idle),
+              "level + standing + idle IS a valid reference");
+
+        // Sprint is the worst offender: per the weapon-families design the carry
+        // poses (rocket at-chest log carry vs shoulder mount) differ hugely, so
+        // a seat taken mid-sprint is wrong by a large rotation.
+        Check(!PlayerController.IsSeatReferenceValid(true, 0f, GunCombat.Phase.Idle),
+              "sprinting is REJECTED even when looking level");
+
+        // Aim pitch drives a blendspace, so a steep look is a different pose.
+        Check(!PlayerController.IsSeatReferenceValid(false,  45f * Deg, GunCombat.Phase.Idle),
+              "looking 45 deg up is REJECTED");
+        Check(!PlayerController.IsSeatReferenceValid(false, -45f * Deg, GunCombat.Phase.Idle),
+              "looking 45 deg down is REJECTED");
+
+        // Mid-action one-shots move the hand too.
+        Check(!PlayerController.IsSeatReferenceValid(false, 0f, GunCombat.Phase.Reloading),
+              "reloading is REJECTED");
+        Check(!PlayerController.IsSeatReferenceValid(false, 0f, GunCombat.Phase.Firing),
+              "firing is REJECTED");
+
+        // The bound has to be tight enough to matter and loose enough to hit in
+        // normal play — a gate nobody ever satisfies would leave every weapon on
+        // a provisional seat forever, which is the bug wearing a disguise.
+        Check(PlayerController.IsSeatReferenceValid(false, 5f * Deg, GunCombat.Phase.Idle),
+              "a normal 5 deg glance still counts as level");
+        Check(!PlayerController.IsSeatReferenceValid(false, 20f * Deg, GunCombat.Phase.Idle),
+              "20 deg is outside the bound");
+
+        // Symmetry: an asymmetric bound would seat fine looking up and badly
+        // looking down, which is exactly the kind of half-fix that reads as
+        // "it's still sometimes wrong".
+        for (float d = 0f; d <= 30f; d += 2.5f)
+            Check(PlayerController.IsSeatReferenceValid(false,  d * Deg, GunCombat.Phase.Idle)
+               == PlayerController.IsSeatReferenceValid(false, -d * Deg, GunCombat.Phase.Idle),
+                  $"+/-{d:F1} deg treated identically");
+
+        // Airborne skips the pitch clamp (air pose swings hardest, and mid-air
+        // is when players ARE pitched) but never overrides sprint or firing.
+        Check(PlayerController.IsSeatReferenceValid(false, 45f * Deg, GunCombat.Phase.Idle, airborne: true),
+              "airborne + steep pitch still re-seats");
+        Check(!PlayerController.IsSeatReferenceValid(true, 0f, GunCombat.Phase.Idle, airborne: true),
+              "airborne does not override the sprint carry");
+        Check(!PlayerController.IsSeatReferenceValid(false, 0f, GunCombat.Phase.Firing, airborne: true),
+              "airborne does not override the firing recoil pose");
+
+        GD.Print("── seat reference gate: FIRST PERSON (always facing reticle) ──");
+
+        // The whole point of the fix: pitch must NEVER gate the FP seat any more
+        // — a steep look is exactly when continuous re-seating has to keep
+        // pinning the bore to the (pitched) camera direction, not pause and let
+        // the hand weld carry the gun off-target.
+        Check(PlayerController.IsSeatReferenceValid(false, 0f, GunCombat.Phase.Idle, firstPerson: true),
+              "FP: level + standing + idle is valid");
+        Check(PlayerController.IsSeatReferenceValid(false, 45f * Deg, GunCombat.Phase.Idle, firstPerson: true),
+              "FP: looking 45 deg up no longer pauses the seat");
+        Check(PlayerController.IsSeatReferenceValid(false, -45f * Deg, GunCombat.Phase.Idle, firstPerson: true),
+              "FP: looking 45 deg down no longer pauses the seat");
+        Check(PlayerController.IsSeatReferenceValid(false, 85f * Deg, GunCombat.Phase.Idle, firstPerson: true),
+              "FP: even a near-vertical look stays valid (grounded, no airborne flag needed)");
+
+        // Sprint is no longer a pause window either — the fist-blocking carry
+        // clip is suppressed on the FP arms (PlayerAnimator.UpdateFpArmsLocoClip)
+        // and the gun instead keeps chasing the reticle through the sprint.
+        Check(PlayerController.IsSeatReferenceValid(true, 0f, GunCombat.Phase.Idle, firstPerson: true),
+              "FP: sprinting no longer pauses the seat");
+        Check(PlayerController.IsSeatReferenceValid(true, 45f * Deg, GunCombat.Phase.Idle, firstPerson: true),
+              "FP: sprinting + steep pitch together still stay valid");
+
+        // Firing's kick lives on the arms ROOT, one level above this seat, so
+        // continuous re-seating through the muzzle flash does not fight it.
+        Check(PlayerController.IsSeatReferenceValid(false, 0f, GunCombat.Phase.Firing, firstPerson: true),
+              "FP: firing no longer pauses the seat");
+
+        // Reloading is the one deliberate pose FP still yields to — the mag-out
+        // weld would look broken if the gun snapped back to the reticle mid-swap.
+        Check(!PlayerController.IsSeatReferenceValid(false, 0f, GunCombat.Phase.Reloading, firstPerson: true),
+              "FP: reloading still pauses the seat");
+        Check(!PlayerController.IsSeatReferenceValid(true, 45f * Deg, GunCombat.Phase.Reloading, firstPerson: true),
+              "FP: reloading pauses the seat even mid-sprint / steep pitch");
+
+        // Airborne is a no-op for FP now (pitch already never gates it) — the
+        // param exists purely so callers don't have to special-case FP vs TP.
+        Check(PlayerController.IsSeatReferenceValid(true, 45f * Deg, GunCombat.Phase.Idle,
+                                                    airborne: true, firstPerson: true),
+              "FP: airborne + sprinting + steep pitch all together still valid");
+
+        GD.Print(_fail == 0 ? "RESULT OK" : $"RESULT {_fail} FAILURE(S)");
+        GetTree().Quit(_fail == 0 ? 0 : 1);
+    }
+}

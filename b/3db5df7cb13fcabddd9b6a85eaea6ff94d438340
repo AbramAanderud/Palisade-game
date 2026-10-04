@@ -1,0 +1,82 @@
+using Godot;
+using System.Text.Json;
+
+/// res://scripts/MazeSerializer.cs — Multi-slot save/load for MazeData.
+/// Paths are resolved per-account via AccountManager, e.g. user://accounts/alice/maze_2.json.
+public static class MazeSerializer
+{
+    public const int SlotCount = 5;
+
+    static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
+
+    static string SlotPath(int slot) => AccountManager.MazeSlotPath(slot);
+
+    public static void Save(int slot, MazeData data)
+    {
+        data.GoldSpent = 0;
+        if (data.Pieces != null)
+            foreach (var p in data.Pieces)
+                data.GoldSpent += PieceDB.GoldCosts[p.Type];
+
+        string json = JsonSerializer.Serialize(data, JsonOpts);
+        using var file = FileAccess.Open(SlotPath(slot), FileAccess.ModeFlags.Write);
+        file?.StoreString(json);
+    }
+
+    public static MazeData? Load(int slot)
+    {
+        string path = SlotPath(slot);
+        if (!FileAccess.FileExists(path)) return null;
+        using var file = FileAccess.Open(path, FileAccess.ModeFlags.Read);
+        if (file == null) return null;
+        string json = file.GetAsText();
+        try
+        {
+            var data = JsonSerializer.Deserialize<MazeData>(json, JsonOpts);
+            data ??= new MazeData();
+            data.Pieces ??= new();
+            return data;
+        }
+        catch
+        {
+            GD.PushError($"[MazeSerializer] Failed to parse slot {slot}");
+            return null;
+        }
+    }
+
+    public static bool Exists(int slot) => FileAccess.FileExists(SlotPath(slot));
+
+    /// Update per-maze analytics for the given slot at the moment a sword is
+    /// claimed in an online match.
+    ///   • If `wasTrapSuccess` is true, the opponent failed to escape this maze (the
+    ///     local player escaped the opponent's maze first), so trap_count increments.
+    ///   • Otherwise the opponent escaped this maze in `timeSeconds`, so escape_count
+    ///     increments and the time is added to the average.
+    public static void RecordMatchOutcome(int slot, bool wasTrapSuccess, double timeSeconds)
+    {
+        var data = Load(slot);
+        if (data == null) return;
+
+        data.MatchesPlayed++;
+        if (wasTrapSuccess) data.TrapSuccesses++;
+        else
+        {
+            data.EscapeCount++;
+            data.EscapeTimesSum += timeSeconds;
+        }
+
+        string json = JsonSerializer.Serialize(data, JsonOpts);
+        using var file = FileAccess.Open(SlotPath(slot), FileAccess.ModeFlags.Write);
+        file?.StoreString(json);
+
+        double trapRate = data.MatchesPlayed > 0
+            ? (double)data.TrapSuccesses / data.MatchesPlayed
+            : 0.0;
+        double avgEscape = data.EscapeCount > 0
+            ? data.EscapeTimesSum / data.EscapeCount
+            : 0.0;
+        GD.Print($"[MazeStats] Slot {slot} ({data.Name}): trap rate {trapRate:P0} " +
+                 $"({data.TrapSuccesses}/{data.MatchesPlayed}), avg escape {avgEscape:F1}s " +
+                 $"over {data.EscapeCount} escapes.");
+    }
+}

@@ -1,0 +1,94 @@
+using Godot;
+
+/// res://test/TestTask.cs
+/// ─────────────────────────────────────────────────────────────────────────────
+/// FP continuous-seat verification. Films through the player's OWN FP camera
+/// (creates no camera of its own — the viewmodel lives on the FP-only layer).
+/// Beats: ak47 for the first 3 s, then re-equip mac10. The old latched seat was
+/// only correct on the frame it was measured — by late idle-cycle frames every
+/// gun drifted diagonal/up. With the continuous re-seat, the muzzle must stay
+/// pinned toward the crosshair in EVERY frame, early and late, both guns.
+/// ─────────────────────────────────────────────────────────────────────────────
+public partial class TestTask : Node3D
+{
+    PlayerController? _player;
+    float _t;
+    bool  _swapped;
+
+    public override void _Ready()
+    {
+        var env = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = new Color(0.16f, 0.18f, 0.24f),
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(1f, 0.97f, 0.92f),
+            AmbientLightEnergy = 0.9f,
+        };
+        AddChild(new WorldEnvironment { Environment = env });
+        var sun = new DirectionalLight3D { LightEnergy = 1.6f };
+        sun.RotationDegrees = new Vector3(-45f, 30f, 0f);
+        AddChild(sun);
+
+        var floor = new StaticBody3D();
+        floor.AddChild(new CollisionShape3D
+        { Shape = new BoxShape3D { Size = new Vector3(40f, 1f, 40f) } });
+        AddChild(floor);
+        floor.GlobalPosition = new Vector3(0f, -0.5f, 0f);
+
+        // A target post at the crosshair so "muzzle points downrange" is a
+        // direct visual read against a reference, not a guess.
+        var post = new MeshInstance3D
+        {
+            Mesh = new BoxMesh { Size = new Vector3(0.4f, 3f, 0.4f) },
+            Position = new Vector3(0f, 1.5f, -12f),
+        };
+        post.SetSurfaceOverrideMaterial(0, new StandardMaterial3D
+        { AlbedoColor = new Color(0.85f, 0.3f, 0.25f), Roughness = 1f });
+        AddChild(post);
+
+        // NOT Frozen: Frozen skips the whole physics tick, and AnimateFpGun /
+        // SeatGripInHand — the entire FP viewmodel pipeline — live inside it.
+        // A frozen player never shows arms or gun in ANY capture.
+        _player = PlayerController.Spawn(this, new Vector3(0f, 0.2f, 0f), 0f);
+        _player.EquipStarterGun("ak47");
+
+        // One-off axis probe: print each named mac10 part's centre/size in
+        // MODEL-LOCAL space. The mag's offset from the body = local down; the
+        // bore is the long horizontal axis perpendicular to it; the trigger
+        // sits in the rear half, fixing the muzzle's sign.
+        var probeScene = GD.Load<PackedScene>(
+            "res://assets/guns/Styloo Guns Asset Pack GLTF FBX V1.1/Normal version Color and NormalMap/GLB/mac10.glb");
+        if (probeScene != null)
+        {
+            var probe = probeScene.Instantiate<Node3D>();
+            AddChild(probe);
+            probe.Position = new Vector3(0f, -50f, 0f);   // out of shot
+            PrintPartAabbs(probe, probe);
+        }
+    }
+
+    static void PrintPartAabbs(Node3D root, Node node)
+    {
+        if (node is MeshInstance3D mi && mi.Mesh != null)
+        {
+            // Part AABB transformed into the ROOT's local space.
+            var xf = root.GlobalTransform.AffineInverse() * mi.GlobalTransform;
+            var a  = xf * mi.GetAabb();
+            var c  = a.Position + a.Size * 0.5f;
+            GD.Print($"[Probe] {mi.Name}: centre=({c.X:F3},{c.Y:F3},{c.Z:F3}) size=({a.Size.X:F3},{a.Size.Y:F3},{a.Size.Z:F3})");
+        }
+        foreach (Node child in node.GetChildren()) PrintPartAabbs(root, child);
+    }
+
+    public override void _PhysicsProcess(double delta)
+    {
+        _t += (float)delta;
+        if (!_swapped && _t >= 3f && _player != null)
+        {
+            _swapped = true;
+            _player.EquipStarterGun("mac10");
+            GD.Print("[Task] swapped to mac10");
+        }
+    }
+}

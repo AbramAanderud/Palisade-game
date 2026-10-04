@@ -1,0 +1,55 @@
+using System;
+using System.Linq;
+using Godot;
+
+/// Headless assertion harness for PieceDB category metadata.
+/// Prints one line per check and quits non-zero if any check fails.
+public partial class TestPieceCategories : Node
+{
+    int _failures = 0;
+
+    void Check(bool condition, string label)
+    {
+        if (condition) GD.Print($"PASS  {label}");
+        else { GD.Print($"FAIL  {label}"); _failures++; }
+    }
+
+    public override void _Ready()
+    {
+        // Every PieceType must resolve to a category without throwing.
+        foreach (PieceType pt in Enum.GetValues<PieceType>())
+        {
+            bool ok;
+            try { PieceDB.CategoryOf(pt); ok = true; }
+            catch (Exception e) { GD.Print($"      threw: {e.Message}"); ok = false; }
+            Check(ok, $"CategoryOf({pt}) does not throw");
+        }
+
+        // Known placements.
+        Check(PieceDB.CategoryOf(PieceType.Straight)   == PieceCategory.Structure,
+              "Straight is Structure");
+        Check(PieceDB.CategoryOf(PieceType.Cross)      == PieceCategory.Structure,
+              "Cross is Structure");
+        Check(PieceDB.CategoryOf(PieceType.StairsUp)   == PieceCategory.Traversal,
+              "StairsUp is Traversal");
+        Check(PieceDB.CategoryOf(PieceType.StairsDown) == PieceCategory.Traversal,
+              "StairsDown is Traversal");
+
+        // CategoryOrder must list every category exactly once.
+        Check(PieceDB.CategoryOrder.Length == Enum.GetValues<PieceCategory>().Length,
+              "CategoryOrder covers every PieceCategory");
+        Check(PieceDB.CategoryOrder.Distinct().Count() == PieceDB.CategoryOrder.Length,
+              "CategoryOrder has no duplicates");
+
+        // Every category needs a display label.
+        foreach (var c in PieceDB.CategoryOrder)
+            Check(PieceDB.CategoryLabels.ContainsKey(c) &&
+                  !string.IsNullOrWhiteSpace(PieceDB.CategoryLabels[c]),
+                  $"CategoryLabels has a non-empty label for {c}");
+
+        GD.Print(_failures == 0
+            ? "RESULT OK"
+            : $"RESULT {_failures} FAILURE(S)");
+        GetTree().Quit(_failures == 0 ? 0 : 1);
+    }
+}

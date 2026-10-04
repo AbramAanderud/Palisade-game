@@ -1,0 +1,103 @@
+# tools/trim_gunsfx.py
+# Trims leading/trailing silence off the hand-added gunshot MP3s and writes
+# game-ready WAVs beside them.  Run:  py tools/trim_gunsfx.py
+#
+# WHY
+# Several of the source MP3s start with dead air — measured with ffmpeg
+# silencedetect: shotgunshot 328 ms, pistolshot 141 ms, allrocketshots 123 ms.
+# AudioStreamPlayer3D.Play() starts at sample 0, so that silence is pure input
+# latency: you pull the trigger and hear nothing for a third of a second. It is
+# worse than it sounds, because Play() RESTARTS the stream on every shot — at
+# the sidearm's 0.22 s fire interval a 141 ms lead-in leaves only ~79 ms of
+# audible shot per trigger pull.
+#
+# WAV rather than trimmed MP3, for two reasons:
+#   - re-encoding MP3 is lossy a second time; decoding once to PCM is not.
+#   - MP3 carries encoder delay and needs decoding on every play. For short,
+#     rapid, latency-critical one-shots, PCM is simply the right container.
+#
+# The originals are left untouched — this only ever writes new shot_*.wav files.
+
+import json, os, re, shutil, subprocess, sys
+
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                   "..", "assets", "audio", "sfx", "combat")
+
+# source mp3 stem -> output stem
+FILES = {
+    "pistolshot":     "shot_pistol",
+    "smgshot":        "shot_smg",
+    "akshot":         "shot_rifle",
+    "shotgunshot":    "shot_shotgun",
+    "snipershot":     "shot_sniper",
+    "allrocketshots": "shot_rocket",
+}
+
+THRESH   = "-45dB"   # quieter than this counts as silence
+MIN_SIL  = 0.02      # seconds. 0.08 missed the sniper's 62 ms lead-in and
+                     # 0.03 still missed the rifle's ~25 ms one.
+PREROLL  = 0.005     # keep 5 ms before the transient so the attack is not clipped
+TAIL_PAD = 0.030     # keep 30 ms after the last audio so the tail is not cut dead
+
+ff  = shutil.which("ffmpeg")
+ffp = shutil.which("ffprobe")
+if not ff or not ffp:
+    sys.exit("ffmpeg/ffprobe not on PATH")
+
+
+def duration(path):
+    out = subprocess.run([ffp, "-v", "error", "-show_entries", "format=duration",
+                          "-of", "json", path], capture_output=True, text=True).stdout
+    return float(json.loads(out)["format"]["duration"])
+
+
+def content_bounds(path, dur):
+    """First and last instant that is not silence."""
+    out = subprocess.run(
+        [ff, "-hide_banner", "-nostats", "-i", path,
+         "-af", f"silencedetect=noise={THRESH}:d={MIN_SIL}", "-f", "null", "-"],
+        capture_output=True, text=True).stderr
+
+    starts = [float(m) for m in re.findall(r"silence_start: *([0-9.]+)", out)]
+    ends   = [float(m) for m in re.findall(r"silence_end: *([0-9.]+)", out)]
+
+    # Leading silence only counts if it begins at (essentially) zero.
+    begin = ends[0] if (starts and starts[0] <= 0.01 and ends) else 0.0
+
+    # Trailing silence, two shapes — BOTH are needed. ffmpeg usually terminates
+    # the final run at EOF (silence_end == duration), so testing only for an
+    # unterminated run silently trims nothing, which is how an earlier pass
+    # here stopped cutting tails at all.
+    end = dur
+    if starts:
+        if not ends or starts[-1] > ends[-1]:
+            end = starts[-1]                       # run continues past EOF
+        elif ends[-1] >= dur - 0.02:
+            end = starts[-1]                       # run terminated exactly at EOF
+
+    return max(0.0, begin - PREROLL), min(dur, end + TAIL_PAD)
+
+
+for stem, out_stem in FILES.items():
+    src = os.path.abspath(os.path.join(SRC, stem + ".mp3"))
+    if not os.path.exists(src):
+        print(f"[trim] MISSING {stem}.mp3 — skipped")
+        continue
+
+    dur = duration(src)
+    a, b = content_bounds(src, dur)
+    dst = os.path.abspath(os.path.join(SRC, out_stem + ".wav"))
+
+    # Mono: these are world-positioned 3D one-shots. A stereo source played
+    # through AudioStreamPlayer3D gets folded down anyway, and keeping two
+    # channels would only double the memory for identical output.
+    subprocess.run(
+        [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", src,
+         "-af", f"atrim=start={a:.4f}:end={b:.4f},asetpts=N/SR/TB",
+         "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le", dst],
+        check=True)
+
+    print(f"[trim] {stem:16s} {dur:5.3f}s -> {out_stem}.wav "
+          f"{b - a:5.3f}s   (cut {a * 1000:5.0f} ms lead, {(dur - b) * 1000:5.0f} ms tail)")
+
+print("[trim] done — originals untouched")

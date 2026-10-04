@@ -1,0 +1,3173 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Godot;
+
+/// New 3D-first maze editor ("Online Maze" from the title screen).
+/// Black world, white geometry, 45°-isometric camera with right-click orbit.
+/// Per-floor grids; lower floors dimmed.  3D thumbnail piece palette.
+/// 5 save slots (uses MazeSerializer slots 0–4).
+public partial class MazeEditor3D : Control
+{
+    // ── World constants ────────────────────────────────────────────────────────
+    const float CS    = DungeonBuilder.CellSize;      // 10 m per cell
+    const float FH    = DungeonBuilder.FloorHeight;   // 18 m floor-to-floor
+    const float WallH = 5.5f;                         // visual wall height in editor
+    const float WallT = 0.28f;
+    const float FlrT  = 0.22f;
+    const int   GW    = 10;
+    const int   GH    = 10;
+    const int   FlMin = -3;
+    const int   FlMax =  3;
+    const int   MaxSlots  = 5;
+    const int   PanW     = 220;
+    const int   ThSz     = 96;
+    const int   PalBarH  = 164;   // 128 piece row + 36 category tab row
+    const int   CatTabH  = 36;    // height of the category tab row
+
+    const float CentW  = CS * 0.50f;                // 5m central room square
+    const float ArmW   = CS * 0.40f;                // 4m corridor arm width
+    const float ArmLen = (CS - CentW) * 0.5f;       // 2.5m arm length
+    const float EdFH   = 8f;                        // editor display floor spacing (visual only)
+
+    static readonly Vector3 GridCentre = new(GW * CS * 0.5f, 0f, GH * CS * 0.5f);
+
+    // ── Palette order ──────────────────────────────────────────────────────────
+    static readonly PieceType[] Palette =
+    {
+        PieceType.Straight, PieceType.LHall,
+        PieceType.THall, PieceType.Cross,
+        PieceType.StairsUp, PieceType.StairsDown,
+    };
+
+    // Start is on the far-side row (cy = 0, the top of the screen — furthest from the
+    // default camera view). Exit is on the near-side row (cy = GH-1, the bottom).
+    // At these positions, both pieces' natural rotations (Start opens S, Exit opens N)
+    // already point inward into the maze — no rotation needed by default.
+    const int StartRow = 0;
+    const int ExitRow  = GH - 1;
+
+    // ── Colors ─────────────────────────────────────────────────────────────────
+    static readonly Color CFloor   = new(0.82f, 0.82f, 0.82f);
+    static readonly Color CWall    = new(1.00f, 1.00f, 1.00f);
+    static readonly Color CDimFloor= new(0.28f, 0.28f, 0.28f, 0.45f);
+    static readonly Color CDimWall = new(0.50f, 0.50f, 0.50f, 0.16f);
+    static readonly Color CStart   = new(0.20f, 0.88f, 0.28f);
+    static readonly Color CExit    = new(0.88f, 0.20f, 0.20f);
+    static readonly Color CStair           = new(0.62f, 0.62f, 0.62f);   // dim gray — stair that doesn't touch the active floor
+    static readonly Color CStairActiveUp   = new(0.30f, 0.90f, 1.00f);   // cyan — stair connecting active floor UP to the floor above (either endpoint)
+    static readonly Color CStairActiveDown = new(0.55f, 0.30f, 0.92f);   // purple — stair connecting active floor DOWN to the floor below (either endpoint)
+    static readonly Color CActive          = new(0.30f, 0.68f, 1.00f);   // mid-blue — any non-Start/Exit/stair piece on the floor you're on
+    static readonly Color CSel     = new(1.00f, 0.80f, 0.15f);
+    static readonly Color CText    = new(0.85f, 0.85f, 0.85f);
+    static readonly Color CDim     = new(0.48f, 0.48f, 0.48f);
+    static readonly Color CPan     = new(0f, 0f, 0f);   // bottom palette bar — pure black to match the rest of the editor backdrop
+
+    // ── Editor state ───────────────────────────────────────────────────────────
+    int        _slot     = 0;
+    int        _floor    = 0;
+    PieceType? _selType  = null;
+    PieceCategory _selCat = PieceCategory.Structure;
+
+    // ── Room paint gesture ────────────────────────────────────────────────────
+    // Painting a room takes two clicks: the first anchors one corner, the second
+    // fills the rectangle between them with Room tiles. _roomAnchor is null when
+    // no corner has been set yet.
+    (int cx, int cy)? _roomAnchor = null;
+
+    // ── Teleport pairing ────────────────────────────────────────────────────
+    // Placing a Teleport Pad alternates: the first placement opens a new pair and
+    // stays unlinked; the second closes it and both ends get the same LinkId.
+    int        _pendingLinkId = 0;
+    int        _nextLinkId    = 1;
+    int        _rotation = 0;
+    // internal (not private): test/TestRoomPitLogic.cs seeds this directly to exercise
+    // IsValidPlacement / TryGetPlacedPieceOnFloor headlessly, without a running scene tree.
+    internal MazeData _maze = new() { Name = "New Maze", Pieces = new() };
+
+    // Camera / orbit
+    float   _camYaw   = -0.55f;   // ≈NW start
+    float   _camPitch = 0.60f;
+    float   _camDist  = 145f;
+    bool    _rmb      = false;
+    bool    _rmbDrag  = false;
+    Vector2 _rmbStart = Vector2.Zero;
+
+    // Middle-mouse-drag pan. Offsets the orbit camera's target from GridCentre so the
+    // user can re-center the view on any cell instead of being locked to the maze's
+    // dead center. Reset with Home.
+    bool    _mmb      = false;
+    Vector3 _camPan   = Vector3.Zero;
+
+    // Pick-up / move state
+    bool      _holding    = false;
+    PieceType _heldType   = default;
+    int       _heldRot    = 0;
+    int       _heldOX     = -1;
+    int       _heldOY     = -1;
+    int       _heldOFloor = 0;
+    Node3D?   _heldGeo    = null;
+    // Carries a picked-up Teleport Pad's pairing across the move: PickUpPiece deletes
+    // the original MazePiece record (its LinkId with it), and DropPiece/CancelHolding
+    // build a brand-new MazePiece — without this, relocating (or even just picking up
+    // and Esc-cancelling) either half of a linked pair would silently reset it to 0 and
+    // orphan its partner. 0 for anything that isn't a Teleport Pad.
+    int       _heldLinkId = 0;
+
+    // Palette preview ghost (shown when a palette type is selected and mouse is over grid)
+    Node3D?   _previewGeo = null;
+
+    // Hover highlight
+    int       _hoverCx = -1;
+    int       _hoverCy = -1;
+    readonly List<MeshInstance3D> _hoverBorder = new();
+
+    // Pulsing red error indicator on the conflicting piece (opening-mismatch validations)
+    MeshInstance3D?     _errorPulse;
+    StandardMaterial3D? _errorPulseMat;
+    float               _errorPulseTimer = 0f;
+    float               _errorPulsePhase = 0f;
+    int                 _errorPulseFloor = 0;
+    int                 _errorPulseCx    = -1;
+    int                 _errorPulseCy    = -1;
+
+    // ── Nodes ──────────────────────────────────────────────────────────────────
+    FontFile?            _font;
+    SubViewport          _mainVp = null!;
+    Camera3D             _cam    = null!;
+    Node3D               _world  = null!;
+    SubViewportContainer _vpCont = null!;
+
+    // Geometry keyed by cell
+    record struct CK(int X, int Y, int F);
+    readonly Dictionary<CK, Node3D>        _cellGeo     = new();
+    readonly Dictionary<int, MeshInstance3D> _gridMi    = new();
+    readonly List<MeshInstance3D>            _edgeWalls  = new();
+    readonly List<MeshInstance3D>            _borderHints = new();
+
+    // Active-floor reference plane + corner label. A translucent blue slab at the
+    // active floor's Y so the eye locks onto the layer you're editing even when
+    // there's lots of vertical context. Repositioned on every floor change.
+    MeshInstance3D? _activeFloorPlane;
+    Label3D?        _activeFloorLabel;
+
+    // Palette
+    readonly Dictionary<PieceType, Panel>       _palPan  = new();
+    readonly Dictionary<PieceType, SubViewport> _thumbVp = new();
+    readonly Dictionary<PieceCategory, Button> _catBtn = new();
+
+    // UI refs
+    Label    _floorLbl  = null!;
+    Label    _statusLbl = null!;
+    LineEdit _nameEdit  = null!;
+    Button[] _slotBtns  = new Button[MaxSlots];
+
+    // Audio
+    AudioStreamPlayer? _clickSfx;
+
+    // ── _Ready ─────────────────────────────────────────────────────────────────
+    public override void _Ready()
+    {
+        _font = GD.Load<FontFile>("res://assets/fonts/Agmena Pro Book.ttf");
+
+        // Reuse the menu click sound for piece pick-up / place / drop feedback
+        _clickSfx = new AudioStreamPlayer();
+        var clickStream = GD.Load<AudioStream>("res://assets/audio/ui/MenuButtonClick.wav");
+        if (clickStream != null) _clickSfx.Stream = clickStream;
+        AddChild(_clickSfx);
+
+        BuildUI();
+        SetupMainVp();
+        SetupBackgroundSmoke();
+        SetupThumbs();
+        BuildFloorGrids();
+        BuildActiveFloorAnchor();
+        // Restore the slot the user was last editing / playtesting so coming back
+        // from "Test Maze" doesn't kick them off whatever they were working on.
+        int startSlot = Mathf.Clamp(GameState.ActiveSlot, 0, MaxSlots - 1);
+        LoadSlot(startSlot);
+    }
+
+    // ── _Process ───────────────────────────────────────────────────────────────
+    public override void _Process(double _dt)
+    {
+        UpdateCamera();
+        UpdateErrorPulse((float)_dt);
+    }
+
+    // ── Keyboard shortcuts ─────────────────────────────────────────────────────
+    public override void _Input(InputEvent ev)
+    {
+        if (ev is not InputEventKey k || !k.Pressed) return;
+        // Don't fire editor shortcuts while the user is typing in a text field
+        if (GetViewport().GuiGetFocusOwner() is LineEdit) return;
+
+        switch (k.Keycode)
+        {
+            case Key.R: RotateOnce(); break;
+            case Key.W:
+                FloorUp();
+                GetViewport().SetInputAsHandled();
+                break;
+            case Key.S:
+                FloorDown();
+                GetViewport().SetInputAsHandled();
+                break;
+            case Key.Space:
+                _camPan = Vector3.Zero;        // recenter the camera on the grid
+                GetViewport().SetInputAsHandled();
+                break;
+            // D and Escape were here — removed. Right-click now handles both
+            // "cancel a palette selection" and "delete a held piece" so there's a
+            // single gesture for cancellation. Escape falls through to PauseMenu
+            // (the autoload owns it across all editor/gameplay scenes).
+        }
+    }
+
+    // ── UI construction ────────────────────────────────────────────────────────
+    void BuildUI()
+    {
+        var bg = new ColorRect { Color = Colors.Black };
+        bg.SetAnchorsPreset(LayoutPreset.FullRect);
+        AddChild(bg);
+
+        // ── Floating left-side column (no panel background) ─────────────────────
+        // The maze editor's side controls used to live in a dark panel; now every
+        // button is a translucent borderless overlay, matching the floor up/down
+        // buttons on the right. Save and "Exit to main" are pulled out into the
+        // bottom corners (built further down).
+        var lv = new VBoxContainer();
+        lv.AnchorLeft   = 0f; lv.AnchorRight  = 0f;
+        lv.AnchorTop    = 0f; lv.AnchorBottom = 1f;
+        lv.OffsetLeft   = 18;
+        lv.OffsetRight  = 18 + PanW - 36;
+        lv.OffsetTop    = 94;   // leave room for the larger top-left ← BACK button (height 56 + padding)
+        lv.OffsetBottom = -100; // leave room for the bottom-left Save button
+        lv.AddThemeConstantOverride("separation", 10);
+        AddChild(lv);
+
+        // (Standalone "MAZE EDITOR" title removed — the enlarged top-left "← BACK"
+        // button now visually anchors this region without a separate label.)
+
+        // NAME label and the maze-name input share a single row.
+        var nameRow = new HBoxContainer();
+        nameRow.AddThemeConstantOverride("separation", 10);
+        lv.AddChild(nameRow);
+
+        var nameHeader = Lbl("NAME:", 14, CDim);
+        nameHeader.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 0.95f));
+        nameHeader.AddThemeConstantOverride("outline_size", 4);
+        nameHeader.SizeFlagsVertical = SizeFlags.ShrinkCenter;
+        nameRow.AddChild(nameHeader);
+
+        _nameEdit = new LineEdit { PlaceholderText = "Maze name…", CustomMinimumSize = new Vector2(0, 40) };
+        if (_font != null) _nameEdit.AddThemeFontOverride("font", _font);
+        _nameEdit.AddThemeFontSizeOverride("font_size", 16);
+        _nameEdit.AddThemeStyleboxOverride("normal",
+            Flat(new Color(0.04f, 0.04f, 0.04f, 0.55f)));
+        _nameEdit.AddThemeStyleboxOverride("focus",
+            Flat(new Color(0.10f, 0.10f, 0.10f, 0.75f)));
+        _nameEdit.SizeFlagsHorizontal = SizeFlags.ExpandFill;
+        _nameEdit.TextChanged += t => { _maze.Name = t; RefreshSlotButtons(); };
+        nameRow.AddChild(_nameEdit);
+
+        var slotsHeader = Lbl("SAVE SLOTS", 14, CDim);
+        slotsHeader.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 0.95f));
+        slotsHeader.AddThemeConstantOverride("outline_size", 4);
+        lv.AddChild(slotsHeader);
+
+        for (int i = 0; i < MaxSlots; i++)
+        {
+            int idx = i;
+            _slotBtns[i] = MakeFloatBtn($"  {i + 1}", 16, () => { SaveCurrentSlot(); LoadSlot(idx); },
+                                        new Vector2(0, 44));
+            _slotBtns[i].SizeFlagsHorizontal = SizeFlags.ExpandFill;
+            lv.AddChild(_slotBtns[i]);
+        }
+
+        var clearBtn = MakeFloatBtn("CLEAR MAP", 16, ConfirmClearMap, new Vector2(0, 48));
+        clearBtn.SizeFlagsHorizontal = SizeFlags.ExpandFill;
+        lv.AddChild(clearBtn);
+
+        // PLAY TEST button moved to a floating slot in the top-right corner — see below.
+
+        // ── Bottom-left: Save ──────────────────────────────────────────────────
+        var saveBtn = MakeFloatBtn("SAVE", 20, SaveCurrentSlot, new Vector2(160, 56));
+        saveBtn.AnchorLeft     = 0f; saveBtn.AnchorRight  = 0f;
+        saveBtn.AnchorTop      = 1f; saveBtn.AnchorBottom = 1f;
+        saveBtn.GrowHorizontal = GrowDirection.End;
+        saveBtn.GrowVertical   = GrowDirection.Begin;
+        saveBtn.OffsetLeft     = 24;
+        saveBtn.OffsetRight    = 24 + 160;
+        saveBtn.OffsetTop      = -(56 + 24);
+        saveBtn.OffsetBottom   = -24;
+        AddChild(saveBtn);
+
+        // ── Bottom-right: PLAY TEST ────────────────────────────────────────────
+        // (← BACK in the top-left still routes to the main menu, so the previous
+        // bottom-right "EXIT TO MAIN" button is gone — this corner is the play-test action now.)
+        var playTestBtnBR = MakeFloatBtn("TEST MAZE", 20, OnEnterDungeon, new Vector2(200, 68));
+        playTestBtnBR.AnchorLeft     = 1f; playTestBtnBR.AnchorRight  = 1f;
+        playTestBtnBR.AnchorTop      = 1f; playTestBtnBR.AnchorBottom = 1f;
+        playTestBtnBR.GrowHorizontal = GrowDirection.Begin;
+        playTestBtnBR.GrowVertical   = GrowDirection.Begin;
+        playTestBtnBR.OffsetLeft     = -(200 + 24);
+        playTestBtnBR.OffsetRight    = -24;
+        playTestBtnBR.OffsetTop      = -(68 + 24);
+        playTestBtnBR.OffsetBottom   = -24;
+        playTestBtnBR.AddThemeColorOverride("font_color", new Color(0.85f, 1f, 0.7f));
+        AddChild(playTestBtnBR);
+
+        // ── Top-left: ← BACK shortcut to main menu (mirrors EXIT TO MAIN but matches
+        // the conventional location of a back affordance). Enlarged so it doubles as
+        // the visual anchor for the editor — no separate title label needed.
+        const int BackBtnW = 170;
+        const int BackBtnH = 56;
+        var topBack = MakeFloatBtn("← BACK", 22,
+            () => { SaveCurrentSlot(); GetTree().ChangeSceneToFile("res://scenes/TitleScreen.tscn"); },
+            new Vector2(BackBtnW, BackBtnH));
+        topBack.AnchorLeft     = 0f; topBack.AnchorRight  = 0f;
+        topBack.AnchorTop      = 0f; topBack.AnchorBottom = 0f;
+        topBack.OffsetLeft     = 18;
+        topBack.OffsetRight    = 18 + BackBtnW;
+        topBack.OffsetTop      = 18;
+        topBack.OffsetBottom   = 18 + BackBtnH;
+        AddChild(topBack);
+
+        // ── Centre viewport container ───────────────────────────────────────────
+        _vpCont = new SubViewportContainer { Stretch = true };
+        _vpCont.SetAnchorsPreset(LayoutPreset.FullRect);
+        _vpCont.OffsetLeft   =  PanW;
+        _vpCont.OffsetRight  =  0;
+        _vpCont.OffsetBottom = -PalBarH;
+        _vpCont.GuiInput += HandleVpInput;
+        AddChild(_vpCont);
+
+        // ── Bottom piece palette bar ────────────────────────────────────────────
+        var bot = new Panel();
+        bot.AnchorLeft   = 0f; bot.AnchorRight  = 1f;
+        bot.AnchorTop    = 1f; bot.AnchorBottom = 1f;
+        bot.GrowVertical = GrowDirection.Begin;
+        bot.OffsetLeft   = PanW;
+        bot.OffsetRight  = -(200 + 48);   // shift palette pieces left to clear room for TEST MAZE in the bottom-right corner
+        bot.OffsetTop    = -PalBarH;
+        bot.OffsetBottom = 0f;
+        bot.AddThemeStyleboxOverride("panel", Flat(CPan));
+        AddChild(bot);
+
+        // Category tab row sits above the piece row inside the same panel.
+        var col = new VBoxContainer();
+        col.SetAnchorsPreset(LayoutPreset.FullRect);
+        col.AddThemeConstantOverride("separation", 0);
+        bot.AddChild(col);
+
+        var tabs = new HBoxContainer();
+        tabs.CustomMinimumSize = new Vector2(0, CatTabH);
+        tabs.AddThemeConstantOverride("separation", 6);
+        tabs.Alignment = BoxContainer.AlignmentMode.Center;
+        col.AddChild(tabs);
+
+        foreach (var cat in PieceDB.CategoryOrder)
+        {
+            var localCat = cat;   // capture per-iteration for the lambda
+            var tb = new Button
+            {
+                Text                = PieceDB.CategoryLabels[cat],
+                CustomMinimumSize   = new Vector2(132, CatTabH - 6),
+                FocusMode           = Control.FocusModeEnum.None,
+            };
+            if (_font != null) tb.AddThemeFontOverride("font", _font);
+            tb.AddThemeFontSizeOverride("font_size", 13);
+            tb.Pressed += () => SelectCategory(localCat);
+            tabs.AddChild(tb);
+            _catBtn[cat] = tb;
+        }
+
+        var hbox = new HBoxContainer();
+        hbox.SizeFlagsVertical = SizeFlags.ExpandFill;
+        hbox.AddThemeConstantOverride("separation", 10);
+        hbox.Alignment = BoxContainer.AlignmentMode.Center;
+        col.AddChild(hbox);
+
+        // Every cell is built once — thumbnail SubViewports are expensive and must
+        // never be rebuilt on a tab switch. SelectCategory only toggles Visible.
+        foreach (var pt in Palette)
+            hbox.AddChild(BuildPaletteCell(pt));
+
+        // Apply the initial tab (Structure) now — without this, every cell's default
+        // Panel.Visible stays true and all categories would appear stacked together
+        // until the first click.
+        RefreshPalette();
+
+        // ── Floating "click a palette piece" prompt above the palette bar ─────
+        // Only the palette callout lives down here — every other shortcut is in the
+        // top-right keybind legend, since this hint physically points to the bar.
+        var hintLbl = new Label
+        {
+            Text                = "Click a palette piece below to select",
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        if (_font != null) hintLbl.AddThemeFontOverride("font", _font);
+        hintLbl.AddThemeFontSizeOverride("font_size", 14);
+        hintLbl.AddThemeColorOverride("font_color",         new Color(0.62f, 0.62f, 0.62f));
+        hintLbl.AddThemeColorOverride("font_outline_color", new Color(0f, 0f, 0f, 0.95f));
+        hintLbl.AddThemeConstantOverride("outline_size", 4);
+        hintLbl.AnchorLeft     = 0f; hintLbl.AnchorRight  = 1f;
+        hintLbl.AnchorTop      = 1f; hintLbl.AnchorBottom = 1f;
+        hintLbl.GrowVertical   = GrowDirection.Begin;
+        hintLbl.OffsetLeft     = PanW + 20;
+        hintLbl.OffsetRight    = -20;
+        hintLbl.OffsetTop      = -(PalBarH + 28);
+        hintLbl.OffsetBottom   = -(PalBarH + 4);
+        hintLbl.MouseFilter    = MouseFilterEnum.Ignore;
+        AddChild(hintLbl);
+
+        // ── Floating status banner at the top of the viewport ────────────────
+        _statusLbl = new Label
+        {
+            Text                = "",
+            HorizontalAlignment = HorizontalAlignment.Center,
+            AutowrapMode        = TextServer.AutowrapMode.Word,
+        };
+        if (_font != null) _statusLbl.AddThemeFontOverride("font", _font);
+        _statusLbl.AddThemeFontSizeOverride("font_size", 26);
+        _statusLbl.AddThemeColorOverride("font_color",         Colors.White);
+        _statusLbl.AddThemeColorOverride("font_outline_color", new Color(0f, 0f, 0f, 0.95f));
+        _statusLbl.AddThemeConstantOverride("outline_size", 6);
+        _statusLbl.AnchorLeft   = 0f; _statusLbl.AnchorRight  = 1f;
+        _statusLbl.AnchorTop    = 0f; _statusLbl.AnchorBottom = 0f;
+        _statusLbl.OffsetLeft   = PanW + 20;
+        _statusLbl.OffsetRight  = -20;
+        _statusLbl.OffsetTop    = 24;
+        _statusLbl.OffsetBottom = 96;
+        _statusLbl.MouseFilter  = MouseFilterEnum.Ignore;
+        AddChild(_statusLbl);
+
+        // ── Top-right keybind legend ─────────────────────────────────────────
+        // Single home for every editor control (mouse + keyboard). The bottom strip
+        // only carries the "click palette piece" prompt now.
+        var keyLegend = new VBoxContainer();
+        keyLegend.AnchorLeft     = 1f; keyLegend.AnchorRight  = 1f;
+        keyLegend.AnchorTop      = 0f; keyLegend.AnchorBottom = 0f;
+        keyLegend.GrowHorizontal = GrowDirection.Begin;
+        keyLegend.OffsetLeft     = -230;
+        keyLegend.OffsetRight    = -20;
+        keyLegend.OffsetTop      = 18;
+        keyLegend.AddThemeConstantOverride("separation", 4);
+        keyLegend.MouseFilter    = MouseFilterEnum.Ignore;
+        AddChild(keyLegend);
+
+        var legendBg = new Panel();
+        legendBg.AnchorLeft = 0f; legendBg.AnchorRight = 1f;
+        legendBg.AnchorTop  = 0f; legendBg.AnchorBottom = 0f;
+        legendBg.OffsetTop = -8; legendBg.OffsetBottom = 4;
+        legendBg.OffsetLeft = -8; legendBg.OffsetRight = 8;
+        legendBg.AddThemeStyleboxOverride("panel",
+            Flat(new Color(0.05f, 0.05f, 0.05f, 0.65f), new Color(0.7f, 0.7f, 0.7f, 0.4f)));
+        legendBg.MouseFilter = MouseFilterEnum.Ignore;
+        keyLegend.AddChild(legendBg);
+
+        void AddRow(string key, string action)
+        {
+            var row = new HBoxContainer();
+            row.AddThemeConstantOverride("separation", 10);
+            row.MouseFilter = MouseFilterEnum.Ignore;
+            keyLegend.AddChild(row);
+
+            var keyLbl = new Label
+            {
+                Text                = $"[{key}]",
+                CustomMinimumSize   = new Vector2(96, 0),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            };
+            if (_font != null) keyLbl.AddThemeFontOverride("font", _font);
+            keyLbl.AddThemeFontSizeOverride("font_size", 14);
+            keyLbl.AddThemeColorOverride("font_color", new Color(1f, 0.92f, 0.55f));
+            row.AddChild(keyLbl);
+
+            var actLbl = new Label { Text = action };
+            if (_font != null) actLbl.AddThemeFontOverride("font", _font);
+            actLbl.AddThemeFontSizeOverride("font_size", 14);
+            actLbl.AddThemeColorOverride("font_color", new Color(0.85f, 0.85f, 0.85f));
+            row.AddChild(actLbl);
+        }
+        AddRow("L-Click", "pick up / place");
+        AddRow("R-Click", "drop / delete");
+        AddRow("R",       "rotate");
+        AddRow("W",       "floor up");
+        AddRow("S",       "floor down");
+        AddRow("R-Drag",  "orbit camera");
+        AddRow("M-Drag",  "pan camera");
+        AddRow("Wheel",   "zoom");
+        AddRow("Space",   "recenter view");
+
+        // ── Floating floor up/down controls on the right edge of the viewport ──
+        const int FloorBtnSz  = 72;
+        const int FloorBtnPad = 24;
+        const int FloorLblH   = 30;
+
+        var floorCol = new VBoxContainer();
+        floorCol.AnchorLeft     = 1f; floorCol.AnchorRight  = 1f;
+        floorCol.AnchorTop      = 0.5f; floorCol.AnchorBottom = 0.5f;
+        floorCol.GrowHorizontal = GrowDirection.Begin;
+        floorCol.GrowVertical   = GrowDirection.Both;
+        floorCol.OffsetLeft     = -(FloorBtnSz + FloorBtnPad);
+        floorCol.OffsetRight    = -FloorBtnPad;
+        float halfH = (FloorBtnSz + FloorLblH + FloorBtnSz + 16) * 0.5f;
+        floorCol.OffsetTop      = -halfH;
+        floorCol.OffsetBottom   =  halfH;
+        floorCol.AddThemeConstantOverride("separation", 8);
+        floorCol.MouseFilter    = MouseFilterEnum.Ignore;   // pass through gaps; children grab clicks
+        AddChild(floorCol);
+
+        // Up/down arrow buttons show their keyboard shortcut letters (W / S) at the
+        // "end" of each arrow so the binding is discoverable.
+        var fUpBig = MakeFloorBtn("▲\nW", FloorBtnSz, FloorUp);
+        floorCol.AddChild(fUpBig);
+
+        _floorLbl = Lbl($"Floor {_floor}", 20, Colors.White, HorizontalAlignment.Center);
+        _floorLbl.CustomMinimumSize = new Vector2(FloorBtnSz, FloorLblH);
+        _floorLbl.AddThemeColorOverride("font_outline_color", new Color(0, 0, 0, 0.9f));
+        _floorLbl.AddThemeConstantOverride("outline_size", 4);
+        floorCol.AddChild(_floorLbl);
+
+        var fDnBig = MakeFloorBtn("S\n▼", FloorBtnSz, FloorDown);
+        floorCol.AddChild(fDnBig);
+
+        RefreshSlotButtons();
+    }
+
+    // Rectangular floating-style button used for the side controls. Translucent dark
+    // background, no border, gold hover/pressed accents — matches the floor arrow
+    // buttons visually but lets the caller pick the size.
+    Button MakeFloatBtn(string text, int fontSize, Action pressed, Vector2 minSize)
+    {
+        var b = new Button
+        {
+            Text              = text,
+            CustomMinimumSize = minSize,
+            Alignment         = HorizontalAlignment.Center,
+        };
+        if (_font != null) b.AddThemeFontOverride("font", _font);
+        b.AddThemeFontSizeOverride("font_size", fontSize);
+        b.AddThemeColorOverride("font_color",         Colors.White);
+        b.AddThemeColorOverride("font_hover_color",   new Color(1f, 0.92f, 0.55f));
+        b.AddThemeColorOverride("font_pressed_color", new Color(0.85f, 0.75f, 0.2f));
+        b.AddThemeColorOverride("font_focus_color",   Colors.White);
+
+        var bg      = Flat(new Color(0.04f, 0.04f, 0.04f, 0.55f));
+        var bgHover = Flat(new Color(0.12f, 0.12f, 0.12f, 0.78f));
+        var bgPress = Flat(new Color(0.20f, 0.16f, 0.04f, 0.85f));
+        b.AddThemeStyleboxOverride("normal",  bg);
+        b.AddThemeStyleboxOverride("hover",   bgHover);
+        b.AddThemeStyleboxOverride("pressed", bgPress);
+        b.AddThemeStyleboxOverride("focus",   bg);
+        b.AddThemeStyleboxOverride("disabled", bg);
+        b.Pressed += pressed;
+        return b;
+    }
+
+    // Big square floating arrow button used by the floor navigator on the right.
+    // Text supports a second line (e.g. the W/S keybind below the arrow glyph).
+    Button MakeFloorBtn(string glyph, int sz, Action pressed)
+    {
+        var b = new Button
+        {
+            Text              = glyph,
+            CustomMinimumSize = new Vector2(sz, sz),
+            Alignment         = HorizontalAlignment.Center,
+            AutowrapMode      = TextServer.AutowrapMode.Off,
+            ClipText          = false,
+        };
+        if (_font != null) b.AddThemeFontOverride("font", _font);
+        b.AddThemeFontSizeOverride("font_size", 24);
+        b.AddThemeColorOverride("font_color",         Colors.White);
+        b.AddThemeColorOverride("font_hover_color",   new Color(1f, 0.92f, 0.55f));
+        b.AddThemeColorOverride("font_pressed_color", new Color(0.85f, 0.75f, 0.2f));
+
+        var bg      = Flat(new Color(0.04f, 0.04f, 0.04f, 0.65f), new Color(0.85f, 0.85f, 0.85f, 0.6f));
+        var bgHover = Flat(new Color(0.10f, 0.10f, 0.10f, 0.80f), new Color(1f,    0.92f, 0.55f, 0.9f));
+        var bgPress = Flat(new Color(0.18f, 0.15f, 0.04f, 0.85f), new Color(1f,    0.92f, 0.55f, 1f));
+        b.AddThemeStyleboxOverride("normal",  bg);
+        b.AddThemeStyleboxOverride("hover",   bgHover);
+        b.AddThemeStyleboxOverride("pressed", bgPress);
+        b.AddThemeStyleboxOverride("focus",   bg);
+        b.Pressed += pressed;
+        return b;
+    }
+
+    Control BuildPaletteCell(PieceType pt)
+    {
+        // Transparent panel — selection is shown by tinting the background only
+        var outer = new Panel();
+        outer.CustomMinimumSize = new Vector2(ThSz + 8, ThSz + 20);
+        outer.AddThemeStyleboxOverride("panel", Flat(new Color(0, 0, 0, 0)));
+        _palPan[pt] = outer;
+
+        var vb = new VBoxContainer();
+        vb.SetAnchorsPreset(LayoutPreset.FullRect);
+        vb.AddThemeConstantOverride("separation", 3);
+        outer.AddChild(vb);
+
+        var tr = new TextureRect
+        {
+            Name             = "Thumb",
+            CustomMinimumSize = new Vector2(ThSz, ThSz),
+            ExpandMode       = TextureRect.ExpandModeEnum.IgnoreSize,
+            StretchMode      = TextureRect.StretchModeEnum.KeepAspectCentered,
+            SizeFlagsHorizontal = SizeFlags.ShrinkCenter,
+        };
+        vb.AddChild(tr);
+
+        var lbl = Lbl(PieceDB.ShortLabels.TryGetValue(pt, out var sl) ? sl : pt.ToString(),
+                      9, CDim, HorizontalAlignment.Center);
+        lbl.SizeFlagsHorizontal = SizeFlags.ExpandFill;
+        vb.AddChild(lbl);
+
+        outer.GuiInput += ev =>
+        {
+            if (ev is InputEventMouseButton mb && mb.ButtonIndex == MouseButton.Left && mb.Pressed)
+                SelectType(pt);
+        };
+        return outer;
+    }
+
+    // ── Main SubViewport ───────────────────────────────────────────────────────
+    void SetupMainVp()
+    {
+        _mainVp = new SubViewport
+        {
+            Size                   = new Vector2I(1280, 720),
+            RenderTargetClearMode  = SubViewport.ClearMode.Always,
+            RenderTargetUpdateMode = SubViewport.UpdateMode.Always,
+            HandleInputLocally     = false,
+            OwnWorld3D             = true,   // isolate from thumbnail worlds
+        };
+        _vpCont.AddChild(_mainVp);
+
+        _world = new Node3D { Name = "World" };
+        _mainVp.AddChild(_world);
+
+        _cam = new Camera3D { Fov = 48f, Current = true };
+        _mainVp.AddChild(_cam);
+
+        var wenv = new WorldEnvironment();
+        var env  = new Godot.Environment
+        {
+            BackgroundMode     = Godot.Environment.BGMode.Color,
+            BackgroundColor    = Colors.Black,
+            AmbientLightSource = Godot.Environment.AmbientSource.Color,
+            AmbientLightColor  = new Color(0.28f, 0.28f, 0.28f),
+            AmbientLightEnergy = 0.65f,
+        };
+        wenv.Environment = env;
+        _mainVp.AddChild(wenv);
+
+        var dlight = new DirectionalLight3D
+        {
+            Rotation     = new Vector3(-0.75f, 0.55f, 0f),
+            LightEnergy  = 0.85f,
+            LightColor   = new Color(0.95f, 0.95f, 1f),
+        };
+        _mainVp.AddChild(dlight);
+
+        UpdateCamera();
+    }
+
+    // ── Background smoke ambiance ─────────────────────────────────────────────
+    // Slow-drifting translucent wisps below the grid that read as light fog.
+    // Uses CPUParticles3D + a procedural soft-circle texture so it works on the
+    // GL Compatibility renderer (no GPU particle requirement, no asset import).
+    void SetupBackgroundSmoke()
+    {
+        var smoke = new CpuParticles3D
+        {
+            Name                = "BgSmoke",
+            Amount              = 80,
+            Lifetime            = 14.0,
+            Preprocess          = 14.0,
+            OneShot             = false,
+            EmissionShape       = CpuParticles3D.EmissionShapeEnum.Box,
+            EmissionBoxExtents  = new Vector3(70f, 6f, 70f),
+            Direction           = new Vector3(0.3f, 1f, 0.2f),
+            Spread              = 35f,
+            InitialVelocityMin  = 0.5f,
+            InitialVelocityMax  = 1.4f,
+            Gravity             = new Vector3(0f, 0.4f, 0f),
+            ScaleAmountMin      = 7f,
+            ScaleAmountMax      = 13f,
+            Color               = new Color(0.55f, 0.62f, 0.78f, 1f),
+            Position            = new Vector3(GridCentre.X, -16f, GridCentre.Z),
+        };
+        // Alpha fade in/out via ColorRamp (AlphaCurve property only exists in Godot 4.5+).
+        var ramp = new Gradient();
+        ramp.SetColor(0, new Color(1, 1, 1, 0f));
+        ramp.SetColor(1, new Color(1, 1, 1, 0f));
+        ramp.AddPoint(0.25f, new Color(1, 1, 1, 1f));
+        ramp.AddPoint(0.75f, new Color(1, 1, 1, 1f));
+        smoke.ColorRamp = ramp;
+
+        var quadMat = new StandardMaterial3D
+        {
+            AlbedoTexture          = MakeSoftParticleTexture(64),
+            AlbedoColor            = new Color(0.55f, 0.62f, 0.78f, 0.12f),
+            Transparency           = BaseMaterial3D.TransparencyEnum.Alpha,
+            BillboardMode          = BaseMaterial3D.BillboardModeEnum.Enabled,
+            ShadingMode            = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            VertexColorUseAsAlbedo = true,
+            DisableReceiveShadows  = true,
+            BlendMode              = BaseMaterial3D.BlendModeEnum.Add,
+        };
+        var quad = new QuadMesh { Size = new Vector2(1f, 1f), Material = quadMat };
+        smoke.Mesh = quad;
+
+        _mainVp.AddChild(smoke);
+    }
+
+    // Builds a small soft-edged radial-alpha texture for smoke particles.
+    static ImageTexture MakeSoftParticleTexture(int size)
+    {
+        var img      = Image.CreateEmpty(size, size, false, Image.Format.Rgba8);
+        float center = (size - 1) * 0.5f;
+        float maxD   = center;
+        for (int y = 0; y < size; y++)
+        for (int x = 0; x < size; x++)
+        {
+            float dx = x - center, dy = y - center;
+            float d  = Mathf.Sqrt(dx * dx + dy * dy) / maxD;
+            float a  = Mathf.Clamp(1f - d, 0f, 1f);
+            a = a * a * a;  // smooth-step the falloff for a soft cloud edge
+            img.SetPixel(x, y, new Color(1f, 1f, 1f, a));
+        }
+        return ImageTexture.CreateFromImage(img);
+    }
+
+    // ── Thumbnail SubViewports ─────────────────────────────────────────────────
+    void SetupThumbs()
+    {
+        // Standalone SubViewports (no SubViewportContainer needed) with unique names
+        // so each GetTexture() returns a distinct ViewportTexture path.
+        // Invisible-parent wrappers break SubViewport layout; plain Node avoids that.
+        var holder = new Node { Name = "ThumbHolder" };
+        AddChild(holder);
+
+        foreach (var pt in Palette)
+        {
+            var svp = new SubViewport
+            {
+                Name                   = $"Vp_{pt}",
+                Size                   = new Vector2I(ThSz, ThSz),
+                RenderTargetClearMode  = SubViewport.ClearMode.Always,
+                RenderTargetUpdateMode = SubViewport.UpdateMode.Always,
+                HandleInputLocally     = false,
+                OwnWorld3D             = true,   // each thumbnail gets its own 3D world
+            };
+            holder.AddChild(svp);
+            _thumbVp[pt] = svp;
+
+            var wenv = new WorldEnvironment();
+            var env  = new Godot.Environment
+            {
+                BackgroundMode     = Godot.Environment.BGMode.Color,
+                BackgroundColor    = new Color(0.07f, 0.07f, 0.09f),
+                AmbientLightSource = Godot.Environment.AmbientSource.Color,
+                AmbientLightColor  = new Color(0.45f, 0.45f, 0.45f),
+                AmbientLightEnergy = 0.75f,
+            };
+            wenv.Environment = env;
+            svp.AddChild(wenv);
+
+            // Orthographic top-down: exactly matches what the editor looks like
+            var cam = new Camera3D
+            {
+                Projection = Camera3D.ProjectionType.Orthogonal,
+                Size       = CS * 1.35f,   // fits cell with a small margin
+                Position   = new Vector3(CS * 0.5f, 60f, CS * 0.5f),
+            };
+            svp.AddChild(cam);   // must be in tree before LookAt
+            cam.LookAt(new Vector3(CS * 0.5f, 0f, CS * 0.5f), new Vector3(0, 0, -1));
+
+            var light = new DirectionalLight3D
+            {
+                Rotation    = new Vector3(-0.85f, 0.65f, 0f),
+                LightEnergy = 1.1f,
+            };
+            svp.AddChild(light);
+
+            var root = new Node3D();
+            svp.AddChild(root);
+            BuildPieceInto(root, pt, 0, 0f, 0f, 0f, isActive: true);
+
+            WireThumbTexture(pt);
+        }
+    }
+
+    void WireThumbTexture(PieceType pt)
+    {
+        if (!_palPan.TryGetValue(pt, out var panel)) return;
+        var tr = panel.GetNodeOrNull<TextureRect>("VBoxContainer/Thumb");
+        if (tr == null)
+        {
+            // BuildPaletteCell adds a VBoxContainer as first child
+            foreach (var child in panel.GetChildren())
+            {
+                if (child is VBoxContainer vb)
+                {
+                    tr = vb.GetNodeOrNull<TextureRect>("Thumb");
+                    break;
+                }
+            }
+        }
+        if (tr != null && _thumbVp.TryGetValue(pt, out var svp))
+            tr.Texture = svp.GetTexture();
+    }
+
+    // ── Active-floor reference plane ───────────────────────────────────────────
+    // A faint blue slab + corner label sit at the active floor's Y so the eye has a
+    // clear horizontal anchor that says "you are here." Built once at startup;
+    // RefreshActiveFloorAnchor moves them whenever _floor changes.
+    void BuildActiveFloorAnchor()
+    {
+        var plane = new PlaneMesh { Size = new Vector2(GW * CS, GH * CS) };
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor  = new Color(0.25f, 0.55f, 1.0f, 0.10f),
+            Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+            ShadingMode  = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            CullMode     = BaseMaterial3D.CullModeEnum.Disabled,
+            // Keep the plane from z-fighting with piece arm-floors that sit at the same Y.
+            // RenderPriority -1 plus the small Y offset in RefreshActiveFloorAnchor pushes
+            // it below the arm geometry in the draw order.
+            RenderPriority = -1,
+        };
+        _activeFloorPlane = new MeshInstance3D { Mesh = plane, MaterialOverride = mat };
+        _world.AddChild(_activeFloorPlane);
+
+        _activeFloorLabel = new Label3D
+        {
+            Text             = $"FLOOR {_floor}",
+            FontSize         = 96,
+            PixelSize        = 0.03f,
+            Modulate         = new Color(0.55f, 0.80f, 1.0f, 0.95f),
+            OutlineSize      = 12,
+            OutlineModulate  = new Color(0f, 0f, 0f, 0.85f),
+            Billboard        = BaseMaterial3D.BillboardModeEnum.Enabled,
+            NoDepthTest      = true,
+            HorizontalAlignment = HorizontalAlignment.Center,
+        };
+        _world.AddChild(_activeFloorLabel);
+
+        RefreshActiveFloorAnchor();
+    }
+
+    void RefreshActiveFloorAnchor()
+    {
+        if (_activeFloorPlane == null || _activeFloorLabel == null) return;
+
+        float planeY = _floor * EdFH + 0.02f;             // just above the piece base
+        float labelY = _floor * EdFH + 2.5f;              // hover well above the plane
+
+        _activeFloorPlane.Position = new Vector3(GW * CS * 0.5f, planeY, GH * CS * 0.5f);
+
+        // Label sits just past the NE corner so it stays clear of the playable cells.
+        _activeFloorLabel.Position = new Vector3(GW * CS + 3f, labelY, -3f);
+        _activeFloorLabel.Text     = $"FLOOR {_floor}";
+    }
+
+    // ── Floor grids ────────────────────────────────────────────────────────────
+    void BuildFloorGrids()
+    {
+        for (int f = FlMin; f <= FlMax; f++)
+        {
+            var mi = BuildGridMesh(f, GridAlpha(f));
+            _world.AddChild(mi);
+            _gridMi[f] = mi;
+        }
+        RefreshGridOpacity();   // apply the blue active-floor tint at startup
+    }
+
+    MeshInstance3D BuildGridMesh(int floor, float alpha)
+    {
+        float y    = floor * EdFH + FlrT + 0.05f;
+        float barW = 0.40f;   // visible at 145 m camera distance
+        float barH = 0.12f;
+
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor  = new Color(0.55f, 0.55f, 0.55f, alpha),
+            Transparency = alpha < 0.999f
+                ? BaseMaterial3D.TransparencyEnum.Alpha
+                : BaseMaterial3D.TransparencyEnum.Disabled,
+            ShadingMode  = BaseMaterial3D.ShadingModeEnum.Unshaded,
+        };
+
+        var st = new SurfaceTool();
+        st.Begin(Mesh.PrimitiveType.Triangles);
+
+        void AddBar(Vector3 centre, Vector3 size)
+        {
+            float hx = size.X * 0.5f, hy = size.Y * 0.5f, hz = size.Z * 0.5f;
+            Vector3[] c =
+            {
+                centre + new Vector3(-hx, -hy, -hz), centre + new Vector3( hx, -hy, -hz),
+                centre + new Vector3( hx,  hy, -hz), centre + new Vector3(-hx,  hy, -hz),
+                centre + new Vector3(-hx, -hy,  hz), centre + new Vector3( hx, -hy,  hz),
+                centre + new Vector3( hx,  hy,  hz), centre + new Vector3(-hx,  hy,  hz),
+            };
+            void Tri(int a, int b, int d) { st.AddVertex(c[a]); st.AddVertex(c[b]); st.AddVertex(c[d]); }
+            Tri(0,2,1); Tri(0,3,2);  // -Z
+            Tri(4,5,6); Tri(4,6,7);  // +Z
+            Tri(0,4,7); Tri(0,7,3);  // -X
+            Tri(1,2,6); Tri(1,6,5);  // +X
+            Tri(3,7,6); Tri(3,6,2);  // +Y
+            Tri(0,1,5); Tri(0,5,4);  // -Y
+        }
+
+        for (int i = 0; i <= GW; i++)
+        {
+            float x = i * CS, lenZ = GH * CS;
+            AddBar(new Vector3(x, y, lenZ * 0.5f), new Vector3(barW, barH, lenZ));
+        }
+        for (int j = 0; j <= GH; j++)
+        {
+            float z = j * CS, lenX = GW * CS;
+            AddBar(new Vector3(lenX * 0.5f, y, z), new Vector3(lenX, barH, barW));
+        }
+
+        st.GenerateNormals();
+        return new MeshInstance3D { Mesh = st.Commit(), MaterialOverride = mat };
+    }
+
+    // Visibility falls off with distance from the current floor.
+    // Floors below fade gently; floors above fade aggressively so the maze you're
+    // editing always reads clearly without the ceiling grid drowning it out.
+    float GridAlpha(int f)
+    {
+        int dist = _floor - f;          // positive = below, negative = above
+        if (dist == 0) return 0.80f;
+        if (dist  > 0) return Mathf.Max(0.45f * Mathf.Pow(0.65f,  dist - 1), 0.05f);
+        return                Mathf.Max(0.18f * Mathf.Pow(0.45f, -dist - 1), 0.02f);
+    }
+
+    // Active floor gets a saturated blue tint so the workspace plane is unmistakable.
+    // Other floors keep the neutral grey so they don't compete for attention.
+    static readonly Color GridColorActive   = new(0.25f, 0.55f, 1.0f);
+    static readonly Color GridColorInactive = new(0.55f, 0.55f, 0.55f);
+
+    void RefreshGridOpacity()
+    {
+        foreach (var (f, mi) in _gridMi)
+        {
+            if (mi.MaterialOverride is not StandardMaterial3D m) continue;
+            Color c = (f == _floor) ? GridColorActive : GridColorInactive;
+            m.AlbedoColor = new Color(c.R, c.G, c.B, GridAlpha(f));
+        }
+        RefreshActiveFloorAnchor();
+    }
+
+    // ── Piece geometry ─────────────────────────────────────────────────────────
+    void RebuildGeometry()
+    {
+        foreach (var n in _cellGeo.Values) n.QueueFree();
+        _cellGeo.Clear();
+
+        // Render every placed piece on its own floor. Stairs no longer auto-spawn an
+        // inverse "landing" piece on the destination floor — the user is required to
+        // place an actual piece at the landing cell. The stair's step geometry still
+        // physically spans both floors, so the destination-floor view shows the stair
+        // structure translucent through the floor without a separate landing visual.
+        foreach (var p in _maze.Pieces)
+        {
+            var  key = new CK(p.X, p.Y, p.Floor);
+            bool act = p.Floor == _floor;
+            var  geo = new Node3D();
+            _world.AddChild(geo);
+            BuildPieceInto(geo, p.Type, p.Rotation,
+                           p.X * CS, p.Floor * EdFH, p.Y * CS, act);
+            _cellGeo[key] = geo;
+        }
+
+        // Edge walls (the translucent grey panels between cells) were removed —
+        // the pieces themselves now indicate the floor plan via their active blue tint,
+        // and the cleaner look matches a top-down floor plan instead of a wireframe.
+        ClearEdgeWalls();
+    }
+
+    void ClearEdgeWalls()
+    {
+        foreach (var mi in _edgeWalls) { if (IsInstanceValid(mi)) mi.QueueFree(); }
+        _edgeWalls.Clear();
+    }
+
+    // Stair color rule (two-mode):
+    //
+    //   • LONE stair (not part of a multi-piece chain): PERSPECTIVE-based.
+    //       cyan  = this stair goes UP off the active floor
+    //       purple = this stair goes DOWN off the active floor
+    //     So a StairsUp@floor 0 viewed from floor 1 reads as PURPLE — from the user's
+    //     POV on floor 1, the stair descends to floor 0. The piece's native type is
+    //     ignored; what matters is "is the player going up or down via this piece."
+    //
+    //   • CHAINED stair (≥2 same-type stairs linked end-to-end): TYPE-based.
+    //       StairsUp chain  → cyan   on every piece in the chain
+    //       StairsDown chain → purple on every piece in the chain
+    //     A chain is a deliberate unidirectional run — the user built it as a
+    //     staircase, so it should read as one consistent color across all its pieces,
+    //     even when you view it from the landing-floor side of one of the links.
+    //
+    //   • Stair that doesn't touch the active floor at either endpoint → dim gray.
+    Color StairColorForView(PieceType type, int rot, float wx, float wy, float wz)
+    {
+        int pieceFloor = Mathf.RoundToInt(wy / EdFH);
+        int delta      = PieceDB.StairFloorDelta(type);
+        int otherFloor = pieceFloor + delta;
+
+        // Off-floor pieces stay gray regardless of chain status.
+        if (_floor != pieceFloor && _floor != otherFloor) return CStair;
+
+        // ── Chain detection ──────────────────────────────────────────────────────
+        // We're in a chain if either (a) my cross-floor landing holds a same-type
+        // stair (downstream link), or (b) some other same-type stair's cross-floor
+        // landing lands on MY cell (upstream link). The upstream check scans because
+        // the upstream piece's rotation could differ — a fixed-offset lookup would
+        // miss it.
+        int pieceX = Mathf.RoundToInt(wx / CS);
+        int pieceY = Mathf.RoundToInt(wz / CS);
+        bool inChain = false;
+
+        Dir myCross = PieceDB.GetStairCrossDir(type, rot);
+        var (mdx, mdy) = DirToOffset(myCross);
+        if (TryGetPlacedPieceOnFloor(pieceX + mdx, pieceY + mdy, pieceFloor + delta, out var downstream) &&
+            downstream.Type == type)
+            inChain = true;
+
+        if (!inChain)
+        {
+            foreach (var s in _maze.Pieces)
+            {
+                if (s.Type != type) continue;
+                if (s.X == pieceX && s.Y == pieceY && s.Floor == pieceFloor) continue;
+                if (s.Floor + delta != pieceFloor) continue;
+                Dir sCross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+                var (sdx, sdy) = DirToOffset(sCross);
+                if (s.X + sdx == pieceX && s.Y + sdy == pieceY) { inChain = true; break; }
+            }
+        }
+
+        if (inChain)
+            return delta > 0 ? CStairActiveUp : CStairActiveDown;
+
+        // ── Lone stair: perspective-based ────────────────────────────────────────
+        // From the active floor, does the stair go up or down?
+        //   if home is the active floor and delta > 0: goes UP → cyan.
+        //   if home is the active floor and delta < 0: goes DOWN → purple.
+        //   if landing is the active floor: invert (we're looking at the OTHER end).
+        if (_floor == pieceFloor) return delta > 0 ? CStairActiveUp : CStairActiveDown;
+        return delta > 0 ? CStairActiveDown : CStairActiveUp;
+    }
+
+    /// True iff the stair piece at (wy) has at least one endpoint on the active floor —
+    /// either its home cell or its cross-floor landing. Used so the brightness matches
+    /// the highlight color: a stair that's cyan/purple because its landing is on _floor
+    /// renders at the SAME opacity as a stair whose home is _floor. Without this they'd
+    /// share the color but the cross-floor one would be a faded ghost.
+    bool StairTouchesActiveFloor(PieceType type, float wy)
+    {
+        int pieceFloor = Mathf.RoundToInt(wy / EdFH);
+        int delta      = PieceDB.StairFloorDelta(type);
+        return _floor == pieceFloor || _floor == pieceFloor + delta;
+    }
+
+    // internal (not private): the visual-capture harness (TestTrapGlyphs.cs) calls
+    // this directly so a rendered frame goes through the exact same path the
+    // palette thumbnails and grid tiles use — no separate rendering code to drift
+    // out of sync with what a maze author actually sees.
+    internal void BuildPieceInto(Node3D parent, PieceType type, int rot,
+                        float wx, float wy, float wz, bool isActive)
+    {
+        // Inactive floors keep their natural color (green Start, red Exit, orange Stair, white Floor)
+        // but render at lower alpha — easier to identify pieces on adjacent floors at a glance.
+        // Stairs flip to bright blue when they live on the floor the player is currently
+        // editing, so a busy column of orange stairs across many floors clearly highlights
+        // which one you're actively on.
+        // Start/Exit always render in their dedicated colors regardless of floor
+        // (the user explicitly wants those two to stay green/red and not turn blue).
+        // Every other piece type tints blue when it's on the floor you're editing.
+        // Stairs are colored by whether they touch the active floor — see StairColorForView
+        // for the full rule. Non-stair pieces still use the simple isActive split.
+        Color floorCol = type switch
+        {
+            PieceType.Start  => CStart,
+            PieceType.Exit   => CExit,
+            _ when PieceDB.IsStair(type) => StairColorForView(type, rot, wx, wy, wz),
+            _ => isActive ? CActive : CFloor,
+        };
+
+        // Desaturate Start/Exit toward gray on non-active floors so their bright
+        // accents stop competing with the layer you're editing. Stairs are exempt
+        // because StairColorForView already returns gray for stairs that don't
+        // touch the active floor (the cyan/purple cases stay vivid on purpose).
+        if (!isActive && !PieceDB.IsStair(type) &&
+            (type == PieceType.Start || type == PieceType.Exit))
+            floorCol = floorCol.Lerp(CFloor, 0.5f);
+
+        float cx   = wx + CS * 0.5f;
+        float cy   = wy + FlrT * 0.5f;
+        float cz   = wz + CS * 0.5f;
+
+        // Inactive floors ghost down to ~0.25–0.30 alpha — strong enough to retain
+        // depth context, faint enough that the active floor is the unambiguous focal
+        // layer. Floors above the current one fade slightly less since the camera
+        // sees them through translucent geometry stacks.
+        //
+        // EXCEPT for stair pieces whose landing touches the active floor: they're
+        // highlighted cyan/purple by StairColorForView, and we want their brightness
+        // to match the same-floor case so the chain reads as one continuous run.
+        //
+        // Computed here (ahead of the Room/Pit early-outs below) because both of
+        // those custom-rendered types need it too.
+        float flrA;
+        if (isActive || (PieceDB.IsStair(type) && StairTouchesActiveFloor(type, wy)))
+            flrA = 1f;
+        else
+        {
+            int pieceFloor = Mathf.RoundToInt(wy / EdFH);
+            flrA = pieceFloor > _floor ? 0.30f : 0.22f;
+        }
+
+        // Open Room — one flat full-cell slab. Adjacent room tiles abut exactly, so a
+        // painted room reads as a single continuous floor in the editor too.
+        if (type == PieceType.Room)
+        {
+            parent.AddChild(MakeMeshBox(
+                new Vector3(cx, cy, cz),
+                new Vector3(CS - 0.06f, FlrT, CS - 0.06f),
+                floorCol, flrA));
+            return;
+        }
+
+        // Pit — a 3x3 open frame with a hollow centre, drawn at the anchor. The frame
+        // shows the footprint it claims; the vertical bars show the shaft's span.
+        if (type == PieceType.Pit)
+        {
+            float ringY = cy;
+            // Four edge bars outlining the 3x3 footprint.
+            void Edge(Vector3 pos, Vector3 sz)
+                => parent.AddChild(MakeMeshBox(pos, sz, floorCol, flrA));
+
+            Edge(new Vector3(cx, ringY, cz - CS), new Vector3(CS * 3f, FlrT, CS));
+            Edge(new Vector3(cx, ringY, cz + CS), new Vector3(CS * 3f, FlrT, CS));
+            Edge(new Vector3(cx - CS, ringY, cz), new Vector3(CS, FlrT, CS));
+            Edge(new Vector3(cx + CS, ringY, cz), new Vector3(CS, FlrT, CS));
+
+            // Shaft bars at the four corners, spanning one floor up and one down.
+            float span = EdFH * 2f;
+            foreach (var (sx, sz2) in new[] { (-1f, -1f), (1f, -1f), (-1f, 1f), (1f, 1f) })
+                parent.AddChild(MakeMeshBox(
+                    new Vector3(cx + sx * CS * 1.5f, ringY, cz + sz2 * CS * 1.5f),
+                    new Vector3(0.7f, span, 0.7f),
+                    floorCol, flrA * 0.4f));
+            return;
+        }
+
+        // Stair pieces don't get a central floor square — the step geometry below already
+        // fills that space, so the orange flat slab was redundant.
+        if (type != PieceType.StairsUp && type != PieceType.StairsDown)
+        {
+            parent.AddChild(MakeMeshBox(
+                new Vector3(cx, cy, cz),
+                new Vector3(CentW - 0.1f, FlrT, CentW - 0.1f),
+                floorCol, flrA));
+        }
+
+        Dir open = PieceDB.GetOpenings(type, rot);
+        // For stair pieces, suppress the arm floor on the CROSS side. The cross side is
+        // where the steps reach a different floor's Y, so a floor patch at the home Y
+        // sits OVER the descending/ascending steps and visually breaks the chain — most
+        // noticeable on StairsDown chains where it appears as a lip at home-floor level
+        // blocking the view of the next stair below.
+        Dir crossDir = PieceDB.IsStair(type) ? PieceDB.GetStairCrossDir(type, rot) : Dir.None;
+
+        void ArmFloor(float ax, float az, float aw, float ad)
+            => parent.AddChild(MakeMeshBox(
+                   new Vector3(ax, cy, az),
+                   new Vector3(aw - 0.1f, FlrT, ad - 0.1f),
+                   floorCol, flrA));
+
+        if ((open & Dir.N) != 0 && crossDir != Dir.N) ArmFloor(cx,              wz + ArmLen * 0.5f,      ArmW, ArmLen);
+        if ((open & Dir.S) != 0 && crossDir != Dir.S) ArmFloor(cx,              wz + CS - ArmLen * 0.5f, ArmW, ArmLen);
+        if ((open & Dir.E) != 0 && crossDir != Dir.E) ArmFloor(wx + CS - ArmLen * 0.5f, cz,              ArmLen, ArmW);
+        if ((open & Dir.W) != 0 && crossDir != Dir.W) ArmFloor(wx + ArmLen * 0.5f,      cz,              ArmLen, ArmW);
+
+        if (TrapDB.IsTrap(type))
+            BuildTrapGlyph(parent, type, rot, cx, cy + FlrT, cz, floorCol, flrA);
+
+        if (type == PieceType.StairsUp || type == PieceType.StairsDown)
+            BuildStairGeo(parent, type, rot, wx, wy, wz, isActive);
+    }
+
+    // ── Trap glyphs ───────────────────────────────────────────────────────────
+    // A trap tile has to say what it DOES at a glance, from an isometric camera,
+    // at thumbnail size. Each glyph is a handful of small boxes: chevrons for the
+    // slide direction, a big arrow for the traps whose rotation matters, a ring for
+    // a teleport pad, hatching for greased walls.
+    // internal (not private): TestTraps.cs calls this directly to assert that the
+    // glyph geometry for directional traps (Gate/Push) actually moves under
+    // rotation, and that non-directional traps' glyphs don't — without needing
+    // eyes on a rendered frame.
+    internal void BuildTrapGlyph(Node3D parent, PieceType type, int rot,
+                        float cx, float cy, float cz, Color col, float alpha)
+    {
+        // Bright, near-opaque marks — the glyph must beat the tile tint underneath it.
+        Color mark = col.Lerp(new Color(1f, 1f, 1f), 0.55f);
+        float a    = Mathf.Min(1f, alpha + 0.25f);
+        float gy   = cy + 0.06f;
+
+        void Mk(float ox, float oz, float w, float d)
+            => parent.AddChild(MakeMeshBox(
+                   new Vector3(cx + ox, gy, cz + oz),
+                   new Vector3(w, 0.10f, d), mark, a));
+
+        // Unit vector for the piece's facing, matching TrapBuilder.FacingVector.
+        int r = ((rot % 4) + 4) % 4;
+        float fx = r == 1 ? 1f : r == 3 ? -1f : 0f;
+        float fz = r == 2 ? 1f : r == 0 ? -1f : 0f;
+
+        switch (TrapDB.Glyph(type))
+        {
+            case TrapGlyph.Chevrons:      // ice — three chevrons pointing along the corridor
+                for (int i = -1; i <= 1; i++)
+                {
+                    Mk(-1.1f, i * 2.4f, 2.2f, 0.5f);
+                    Mk( 1.1f, i * 2.4f + 0.9f, 2.2f, 0.5f);
+                }
+                break;
+
+            case TrapGlyph.Drag:          // tar — a dense field of short drag marks
+                for (int i = -1; i <= 1; i++)
+                    for (int j = -1; j <= 1; j++)
+                        Mk(i * 2.0f, j * 2.0f, 0.5f, 1.6f);
+                break;
+
+            case TrapGlyph.Snuffed:       // dark — a hollow ring around a dead centre
+                Mk(0f, -2.2f, 4.4f, 0.5f);
+                Mk(0f,  2.2f, 4.4f, 0.5f);
+                Mk(-2.2f, 0f, 0.5f, 4.4f);
+                Mk( 2.2f, 0f, 0.5f, 4.4f);
+                break;
+
+            case TrapGlyph.DownArrow:     // trapdoor — arrow head pointing down-screen
+                Mk(0f, -1.4f, 0.7f, 3.2f);
+                Mk(-1.0f, 1.0f, 2.6f, 0.6f);
+                Mk( 1.0f, 1.0f, 2.6f, 0.6f);
+                Mk(0f, 2.0f, 1.4f, 0.6f);
+                break;
+
+            case TrapGlyph.BigArrow:      // one-way gate — one large arrow along the facing
+                Mk(fx * -1.0f, fz * -1.0f,
+                   Mathf.Abs(fz) > 0.5f ? 0.9f : 5.0f,
+                   Mathf.Abs(fz) > 0.5f ? 5.0f : 0.9f);
+                Mk(fx * 2.2f - fz * 1.3f, fz * 2.2f + fx * 1.3f, 2.0f, 2.0f);
+                Mk(fx * 2.2f + fz * 1.3f, fz * 2.2f - fx * 1.3f, 2.0f, 2.0f);
+                break;
+
+            case TrapGlyph.PushArrows:    // push tile — three stacked arrows along the facing
+                for (int i = -1; i <= 1; i++)
+                {
+                    float px = fz * i * 2.2f, pz = fx * i * 2.2f;
+                    Mk(px + fx * -0.8f, pz + fz * -0.8f,
+                       Mathf.Abs(fz) > 0.5f ? 0.5f : 3.4f,
+                       Mathf.Abs(fz) > 0.5f ? 3.4f : 0.5f);
+                    Mk(px + fx * 1.8f, pz + fz * 1.8f, 1.2f, 1.2f);
+                }
+                break;
+
+            case TrapGlyph.Portal:        // teleport — concentric ring
+                Mk(0f, -1.8f, 3.6f, 0.5f);
+                Mk(0f,  1.8f, 3.6f, 0.5f);
+                Mk(-1.8f, 0f, 0.5f, 3.6f);
+                Mk( 1.8f, 0f, 0.5f, 3.6f);
+                Mk(0f, 0f, 1.0f, 1.0f);
+                break;
+
+            case TrapGlyph.WallHatch:     // greased walls — hatching along both side walls
+                for (int i = -2; i <= 2; i++)
+                {
+                    Mk(-3.4f, i * 1.7f, 1.4f, 0.4f);
+                    Mk( 3.4f, i * 1.7f, 1.4f, 0.4f);
+                }
+                break;
+        }
+    }
+
+    void BuildStairGeo(Node3D parent, PieceType type, int rot,
+                       float wx, float wy, float wz, bool isActive)
+    {
+        int  delta      = PieceDB.StairFloorDelta(type);
+        Dir  highEndDir = delta > 0
+            ? PieceDB.GetStairCrossDir(type, rot)
+            : PieceDB.GetStairFlatDir(type, rot);
+
+        // Unit vector pointing from the low end of the stair toward the high end
+        float fwdX = highEndDir == Dir.E ? 1f : highEndDir == Dir.W ? -1f : 0f;
+        float fwdZ = highEndDir == Dir.S ? 1f : highEndDir == Dir.N ? -1f : 0f;
+
+        // lowY = floor the stairs sit on; highY = connected floor above/below
+        float lowY  = delta > 0 ? wy          : wy + delta * EdFH;
+        float highY = delta > 0 ? wy + EdFH   : wy;
+
+        // 9 step positions span the full EdFH with 1 m of rise between each step.
+        // Step 0 sits at the lower-floor surface and step NS-1 sits at the upper-floor
+        // surface. That's the seam-fixer: chained StairsDown's bottom step (lowY) now
+        // meets the next StairsDown's top step (highY = lowY of the upper one) at the
+        // cell boundary with zero vertical gap. The old 8-step version put step 0 at
+        // lowY+1m, leaving a visible 1 m drop between adjacent stairs going down.
+        // StairsUp didn't show it because that chain meets at top-step ↔ flat-arm, both
+        // at home-floor Y; StairsDown chains meet at bottom-step ↔ flat-arm and exposed
+        // the gap.
+        const int NS = 9;
+        float stepH = CS / NS;
+        float stepV = EdFH / (NS - 1);
+
+        float lx = wx + CS * 0.5f - fwdX * CS * 0.5f;
+        float lz = wz + CS * 0.5f - fwdZ * CS * 0.5f;
+
+        // Stair color: lone stairs use perspective-based, chained stairs use native
+        // type-based — see StairColorForView for the full rule.
+        Color col = StairColorForView(type, rot, wx, wy, wz);
+        // A stair whose landing reaches the active floor is highlighted cyan/purple
+        // (via StairColorForView) — match its brightness to the same-floor case so
+        // both ends of a chain pop at the same intensity. Stairs that don't touch
+        // _floor stay ghosted at the inactive alpha.
+        float alpha;
+        if (isActive || StairTouchesActiveFloor(type, wy))
+            alpha = 0.95f;
+        else
+        {
+            int pieceFloor = Mathf.RoundToInt(wy / EdFH);
+            alpha = pieceFloor > _floor ? 0.30f : 0.22f;
+        }
+
+        for (int i = 0; i < NS; i++)
+        {
+            float scx = lx + fwdX * (i + 0.5f) * stepH;
+            float scy = lowY + i * stepV + FlrT * 0.5f;          // i=0 → lowY, i=NS-1 → highY
+            float scz = lz + fwdZ * (i + 0.5f) * stepH;
+
+            float tw = fwdZ != 0 ? CentW - 0.1f : stepH * 0.88f;
+            float td = fwdX != 0 ? CentW - 0.1f : stepH * 0.88f;
+
+            parent.AddChild(MakeMeshBox(new Vector3(scx, scy, scz),
+                                        new Vector3(tw, FlrT, td), col, alpha));
+        }
+
+        // Shaft connecting the two floor levels — shows the vertical link clearly
+        float sx = wx + CS * 0.5f + fwdX * CS * 0.38f;
+        float sz = wz + CS * 0.5f + fwdZ * CS * 0.38f;
+        parent.AddChild(MakeMeshBox(
+            new Vector3(sx, (lowY + highY) * 0.5f, sz),
+            new Vector3(0.9f, highY - lowY, 0.9f),
+            col, isActive ? 0.22f : 0.07f));
+    }
+
+    // ── Camera update ──────────────────────────────────────────────────────────
+    void UpdateCamera()
+    {
+        float cp = Mathf.Cos(_camPitch), sp = Mathf.Sin(_camPitch);
+        float cy = Mathf.Cos(_camYaw),   sy = Mathf.Sin(_camYaw);
+
+        float targetFloorY = _floor * EdFH;
+        var   target  = new Vector3(GridCentre.X + _camPan.X, targetFloorY + WallH * 0.35f, GridCentre.Z + _camPan.Z);
+        var   offset  = new Vector3(sy * cp, sp, cy * cp) * _camDist;
+
+        _cam.Position = target + offset;
+        // Near-vertical pitch: use -Z as up so North stays at screen-top
+        var up = _camPitch > 1.50f ? new Vector3(0, 0, -1) : Vector3.Up;
+        _cam.LookAt(target, up);
+    }
+
+    // ── Viewport input handling ────────────────────────────────────────────────
+    void HandleVpInput(InputEvent ev)
+    {
+        if (ev is InputEventMouseButton mb)
+        {
+            if (mb.ButtonIndex == MouseButton.Right)
+            {
+                if (mb.Pressed)
+                {
+                    _rmb      = true;
+                    _rmbDrag  = false;
+                    _rmbStart = mb.Position;
+                }
+                else
+                {
+                    bool wasDrag = _rmbDrag;
+                    _rmb = _rmbDrag = false;
+                    if (!wasDrag)
+                    {
+                        // Right-click is the unified cancel/delete gesture (Escape and D
+                        // were removed). Priority is:
+                        //   1. If a piece is being held (picked up off the grid) → discard it
+                        //   2. If a palette piece is selected (preview ghost showing) → clear the selection
+                        //   3. Otherwise, if the cursor is over a placed piece, delete that piece
+                        //      (Start/Exit are still permanent and refuse deletion).
+                        if (_holding)
+                        {
+                            AbandonHolding();
+                        }
+                        else if (_roomAnchor != null)
+                        {
+                            // Right-click is this editor's unified cancel gesture (see the
+                            // comment above); a half-finished room drag cancels first so a
+                            // second right-click is still available to clear the Room
+                            // selection itself.
+                            CancelRoomPaint();
+                        }
+                        else if (_selType.HasValue)
+                        {
+                            _selType = null;
+                            RefreshPalette();
+                            RebuildBorderHints();
+                            RebuildPreviewGeo();
+                            SetStatus();
+                        }
+                        else if (TryGetCell(mb.Position, out int cx, out int cy))
+                        {
+                            // Cross-floor-aware: this also resolves stairs whose home
+                            // floor is _floor±1 but whose landing visually sits at the
+                            // active floor's cell.
+                            if (TryGetActiveFloorPiece(cx, cy, out var rp) &&
+                                (rp.Type == PieceType.Start || rp.Type == PieceType.Exit))
+                            {
+                                SetStatus($"{PieceDB.Labels[rp.Type]} cannot be removed — move it instead.");
+                            }
+                            else
+                            {
+                                RemovePiece(cx, cy);
+                                RebuildGeometry();
+                            }
+                        }
+                    }
+                }
+                GetViewport().SetInputAsHandled();
+            }
+            else if (mb.ButtonIndex == MouseButton.Left && mb.Pressed)
+            {
+                if (TryGetCell(mb.Position, out int cx, out int cy))
+                {
+                    if (_holding)
+                        DropPiece(cx, cy);
+                    // Room painting takes two clicks: first sets a corner, second fills
+                    // the rectangle. Checked before the pick-up path so clicking an
+                    // existing Room tile extends the drag instead of picking it up.
+                    else if (_selType == PieceType.Room)
+                    {
+                        if (_roomAnchor == null)
+                        {
+                            _roomAnchor = (cx, cy);
+                            _clickSfx?.Play();
+                            SetStatus("Room corner set — click the opposite corner  |  right-click to cancel");
+                        }
+                        else
+                        {
+                            var (ax, ay) = _roomAnchor.Value;
+                            _roomAnchor = null;
+                            PaintRoomRect(ax, ay, cx, cy);
+                        }
+                    }
+                    // Cross-floor-aware: pickup applies to stairs whose landing visually
+                    // sits on the active floor too, not just pieces with home == _floor.
+                    else if (TryGetActiveFloorPiece(cx, cy, out _))
+                        PickUpPiece(cx, cy);   // existing piece always takes priority
+                    else if (_selType.HasValue)
+                        PlacePiece(cx, cy);
+                }
+                else if (_holding)
+                {
+                    // Clicked outside the grid while holding a piece → discard it
+                    // (Start/Exit can't be deleted, so they return to their origin instead)
+                    AbandonHolding();
+                }
+                GetViewport().SetInputAsHandled();
+            }
+            else if (mb.ButtonIndex == MouseButton.WheelUp)
+            {
+                _camDist = Mathf.Max(_camDist - 10f, 30f);
+                GetViewport().SetInputAsHandled();
+            }
+            else if (mb.ButtonIndex == MouseButton.WheelDown)
+            {
+                _camDist = Mathf.Min(_camDist + 10f, 400f);
+                GetViewport().SetInputAsHandled();
+            }
+            else if (mb.ButtonIndex == MouseButton.Middle)
+            {
+                _mmb = mb.Pressed;
+                GetViewport().SetInputAsHandled();
+            }
+        }
+        else if (ev is InputEventMouseMotion mm)
+        {
+            if (_rmb)
+            {
+                // 10-pixel threshold (was 4) — small mouse jitter no longer eats the click,
+                // so a quick right-click reliably triggers delete / abandon-hold instead of
+                // being misread as a tiny orbit drag.
+                if ((mm.Position - _rmbStart).Length() > 10f) _rmbDrag = true;
+                if (_rmbDrag)
+                {
+                    _camYaw   -= mm.Relative.X * 0.005f;
+                    _camPitch += mm.Relative.Y * 0.005f;
+                    _camPitch  = Mathf.Clamp(_camPitch, 0.05f, 1.55f);
+                }
+                GetViewport().SetInputAsHandled();
+            }
+            else if (_mmb)
+            {
+                // Middle-mouse drag pans the camera target along the screen's right/up
+                // axes (in world space). Speed scales with distance so the same screen-
+                // pixel delta moves the same on-screen amount whether zoomed in or out.
+                float cp = Mathf.Cos(_camPitch), sp = Mathf.Sin(_camPitch);
+                float cy = Mathf.Cos(_camYaw),   sy = Mathf.Sin(_camYaw);
+                Vector3 fwd = new Vector3(-sy * cp, -sp, -cy * cp).Normalized();
+                Vector3 worldUp = _camPitch > 1.50f ? new Vector3(0, 0, -1) : Vector3.Up;
+                Vector3 right   = fwd.Cross(worldUp).Normalized();
+                Vector3 upPlane = right.Cross(fwd).Normalized();
+
+                // Pixels-to-world factor at the target distance: 2*tan(FOV/2)/viewportHeight.
+                float vpH   = Mathf.Max(GetViewport().GetVisibleRect().Size.Y, 1f);
+                float scale = 2f * Mathf.Tan(_cam.Fov * Mathf.Pi / 360f) * _camDist / vpH;
+                Vector3 delta = (-mm.Relative.X * right + mm.Relative.Y * upPlane) * scale;
+
+                _camPan += new Vector3(delta.X, 0f, delta.Z);   // keep Y locked to the floor
+
+                // Clamp pan so the user can't lose the maze in the void.
+                float maxX = GW * CS * 1.5f, maxZ = GH * CS * 1.5f;
+                _camPan = new Vector3(
+                    Mathf.Clamp(_camPan.X, -maxX, maxX),
+                    0f,
+                    Mathf.Clamp(_camPan.Z, -maxZ, maxZ));
+
+                GetViewport().SetInputAsHandled();
+            }
+            else
+            {
+                if (TryGetCell(mm.Position, out int hcx, out int hcy))
+                    SetHover(hcx, hcy);
+                else
+                    SetHover(-1, -1);
+            }
+        }
+    }
+
+    bool TryGetCell(Vector2 evPos, out int cx, out int cy)
+    {
+        cx = cy = -1;
+        var vpSize = new Vector2(_mainVp.Size.X, _mainVp.Size.Y);
+        var contSz = _vpCont.Size;
+        if (contSz.X <= 0 || contSz.Y <= 0) return false;
+
+        var vpPos = evPos / contSz * vpSize;
+        var origin = _cam.ProjectRayOrigin(vpPos);
+        var dir    = _cam.ProjectRayNormal(vpPos);
+
+        float planeY = _floor * EdFH;
+        if (Mathf.Abs(dir.Y) < 0.001f) return false;
+        float t = (planeY - origin.Y) / dir.Y;
+        if (t < 0f) return false;
+
+        var hit = origin + dir * t;
+        cx = (int)Mathf.Floor(hit.X / CS);
+        cy = (int)Mathf.Floor(hit.Z / CS);
+        return cx >= 0 && cx < GW && cy >= 0 && cy < GH;
+    }
+
+    // ── Hover highlight ────────────────────────────────────────────────────────
+    void SetHover(int cx, int cy)
+    {
+        // Start/Exit are locked to their row regardless of where the cursor is, so the user
+        // can never move them off-row even visually.
+        if (cx >= 0 && _holding)
+        {
+            if (_heldType == PieceType.Start) cy = StartRow;
+            else if (_heldType == PieceType.Exit) cy = ExitRow;
+        }
+
+        if (cx == _hoverCx && cy == _hoverCy) return;
+        _hoverCx = cx;
+        _hoverCy = cy;
+        UpdateHoverHighlight();
+
+        // Re-snap the held ghost's rotation to the new cell's neighbors so the user
+        // sees the orientation they'll actually get on click.
+        if (_holding && _heldGeo != null)
+        {
+            if (cx >= 0)
+            {
+                int snapped = PieceDB.IsStair(_heldType)
+                    ? InferStairRotation(_heldType, cx, cy, _floor, fallback: _heldRot)
+                    : InferRotation(_heldType,      cx, cy, _floor, fallback: _heldRot);
+                if (snapped != _heldRot)
+                {
+                    _heldRot = snapped;
+                    RebuildHeldGeo();
+                }
+                _heldGeo.Visible  = true;
+                _heldGeo.Position = new Vector3(cx * CS, _floor * EdFH, cy * CS);
+            }
+            else
+            {
+                _heldGeo.Visible = false;
+            }
+        }
+
+        // Same idea for the palette preview ghost.
+        if (_previewGeo != null && _selType.HasValue)
+        {
+            if (cx >= 0)
+            {
+                int snapped = PieceDB.IsStair(_selType.Value)
+                    ? InferStairRotation(_selType.Value, cx, cy, _floor, fallback: _rotation)
+                    : InferRotation(_selType.Value,      cx, cy, _floor, fallback: _rotation);
+                if (snapped != _rotation)
+                {
+                    _rotation = snapped;
+                    RebuildPreviewGeo();
+                }
+                _previewGeo.Visible  = true;
+                _previewGeo.Position = new Vector3(cx * CS, _floor * EdFH, cy * CS);
+            }
+            else
+            {
+                _previewGeo.Visible = false;
+            }
+        }
+    }
+
+    // Rebuilds the held-piece ghost in place at the current hover position.
+    void RebuildHeldGeo()
+    {
+        if (!_holding) return;
+        _heldGeo?.QueueFree();
+        _heldGeo = new Node3D();
+        _world.AddChild(_heldGeo);
+        BuildPieceInto(_heldGeo, _heldType, _heldRot, 0f, 0f, 0f, isActive: true);
+        YellowTint(_heldGeo);
+        if (_hoverCx >= 0)
+            _heldGeo.Position = new Vector3(_hoverCx * CS, _floor * EdFH, _hoverCy * CS);
+    }
+
+    void UpdateHoverHighlight()
+    {
+        foreach (var mi in _hoverBorder) { if (IsInstanceValid(mi)) mi.QueueFree(); }
+        _hoverBorder.Clear();
+
+        if (_hoverCx < 0 || _hoverCy < 0) return;
+        if (!_holding && !_selType.HasValue) return;
+
+        // Determine if this hover cell is a valid target. Start/Exit are already clamped
+        // to their row by SetHover, so the off-row case never appears here — what's left is
+        // "no rotation of this piece would be a legal placement at the hovered cell."
+        PieceType? activeType = _holding ? _heldType : _selType;
+        bool invalid = false;
+        if (activeType.HasValue)
+        {
+            bool anyValid = false;
+            for (int r = 0; r < 4; r++)
+            {
+                if (IsValidPlacement(_hoverCx, _hoverCy, activeType.Value, r, silent: true))
+                {
+                    anyValid = true;
+                    break;
+                }
+            }
+            invalid = !anyValid;
+        }
+
+        float y  = _floor * EdFH + FlrT + 0.1f;
+        float x0 = _hoverCx * CS;
+        float z0 = _hoverCy * CS;
+        const float bW = 0.28f, bH = 0.1f;
+
+        // Strong, glowing cyan-blue when valid — stands out against the softer blue
+        // grid lines so the hovered cell pops. Red for invalid placement.
+        var hoverColor = invalid
+            ? new Color(0.95f, 0.18f, 0.18f, 0.98f)
+            : new Color(0.55f, 0.85f, 1.0f,  1.0f);
+
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor                = hoverColor,
+            ShadingMode                = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            EmissionEnabled            = !invalid,
+            Emission                   = new Color(0.30f, 0.65f, 1.0f),
+            EmissionEnergyMultiplier   = 1.8f,
+        };
+        void Bar(Vector3 pos, Vector3 sz)
+        {
+            var mi = new MeshInstance3D { Mesh = new BoxMesh { Size = sz }, MaterialOverride = mat, Position = pos };
+            _world.AddChild(mi);
+            _hoverBorder.Add(mi);
+        }
+        // 4 bars forming a cell border (corners overlap intentionally)
+        Bar(new Vector3(x0 + CS * 0.5f, y, z0      ), new Vector3(CS, bH, bW));
+        Bar(new Vector3(x0 + CS * 0.5f, y, z0 + CS ), new Vector3(CS, bH, bW));
+        Bar(new Vector3(x0,             y, z0 + CS * 0.5f), new Vector3(bW, bH, CS));
+        Bar(new Vector3(x0 + CS,        y, z0 + CS * 0.5f), new Vector3(bW, bH, CS));
+
+        // Pending room rectangle — outlines every cell between the anchor and the cursor.
+        if (_selType == PieceType.Room && _roomAnchor != null)
+        {
+            var (ax, ay) = _roomAnchor.Value;
+            int rx0 = Mathf.Min(ax, _hoverCx), rx1 = Mathf.Max(ax, _hoverCx);
+            int ry0 = Mathf.Min(ay, _hoverCy), ry1 = Mathf.Max(ay, _hoverCy);
+
+            var rectMat = new StandardMaterial3D
+            {
+                AlbedoColor              = new Color(0.45f, 0.95f, 0.65f, 0.95f),
+                ShadingMode              = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                EmissionEnabled          = true,
+                Emission                 = new Color(0.30f, 0.85f, 0.50f),
+                EmissionEnergyMultiplier = 1.5f,
+            };
+
+            for (int rx = rx0; rx <= rx1; rx++)
+            {
+                for (int ry = ry0; ry <= ry1; ry++)
+                {
+                    float rxw = rx * CS, rzw = ry * CS;
+                    void RBar(Vector3 pos, Vector3 sz)
+                    {
+                        var mi = new MeshInstance3D
+                        {
+                            Mesh = new BoxMesh { Size = sz },
+                            MaterialOverride = rectMat,
+                            Position = pos,
+                        };
+                        _world.AddChild(mi);
+                        _hoverBorder.Add(mi);
+                    }
+                    RBar(new Vector3(rxw + CS * 0.5f, y, rzw),           new Vector3(CS, bH, bW));
+                    RBar(new Vector3(rxw + CS * 0.5f, y, rzw + CS),      new Vector3(CS, bH, bW));
+                    RBar(new Vector3(rxw,             y, rzw + CS*0.5f), new Vector3(bW, bH, CS));
+                    RBar(new Vector3(rxw + CS,        y, rzw + CS*0.5f), new Vector3(bW, bH, CS));
+                }
+            }
+        }
+    }
+
+    // ── Pick-up / move ─────────────────────────────────────────────────────────
+    void PickUpPiece(int cx, int cy)
+    {
+        // Cross-floor-aware lookup — picking up a stair whose landing sits on the active
+        // floor uses the stair's ACTUAL home floor as the origin (preserved in
+        // _heldOFloor so a CancelHolding restores it correctly), and RemovePiece below
+        // deletes the right (X, Y, F) record. If the user then drops on the active
+        // floor, the new piece's home becomes _floor — effectively re-anchoring the
+        // stair to the floor they're editing from.
+        if (!TryGetActiveFloorPiece(cx, cy, out var p)) return;
+
+        _heldType   = p.Type;
+        _heldRot    = p.Rotation;
+        _heldOX     = p.X;
+        _heldOY     = p.Y;
+        _heldOFloor = p.Floor;
+        _heldLinkId = p.LinkId;
+
+        RemovePiece(cx, cy);
+
+        // Yellow ghost at the same cell; parent node moves with mouse
+        _heldGeo = new Node3D();
+        _world.AddChild(_heldGeo);
+        BuildPieceInto(_heldGeo, _heldType, _heldRot, 0f, 0f, 0f, isActive: true);
+        YellowTint(_heldGeo);
+        _heldGeo.Position = new Vector3(cx * CS, _floor * EdFH, cy * CS);
+
+        _holding = true;
+        _selType = null;
+        RefreshPalette();
+        RebuildPreviewGeo();   // clears palette preview while holding
+        RebuildGeometry();     // also refreshes stair shadows after removal
+        RebuildBorderHints();
+        _clickSfx?.Play();
+        SetStatus($"Moving {PieceDB.Labels[_heldType]}  —  R to rotate  |  click to place  |  Esc to cancel");
+    }
+
+    void DropPiece(int cx, int cy)
+    {
+        if (!_holding) return;
+
+        // Clamp Start/Exit to their valid row — clicking anywhere on the grid drops them
+        // somewhere on their dedicated row (matching what the user sees via the held ghost).
+        if (_heldType == PieceType.Start) cy = StartRow;
+        else if (_heldType == PieceType.Exit) cy = ExitRow;
+
+        // Auto-orient on drop, same as palette placement
+        int useRot = PieceDB.IsStair(_heldType)
+            ? InferStairRotation(_heldType, cx, cy, _floor, fallback: _heldRot)
+            : InferRotation(_heldType,      cx, cy, _floor, fallback: _heldRot);
+
+        if (!IsValidPlacement(cx, cy, _heldType, useRot)) return;
+
+        _heldGeo?.QueueFree();
+        _heldGeo = null;
+
+        RemovePiece(cx, cy);   // clear any existing piece at destination
+
+        var piece = new MazePiece { X = cx, Y = cy, Floor = _floor,
+                                    Type = _heldType, Rotation = useRot, LinkId = _heldLinkId };
+        _maze.Pieces.Add(piece);
+        _heldRot = useRot;   // remember the snapped rotation in case user picks it up again
+
+        var key = new CK(cx, cy, _floor);
+        var geo = new Node3D();
+        _world.AddChild(geo);
+        BuildPieceInto(geo, _heldType, useRot, cx * CS, _floor * EdFH, cy * CS, isActive: true);
+        _cellGeo[key] = geo;
+
+        _holding = false;
+        RebuildGeometry();   // also refreshes stair shadows
+        RebuildBorderHints();
+        UpdateHoverHighlight();
+        _clickSfx?.Play();
+        SetStatus($"Placed {PieceDB.Labels[_heldType]}");
+    }
+
+    void CancelHolding()
+    {
+        if (!_holding) return;
+
+        _heldGeo?.QueueFree();
+        _heldGeo = null;
+
+        // Restore to original position
+        var piece = new MazePiece { X = _heldOX, Y = _heldOY, Floor = _heldOFloor,
+                                    Type = _heldType, Rotation = _heldRot, LinkId = _heldLinkId };
+        _maze.Pieces.Add(piece);
+
+        var key = new CK(_heldOX, _heldOY, _heldOFloor);
+        var geo = new Node3D();
+        _world.AddChild(geo);
+        BuildPieceInto(geo, _heldType, _heldRot,
+                       _heldOX * CS, _heldOFloor * EdFH, _heldOY * CS,
+                       isActive: _heldOFloor == _floor);
+        _cellGeo[key] = geo;
+
+        _holding = false;
+        RebuildGeometry();   // also refreshes stair shadows
+        RebuildBorderHints();
+        UpdateHoverHighlight();
+        SetStatus();
+    }
+
+    static void YellowTint(Node3D node)
+    {
+        foreach (var child in node.GetChildren())
+        {
+            if (child is MeshInstance3D mi && mi.MaterialOverride is StandardMaterial3D mat)
+                mat.AlbedoColor = new Color(CSel.R, CSel.G, CSel.B, mat.AlbedoColor.A * 0.75f);
+            if (child is Node3D n) YellowTint(n);
+        }
+    }
+
+    // ── Place / remove ─────────────────────────────────────────────────────────
+    void PlacePiece(int cx, int cy)
+    {
+        if (!_selType.HasValue) return;
+        var pt = _selType.Value;
+
+        if (pt == PieceType.StairsUp   && _floor >= FlMax) { SetStatus("Can't place: top floor.");    return; }
+        if (pt == PieceType.StairsDown && _floor <= FlMin) { SetStatus("Can't place: bottom floor."); return; }
+        // A trapdoor drops the player exactly one floor down (TrapBehaviours.
+        // AddTrapdoor just hides/disables this cell's floor; gravity does the
+        // rest) — at the bottom floor there is nothing below to land on.
+        if (pt == PieceType.TrapDoor   && _floor <= FlMin) { SetStatus("Can't place: bottom floor."); return; }
+
+        // Auto-rotate: snap rotation to connect with neighbors / stair landings
+        int useRot = PieceDB.IsStair(pt)
+            ? InferStairRotation(pt, cx, cy, _floor, fallback: _rotation)
+            : InferRotation(pt, cx, cy, _floor, fallback: _rotation);
+
+        if (!IsValidPlacement(cx, cy, pt, useRot)) return;
+
+        RemovePiece(cx, cy);   // clear existing
+
+        var piece = new MazePiece { X = cx, Y = cy, Floor = _floor, Type = pt, Rotation = useRot };
+        _maze.Pieces.Add(piece);
+
+        if (pt == PieceType.TrapPortal)
+        {
+            if (_pendingLinkId == 0)
+            {
+                // Open a new pair — this pad is inert until its partner is placed.
+                piece.LinkId   = _nextLinkId;
+                _pendingLinkId = _nextLinkId;
+                _nextLinkId++;
+                SetStatus($"Teleport pad A placed (pair {piece.LinkId}) — place its partner.");
+            }
+            else
+            {
+                piece.LinkId   = _pendingLinkId;
+                SetStatus($"Teleport pair {piece.LinkId} linked.");
+                _pendingLinkId = 0;
+            }
+        }
+
+        var key = new CK(cx, cy, _floor);
+        var geo = new Node3D();
+        _world.AddChild(geo);
+        BuildPieceInto(geo, pt, useRot, cx * CS, _floor * EdFH, cy * CS, isActive: true);
+        _cellGeo[key] = geo;
+
+        RebuildGeometry();   // refresh stair-shadow rendering
+        _clickSfx?.Play();
+        // Teleport pads already set their own pairing-specific status above
+        // ("pad A placed (pair N)" / "pair N linked") — don't clobber it with
+        // the generic message.
+        if (pt != PieceType.TrapPortal)
+            SetStatus($"Placed {PieceDB.Labels[pt]}");
+    }
+
+    void RemovePiece(int cx, int cy)
+    {
+        // Use the cross-floor-aware lookup so right-click also reaches stair pieces
+        // whose home floor is _floor±1 but whose landing sits on the active floor.
+        // (Stair geometry visually occupies the active floor's cell, so the user
+        // expects "right-click that thing → it's gone.")
+        if (!TryGetActiveFloorPiece(cx, cy, out var target)) return;
+        var key = new CK(target.X, target.Y, target.Floor);
+        _maze.Pieces.RemoveAll(p => p.X == target.X && p.Y == target.Y && p.Floor == target.Floor);
+        if (_cellGeo.TryGetValue(key, out var geo))
+        {
+            geo.QueueFree();
+            _cellGeo.Remove(key);
+        }
+    }
+
+    // ── Room painting ─────────────────────────────────────────────────────────
+    // Click one cell, then a second: every cell in the rectangle between them
+    // becomes an independent Room tile. Painting over an existing piece replaces
+    // it. Cells that already hold a Room are left alone, so overlapping drags
+    // extend a room instead of churning it.
+    void PaintRoomRect(int ax, int ay, int bx, int by)
+    {
+        int painted = 0;
+        int blockedByPiece = 0;
+        foreach (var (x, y) in RoomRectCells(ax, ay, bx, by))
+        {
+            if (RoomPaintSkipsCell(x, y, out bool blockedByMultiCell))
+            {
+                if (blockedByMultiCell) blockedByPiece++;
+                continue;
+            }
+
+            RemovePiece(x, y);
+
+            _maze.Pieces.Add(new MazePiece
+            {
+                X = x, Y = y, Floor = _floor, Type = PieceType.Room, Rotation = 0,
+            });
+            painted++;
+        }
+
+        int x0 = Mathf.Min(ax, bx), x1 = Mathf.Max(ax, bx);
+        int y0 = Mathf.Min(ay, by), y1 = Mathf.Max(ay, by);
+        RebuildGeometry();
+        RebuildBorderHints();
+        _clickSfx?.Play();
+
+        string sizeLabel = $"{(x1 - x0 + 1)}x{(y1 - y0 + 1)}";
+        if (painted > 0 && blockedByPiece > 0)
+            SetStatus($"Painted {painted} room tile(s)  —  {sizeLabel}  " +
+                      $"({blockedByPiece} cell(s) skipped — occupied by a Pit; right-click it to remove first)");
+        else if (painted > 0)
+            SetStatus($"Painted {painted} room tile(s)  —  {sizeLabel}");
+        else if (blockedByPiece > 0)
+            SetStatus($"No room tiles painted — {blockedByPiece} cell(s) occupied by a Pit; right-click it to remove first.");
+        else
+            SetStatus("No new room tiles — that area is already open.");
+    }
+
+    /// Per-cell decision backing PaintRoomRect: whether to leave this cell alone
+    /// rather than paint a Room tile over it, and — via `blockedByMultiCell` —
+    /// whether that's specifically because doing so would require silently
+    /// destroying an existing multi-cell piece (currently just Pit; RemovePiece
+    /// deletes such a piece's ENTIRE record, across every cell and floor it
+    /// spans, not just the one cell clicked). Start/Exit are refused for the
+    /// same "don't silently destroy" reason but were already refused before this
+    /// method existed, so they are not flagged via `blockedByMultiCell` — only
+    /// the new multi-cell case is surfaced in PaintRoomRect's status message.
+    ///
+    /// Extracted as its own `internal` method — rather than inlined in
+    /// PaintRoomRect — so test/TestRoomPitLogic.cs can exercise this decision
+    /// headlessly. PaintRoomRect itself cannot be called from the test harness:
+    /// it calls RebuildGeometry(), which touches _world (the SubViewport's World
+    /// node), and _world is only initialized by SetupMainVp() during a running
+    /// _Ready() — null on an instance built directly by a headless test.
+    internal bool RoomPaintSkipsCell(int x, int y, out bool blockedByMultiCell)
+    {
+        blockedByMultiCell = false;
+
+        // Already a Room here on this floor — nothing to do.
+        if (TryGetPlacedPieceOnFloor(x, y, _floor, out var existing) &&
+            existing.Type == PieceType.Room)
+            return true;
+
+        // Never paint over Start or Exit; they are unique and row-locked.
+        if (existing != null &&
+            (existing.Type == PieceType.Start || existing.Type == PieceType.Exit))
+            return true;
+
+        // Never silently destroy a multi-cell piece (currently just Pit) by
+        // clipping even one corner of its footprint with a room rectangle —
+        // RemovePiece deletes that piece's WHOLE record (every cell, every
+        // floor it spans), not just this one cell. Same "refuse, don't
+        // destroy" precedent as Start/Exit above. Deleting a pit on purpose is
+        // still possible the normal way: right-click any of its cells.
+        if (existing != null && PieceDB.IsMultiCell(existing.Type))
+        {
+            blockedByMultiCell = true;
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Pure rectangle-fill math backing PaintRoomRect: every in-grid cell between
+    /// two opposite corners, order-independent (either corner may be clicked first).
+    /// Kept separate from the paint side effects (RemovePiece/RebuildGeometry/status)
+    /// so it's testable without spinning up the editor's Node tree — see
+    /// test/TestRoomPitLogic.cs. `internal` (not `public`) since the only outside
+    /// caller is that same-assembly headless test harness.
+    internal static IEnumerable<(int x, int y)> RoomRectCells(int ax, int ay, int bx, int by)
+    {
+        int x0 = Mathf.Min(ax, bx), x1 = Mathf.Max(ax, bx);
+        int y0 = Mathf.Min(ay, by), y1 = Mathf.Max(ay, by);
+        for (int x = x0; x <= x1; x++)
+            for (int y = y0; y <= y1; y++)
+                if (x >= 0 && x < GW && y >= 0 && y < GH)
+                    yield return (x, y);
+    }
+
+    /// Cancels a half-finished room drag.
+    void CancelRoomPaint()
+    {
+        if (_roomAnchor == null) return;
+        _roomAnchor = null;
+        UpdateHoverHighlight();
+        SetStatus("Room corner cleared.");
+    }
+
+    // Generic "you let go of the piece" — Start/Exit can't be deleted, so they snap back
+    // to their original cell; every other type is discarded.
+    // Right-click / void-click / D while holding always discards the held piece, including
+    // Start and Exit. If a critical piece gets discarded, EnsureStartExit() re-spawns it at
+    // the default cell on the next Save/Load/Clear, so the maze auto-recovers.
+    // Escape still calls CancelHolding() directly for the "I changed my mind" gesture.
+    void AbandonHolding()
+    {
+        if (!_holding) return;
+        DiscardHolding();
+    }
+
+    void DiscardHolding()
+    {
+        if (!_holding) return;
+        _heldGeo?.QueueFree();
+        _heldGeo = null;
+        _holding = false;
+        RebuildGeometry();   // also refreshes stair shadows
+        RebuildBorderHints();
+        UpdateHoverHighlight();
+        SetStatus($"Discarded {PieceDB.Labels[_heldType]}");
+    }
+
+    // ── Floor navigation ───────────────────────────────────────────────────────
+    void FloorUp()
+    {
+        if (_floor >= FlMax) return;
+        _floor++;
+        OnFloorChanged();
+    }
+
+    void FloorDown()
+    {
+        if (_floor <= FlMin) return;
+        _floor--;
+        OnFloorChanged();
+    }
+
+    void OnFloorChanged()
+    {
+        // A pending room-corner click doesn't survive a floor change — otherwise
+        // the next click completes PaintRoomRect on the NEW _floor using the OLD
+        // click's coordinates, painting a rectangle the user never saw previewed
+        // here. CancelRoomPaint() is a no-op when no anchor is pending, and also
+        // refreshes the on-screen rectangle preview so a cancelled drag stops
+        // drawing immediately instead of lingering until the next mouse move.
+        CancelRoomPaint();
+
+        _floorLbl.Text = $"Floor {_floor}";
+        RefreshGridOpacity();
+        RebuildGeometry();
+        // Border hints are floor-aware (Exit can land on any floor — see RebuildBorderHints)
+        // so they must be redrawn whenever the visible floor set changes.
+        RebuildBorderHints();
+        // Held ghost follows the floor change — same cell, new Y level
+        if (_holding && _heldGeo != null && _hoverCx >= 0)
+            _heldGeo.Position = new Vector3(_hoverCx * CS, _floor * EdFH, _hoverCy * CS);
+    }
+
+    // ── Piece type selection ───────────────────────────────────────────────────
+    void SelectType(PieceType pt)
+    {
+        // Picking from the palette while holding a piece discards it (Start/Exit return to origin)
+        if (_holding) AbandonHolding();
+        // Switching tools mid-drag would otherwise leave a stale anchor that silently
+        // completes a paint against a rectangle the user never saw previewed.
+        _roomAnchor = null;
+
+        _selType = pt;
+        _selCat  = PieceDB.CategoryOf(pt);   // follow the piece to its tab
+        RefreshPalette();
+        RebuildBorderHints();
+        RebuildPreviewGeo();
+        SetStatus($"{PieceDB.Labels[pt]}  [{PieceDB.GoldCosts[pt]}g]");
+        // Camera stays where it is — user can right-click orbit freely.
+    }
+
+    void RotateOnce()
+    {
+        if (_holding)
+        {
+            _heldRot = (_heldRot + 1) % 4;
+            _heldGeo?.QueueFree();
+            _heldGeo = new Node3D();
+            _world.AddChild(_heldGeo);
+            BuildPieceInto(_heldGeo, _heldType, _heldRot, 0f, 0f, 0f, isActive: true);
+            YellowTint(_heldGeo);
+            if (_hoverCx >= 0)
+                _heldGeo.Position = new Vector3(_hoverCx * CS, _floor * EdFH, _hoverCy * CS);
+            SetStatus($"Moving {PieceDB.Labels[_heldType]}  rot {_heldRot * 90}°  —  click to place  |  Esc to cancel");
+        }
+        else
+        {
+            _rotation = (_rotation + 1) % 4;
+            RebuildPreviewGeo();
+            SetStatus(_selType.HasValue
+                ? $"{PieceDB.Labels[_selType.Value]}  rot {_rotation * 90}°"
+                : $"Rotation: {_rotation * 90}°");
+        }
+    }
+
+    void SelectCategory(PieceCategory cat)
+    {
+        _selCat = cat;
+        RefreshPalette();
+        _clickSfx?.Play();
+    }
+
+    void RefreshPalette()
+    {
+        foreach (var (pt, panel) in _palPan)
+        {
+            // Cells outside the active tab are hidden, not destroyed — their
+            // thumbnail SubViewports stay alive and keep rendering.
+            panel.Visible = PieceDB.CategoryOf(pt) == _selCat;
+
+            bool sel = _selType == pt;
+            // Selected: subtle warm tint; unselected: fully transparent (floating look)
+            panel.AddThemeStyleboxOverride("panel",
+                Flat(sel ? new Color(0.20f, 0.17f, 0.03f, 0.75f) : new Color(0, 0, 0, 0)));
+        }
+
+        foreach (var (cat, btn) in _catBtn)
+        {
+            bool active = cat == _selCat;
+            btn.AddThemeColorOverride("font_color",
+                active ? new Color(1f, 0.86f, 0.35f) : new Color(0.55f, 0.55f, 0.55f));
+            btn.AddThemeStyleboxOverride("normal",
+                Flat(active ? new Color(0.16f, 0.13f, 0.03f, 0.9f) : new Color(0, 0, 0, 0),
+                     active ? new Color(0.85f, 0.70f, 0.25f, 0.8f) : new Color(0.35f, 0.35f, 0.35f, 0.5f)));
+            btn.AddThemeStyleboxOverride("hover",
+                Flat(new Color(0.22f, 0.19f, 0.06f, 0.9f), new Color(0.85f, 0.70f, 0.25f, 0.8f)));
+            btn.AddThemeStyleboxOverride("pressed",
+                Flat(new Color(0.26f, 0.22f, 0.07f, 0.95f), new Color(1f, 0.86f, 0.35f, 0.9f)));
+        }
+    }
+
+    // ── Clear ──────────────────────────────────────────────────────────────────
+    // Shows a Yes/No confirmation dialog before wiping the current slot —
+    // clearing is destructive (loses every piece on every floor) so a single
+    // misclick shouldn't trash the user's maze.
+    void ConfirmClearMap()
+    {
+        var dialog = new ConfirmationDialog
+        {
+            Title         = "Clear Map",
+            DialogText    = "Clear every piece in this maze?\nThis cannot be undone.",
+            OkButtonText  = "Yes",
+            CancelButtonText = "No",
+        };
+        if (_font != null)
+        {
+            dialog.AddThemeFontOverride("font", _font);
+            dialog.AddThemeFontSizeOverride("font_size", 16);
+        }
+        AddChild(dialog);
+        dialog.Confirmed   += () => { ClearCurrentMap(); dialog.QueueFree(); };
+        dialog.Canceled    += () => dialog.QueueFree();
+        dialog.CloseRequested += () => dialog.QueueFree();
+        dialog.PopupCentered(new Vector2I(360, 160));
+    }
+
+    void ClearCurrentMap()
+    {
+        // A pending room-corner click must not survive a Clear Map — otherwise
+        // the very next click completes PaintRoomRect from a pre-clear anchor,
+        // laying room tiles immediately after the user asked to clear everything.
+        CancelRoomPaint();
+
+        _maze.Pieces.Clear();
+        EnsureStartExit();
+        RebuildGeometry();
+        SetStatus("Map cleared.");
+    }
+
+    // ── Save / load ────────────────────────────────────────────────────────────
+    public void SaveCurrentSlot()
+    {
+        if (_nameEdit != null && _nameEdit.Text.Length > 0)
+            _maze.Name = _nameEdit.Text;
+        _maze.IsOnline    = true;
+        _maze.IsGameReady = MazeValidator.IsGameReady(_maze, out string readyErr);
+        MazeSerializer.Save(_slot, _maze);
+        RefreshSlotButtons();
+        SetStatus(_maze.IsGameReady
+            ? "Saved — maze is game-ready."
+            : $"Saved — not game-ready: {readyErr}");
+
+        // Red pulse only fires now on save-failures (not during normal placement).
+        // It points at the first piece that's unreachable from Start so the user
+        // can see exactly where the path breaks.
+        if (!_maze.IsGameReady)
+        {
+            var broken = FindUnreachableProblemPiece();
+            if (broken != null) FlagErrorCell(broken.X, broken.Y, broken.Floor);
+        }
+    }
+
+    // Returns the first piece that BFS from Start cannot reach. Prefers the Exit when
+    // it's unreachable (most obvious "missing path"), then picks any other orphan piece.
+    // Returns null if everything is fine.
+    MazePiece? FindUnreachableProblemPiece()
+    {
+        var start = _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Start);
+        if (start == null) return _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit)
+                                ?? _maze.Pieces.FirstOrDefault();
+
+        var visited = new System.Collections.Generic.HashSet<(int, int, int)>
+            { (start.X, start.Y, start.Floor) };
+        var queue   = new System.Collections.Generic.Queue<MazePiece>();
+        queue.Enqueue(start);
+
+        var lookup = _maze.Pieces.ToDictionary(p => (p.X, p.Y, p.Floor));
+        Dir[]       all  = { Dir.N, Dir.E, Dir.S, Dir.W };
+        (int,int)[] dlt  = { (0,-1), (1,0), (0,1), (-1,0) };
+        Dir[]       opp  = { Dir.S, Dir.W, Dir.N, Dir.E };
+
+        while (queue.Count > 0)
+        {
+            var p   = queue.Dequeue();
+            Dir op  = PieceDB.GetOpenings(p.Type, p.Rotation);
+            for (int i = 0; i < 4; i++)
+            {
+                if ((op & all[i]) == 0) continue;
+                int nFloor = p.Floor;
+                if (PieceDB.IsStair(p.Type) &&
+                    all[i] == PieceDB.GetStairCrossDir(p.Type, p.Rotation))
+                    nFloor = p.Floor + PieceDB.StairFloorDelta(p.Type);
+                var key = (p.X + dlt[i].Item1, p.Y + dlt[i].Item2, nFloor);
+                if (visited.Contains(key)) continue;
+                if (!lookup.TryGetValue(key, out var nb)) continue;
+                if (PieceDB.IsStair(nb.Type) &&
+                    opp[i] == PieceDB.GetStairCrossDir(nb.Type, nb.Rotation)) continue;
+                if ((PieceDB.GetOpenings(nb.Type, nb.Rotation) & opp[i]) == 0) continue;
+                visited.Add(key);
+                queue.Enqueue(nb);
+            }
+        }
+
+        // Exit first — that's almost always the user-visible problem when a save fails.
+        var exit = _maze.Pieces.FirstOrDefault(p => p.Type == PieceType.Exit);
+        if (exit != null && !visited.Contains((exit.X, exit.Y, exit.Floor))) return exit;
+        return _maze.Pieces.FirstOrDefault(p => !visited.Contains((p.X, p.Y, p.Floor)));
+    }
+
+    void LoadSlot(int s)
+    {
+        // Loading replaces _maze wholesale with a different maze's data — a
+        // pending room-corner click from the maze being left behind is stale by
+        // definition (its coordinates mean nothing on the newly-loaded layout)
+        // and must not survive to complete a paint against it on the next click.
+        CancelRoomPaint();
+
+        _slot = s;
+        var data = MazeSerializer.Load(s);
+        _maze = data ?? new MazeData { Name = $"Maze {s + 1}", Pieces = new() };
+
+        // Continue numbering above whatever the loaded maze already uses.
+        _nextLinkId    = 1;
+        _pendingLinkId = 0;
+        foreach (var lp in _maze.Pieces)
+            if (lp.LinkId >= _nextLinkId) _nextLinkId = lp.LinkId + 1;
+
+        if (_nameEdit != null) _nameEdit.Text = _maze.Name;
+        EnsureStartExit();
+        RebuildGeometry();
+        RefreshSlotButtons();
+        SetStatus("Slot loaded.");
+    }
+
+    void RefreshSlotButtons()
+    {
+        for (int i = 0; i < MaxSlots; i++)
+        {
+            var  data    = MazeSerializer.Load(i);
+            string name  = data?.Name ?? "(empty)";
+            int pieces   = data?.Pieces?.Count ?? 0;
+            // A saved-but-broken maze (has pieces yet isn't game-ready) gets a red [!] prefix
+            // and red text. The slot can still be clicked to load and fix, but it's flagged
+            // as unusable until the path between Start and Exit is restored — PlayGameScreen
+            // already filters out non-ready slots from the matchmaking dropdown.
+            bool notReady = data != null && pieces > 0 && !data.IsGameReady;
+            string prefix = notReady ? "[!] " : "  ";
+            _slotBtns[i].Text = $"{prefix}{i + 1}.  {name}  [{pieces}p]";
+
+            bool isCur = i == _slot;
+            _slotBtns[i].AddThemeStyleboxOverride("normal",
+                Flat(isCur ? new Color(0.20f, 0.16f, 0.04f, 0.80f)
+                           : new Color(0.04f, 0.04f, 0.04f, 0.55f)));
+            _slotBtns[i].AddThemeColorOverride("font_color",
+                notReady ? new Color(1f, 0.30f, 0.30f)
+                : isCur  ? new Color(1f, 0.92f, 0.55f)
+                         : Colors.White);
+        }
+    }
+
+    // ── Enter dungeon ──────────────────────────────────────────────────────────
+    void OnEnterDungeon()
+    {
+        // Must be a full game-ready maze (Start, Exit, and a valid path between them) before
+        // we let the user test it. Same gate as Save/PlayGameScreen filtering.
+        if (!MazeValidator.IsGameReady(_maze, out string err))
+        {
+            SetStatus($"Can't enter — {err}");
+            return;
+        }
+        SaveCurrentSlot();
+        // Play-test always goes through the dual-maze arena scene so the exit dumps the
+        // player into the central arena (matching the online match layout). Both maze
+        // slots are set to the maze being edited — the second copy is a mirror on the
+        // far side of the arena, which the player can ignore or wander into.
+        GameState.ActiveSlot        = _slot;
+        GameState.IsArenaMode       = true;
+        GameState.ArenaSlotA        = _slot;
+        GameState.ArenaSlotB        = _slot;
+        GameState.EditorReturnScene = "res://scenes/MazeEditor3D.tscn";
+        DungeonArena.ChosenSpawn    = DungeonArena.SpawnPoint.MazeA;
+        GetTree().ChangeSceneToFile("res://scenes/DungeonArena.tscn");
+    }
+
+    void SetStatus(string msg = "")
+    {
+        if (_statusLbl == null) return;
+        _statusLbl.Text = msg.Length > 0 ? msg
+            : _selType.HasValue ? $"{PieceDB.Labels[_selType.Value]}  {_rotation * 90}°"
+            : "Select a piece →";
+    }
+
+    // ── Mesh helpers ───────────────────────────────────────────────────────────
+    static MeshInstance3D MakeMeshBox(Vector3 pos, Vector3 size, Color col, float alpha = 1f)
+    {
+        var mat = new StandardMaterial3D
+        {
+            AlbedoColor  = new Color(col.R, col.G, col.B, alpha),
+            ShadingMode  = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            Transparency = alpha < 0.999f
+                ? BaseMaterial3D.TransparencyEnum.Alpha
+                : BaseMaterial3D.TransparencyEnum.Disabled,
+        };
+        return new MeshInstance3D
+        {
+            Mesh             = new BoxMesh { Size = size },
+            MaterialOverride = mat,
+            Position         = pos,
+        };
+    }
+
+    // ── UI helpers ─────────────────────────────────────────────────────────────
+    Label Lbl(string text, int size, Color col,
+              HorizontalAlignment align = HorizontalAlignment.Left)
+    {
+        var l = new Label { Text = text, HorizontalAlignment = align };
+        if (_font != null) l.AddThemeFontOverride("font", _font);
+        l.AddThemeFontSizeOverride("font_size", size);
+        l.AddThemeColorOverride("font_color", col);
+        return l;
+    }
+
+    Button Btn(string text, int size, Action pressed)
+    {
+        var b = new Button { Text = text };
+        if (_font != null) b.AddThemeFontOverride("font", _font);
+        b.AddThemeFontSizeOverride("font_size", size);
+        b.Pressed += pressed;
+        return b;
+    }
+
+    VBoxContainer MakeVBox(int margin)
+    {
+        var v = new VBoxContainer();
+        v.AddThemeConstantOverride("separation", 4);
+        v.AddThemeConstantOverride("margin_left",   margin);
+        v.AddThemeConstantOverride("margin_right",  margin);
+        v.AddThemeConstantOverride("margin_top",    margin);
+        v.AddThemeConstantOverride("margin_bottom", margin);
+        return v;
+    }
+
+    void StyleLineEdit(LineEdit le)
+    {
+        if (_font != null) le.AddThemeFontOverride("font", _font);
+        le.AddThemeFontSizeOverride("font_size", 12);
+    }
+
+    static StyleBoxFlat Flat(Color bg, Color? border = null)
+    {
+        var s = new StyleBoxFlat { BgColor = bg };
+        if (border.HasValue) { s.BorderColor = border.Value; s.SetBorderWidthAll(1); }
+        return s;
+    }
+
+    // ── Palette preview ghost ─────────────────────────────────────────────────
+    void RebuildPreviewGeo()
+    {
+        _previewGeo?.QueueFree();
+        _previewGeo = null;
+        if (!_selType.HasValue) return;
+
+        _previewGeo = new Node3D { Visible = false };
+        _world.AddChild(_previewGeo);
+        BuildPieceInto(_previewGeo, _selType.Value, _rotation, 0f, 0f, 0f, isActive: true);
+        YellowTint(_previewGeo);
+
+        // Position at current hover cell if already over the grid
+        if (_hoverCx >= 0)
+        {
+            _previewGeo.Visible  = true;
+            _previewGeo.Position = new Vector3(_hoverCx * CS, _floor * EdFH, _hoverCy * CS);
+        }
+    }
+
+    // ── Permanent Start / Exit pieces ─────────────────────────────────────────
+    void EnsureStartExit()
+    {
+        if (!_maze.Pieces.Any(p => p.Type == PieceType.Start))
+            _maze.Pieces.Add(new MazePiece { X = GW / 2, Y = StartRow, Floor = 0,
+                                             Type = PieceType.Start, Rotation = 0 });
+        if (!_maze.Pieces.Any(p => p.Type == PieceType.Exit))
+            _maze.Pieces.Add(new MazePiece { X = GW / 2, Y = ExitRow,  Floor = 0,
+                                             Type = PieceType.Exit,  Rotation = 0 });
+    }
+
+    // ── Pulsing red error indicator ────────────────────────────────────────────
+    // When a validation rejects a placement because of an opening-mismatch with a
+    // specific neighbor piece, we flash a red glow over that neighbor's cell so the
+    // user can see exactly which piece is causing the conflict. The pulse fades
+    // out over ~3.5 seconds and re-activates each time a new mismatch is reported.
+    void FlagErrorCell(int x, int y, int floor)
+    {
+        if (_errorPulse == null)
+        {
+            _errorPulseMat = new StandardMaterial3D
+            {
+                AlbedoColor               = new Color(1.0f, 0.18f, 0.18f, 0.55f),
+                ShadingMode               = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                Transparency              = BaseMaterial3D.TransparencyEnum.Alpha,
+                EmissionEnabled           = true,
+                Emission                  = new Color(1.0f, 0.12f, 0.12f),
+                EmissionEnergyMultiplier  = 2.0f,
+            };
+            _errorPulse = new MeshInstance3D
+            {
+                Name             = "ErrorPulse",
+                Mesh             = new BoxMesh { Size = new Vector3(CS - 0.4f, 0.12f, CS - 0.4f) },
+                MaterialOverride = _errorPulseMat,
+            };
+            _world.AddChild(_errorPulse);
+        }
+        _errorPulseCx    = x;
+        _errorPulseCy    = y;
+        _errorPulseFloor = floor;
+        _errorPulseTimer = 3.5f;
+        _errorPulsePhase = 0f;
+        _errorPulse.Visible = true;
+    }
+
+    void UpdateErrorPulse(float dt)
+    {
+        if (_errorPulse == null || !_errorPulse.Visible) return;
+        _errorPulseTimer -= dt;
+        if (_errorPulseTimer <= 0f)
+        {
+            _errorPulse.Visible = false;
+            return;
+        }
+
+        // Pulse cycle (~3 Hz) + slight vertical bob — "glows red up and down"
+        _errorPulsePhase += dt * 6.0f;
+        float pulse01 = (Mathf.Sin(_errorPulsePhase) + 1f) * 0.5f;
+        // Final-second fade so it doesn't snap off
+        float life    = Mathf.Clamp(_errorPulseTimer / 1.2f, 0f, 1f);
+
+        if (_errorPulseMat != null)
+        {
+            _errorPulseMat.AlbedoColor              = new Color(1.0f, 0.18f, 0.18f, (0.35f + pulse01 * 0.5f) * life);
+            _errorPulseMat.EmissionEnergyMultiplier = (1.4f + pulse01 * 2.4f) * life;
+        }
+
+        float baseY = _errorPulseFloor * EdFH + FlrT + 0.25f;
+        _errorPulse.Position = new Vector3(
+            _errorPulseCx * CS + CS * 0.5f,
+            baseY + Mathf.Sin(_errorPulsePhase) * 0.35f,
+            _errorPulseCy * CS + CS * 0.5f);
+    }
+
+    // RebuildEdgeWalls was removed — the edge-wall system used to draw translucent
+    // grey panels at every closed cell boundary on the current floor. The visual got
+    // noisy with stair chains and obscured the floor layout, so it's gone now;
+    // pieces communicate the floor plan via their blue active-color tint instead.
+    // ClearEdgeWalls() (above) is still called from RebuildGeometry to free any
+    // stragglers from an older slot save that might have created entries.
+
+    // ── Border cell hints (for Exit/Start placement) ───────────────────────────
+    void RebuildBorderHints()
+    {
+        foreach (var mi in _borderHints) { if (IsInstanceValid(mi)) mi.QueueFree(); }
+        _borderHints.Clear();
+
+        PieceType? activeType = _holding ? _heldType : _selType;
+        if (activeType != PieceType.Exit && activeType != PieceType.Start) return;
+
+        int validRow = activeType == PieceType.Start ? StartRow : ExitRow;
+        // Green for Start, red for Exit
+        Color tint = activeType == PieceType.Start
+            ? new Color(0.20f, 0.90f, 0.35f, 0.45f)
+            : new Color(0.95f, 0.25f, 0.25f, 0.45f);
+
+        // Start stays on floor 0. Exit can be placed on any floor — highlight its row
+        // on every floor so the user sees all valid destinations.
+        int floorMin = activeType == PieceType.Exit ? FlMin : 0;
+        int floorMax = activeType == PieceType.Exit ? FlMax : 0;
+
+        for (int f = floorMin; f <= floorMax; f++)
+        {
+            // Dim hints on non-current floors so the active floor still reads as primary
+            float alphaScale = (f == _floor) ? 1f : 0.35f;
+            var floorMat = new StandardMaterial3D
+            {
+                AlbedoColor  = new Color(tint.R, tint.G, tint.B, tint.A * alphaScale),
+                ShadingMode  = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+            };
+            float y = f * EdFH + FlrT + 0.05f;
+
+            for (int x = 0; x < GW; x++)
+            {
+                // Skip cells that already contain a piece on this floor
+                if (_cellGeo.ContainsKey(new CK(x, validRow, f))) continue;
+                var mi = new MeshInstance3D
+                {
+                    Mesh             = new BoxMesh { Size = new Vector3(CS - 0.1f, 0.06f, CS - 0.1f) },
+                    MaterialOverride = floorMat,
+                    Position         = new Vector3(x * CS + CS * 0.5f, y, validRow * CS + CS * 0.5f),
+                };
+                _world.AddChild(mi);
+                _borderHints.Add(mi);
+            }
+        }
+    }
+
+    // ── Placement validation ───────────────────────────────────────────────────
+    // internal (not private): test/TestRoomPitLogic.cs calls this directly to cover
+    // the Pit footprint/bounds checks headlessly. Always pass silent:true from a test
+    // — the false path calls SetStatus(), which touches a UI Label that only exists
+    // after _Ready() has built the scene.
+    internal bool IsValidPlacement(int cx, int cy, PieceType type, int rot, bool silent = false)
+    {
+        // Start stays in its row; Exit stays in its row
+        if (type == PieceType.Start)
+        {
+            if (cy != StartRow)
+            {
+                if (!silent) SetStatus("Start must stay in the top row.");
+                return false;
+            }
+        }
+        else if (type == PieceType.Exit)
+        {
+            if (cy != ExitRow)
+            {
+                if (!silent) SetStatus("Exit must stay in the bottom row.");
+                return false;
+            }
+        }
+
+        // Refuse to place/drop ANY piece — including a new Pit — onto a cell
+        // already claimed by an existing multi-cell piece (currently just Pit).
+        // Both PlacePiece and DropPiece unconditionally call RemovePiece right
+        // after this check passes, and RemovePiece deletes a multi-cell piece's
+        // ENTIRE record (every cell, every floor it spans) — not just the one
+        // cell clicked/dropped on. Before this check existed, only a NEW Pit's
+        // own footprint was validated against occupancy (below); an ordinary
+        // piece sailed through here because the general connection-scan only
+        // looks at neighbours' openings, and a Pit is open on every face, so it
+        // always looked "connected". Same "refuse, don't destroy" precedent as
+        // the Start/Exit checks above. Deleting a pit on purpose is still
+        // possible the normal way: right-click any of its cells.
+        if (TryGetPlacedPieceOnFloor(cx, cy, _floor, out var occupant) &&
+            PieceDB.IsMultiCell(occupant.Type))
+        {
+            if (!silent)
+                SetStatus($"{PieceDB.Labels[occupant.Type]} is in the way — right-click it to remove first.");
+            return false;
+        }
+
+        if (type == PieceType.Pit)
+        {
+            // The 3x3 footprint must fit inside the grid. Unlike the vertical span,
+            // a horizontal overhang cannot be meaningfully clipped.
+            if (cx < 1 || cx >= GW - 1 || cy < 1 || cy >= GH - 1)
+            {
+                if (!silent) SetStatus("Pit needs one clear cell on every side — move it inward.");
+                return false;
+            }
+
+            // Nothing may already occupy any cell of the footprint on any of its floors.
+            foreach (int f in PitBuilder.OccupiedFloors(_floor, FlMin, FlMax))
+            {
+                foreach (var (dx, dy) in PieceDB.Footprint(PieceType.Pit))
+                {
+                    if (!TryGetPlacedPieceOnFloor(cx + dx, cy + dy, f, out var blocker)) continue;
+                    if (!silent)
+                        SetStatus($"Pit is blocked by {PieceDB.Labels[blocker.Type]} " +
+                                  $"at ({cx + dx},{cy + dy},F{f}).");
+                    return false;
+                }
+            }
+
+            // A pit is always valid to place otherwise: floors outside the world range
+            // are simply cut off (PitBuilder.OccupiedFloors clips them) and the piece
+            // stays valid, per the design.
+            return true;
+        }
+
+        if (PieceDB.IsStair(type))
+            return IsValidStairPlacement(cx, cy, type, rot);
+
+        // Connection scan. We only need ONE matched opening between this piece and any
+        // neighbor (or a stair landing) — non-matching openings are now treated as
+        // dead ends instead of hard mismatches. That lets pieces with extra openings
+        // (like the Cross/+) sit next to stair side walls or other closed walls with
+        // some of their openings simply not going anywhere.
+        bool hasConnection = false;
+
+        foreach (Dir dir in new[] { Dir.N, Dir.S, Dir.E, Dir.W })
+        {
+            var (dx, dz) = DirToOffset(dir);
+            int nx = cx + dx, ny = cy + dz;
+            if (nx < 0 || nx >= GW || ny < 0 || ny >= GH) continue;
+
+            if (!TryGetPlacedPieceOnFloor(nx, ny, _floor, out var nbr)) continue;
+
+            Dir  oppDir     = PieceDB.Opposite(dir);
+            bool myHasOpen  = PieceDB.HasSameFloorOpening(type, rot, dir);
+            bool nbrHasOpen = PieceDB.HasSameFloorOpening(nbr.Type, nbr.Rotation, oppDir);
+
+            if (myHasOpen && nbrHasOpen) hasConnection = true;
+            // myOpen ^ nbrOpen → dead-end mismatch, intentionally allowed.
+        }
+
+        // Stair landings count as connections too
+        if (!hasConnection && HasStairLandingNeighbor(cx, cy, _floor, type, rot))
+            hasConnection = true;
+
+        bool freeMove   = type == PieceType.Start || type == PieceType.Exit;
+        int  floorCount = _maze.Pieces.Count(p => p.Floor == _floor);
+        if (!freeMove && floorCount > 0 && !hasConnection)
+        {
+            if (!silent) SetStatus("Piece must connect to an existing piece.");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Stairs must have their flat-face opening connect to a same-floor neighbor,
+    // or their cross-face land on an existing piece on the destination floor that
+    // points back toward us.
+    bool IsValidStairPlacement(int cx, int cy, PieceType type, int rot)
+    {
+        Dir flatDir  = PieceDB.GetStairFlatDir(type, rot);
+        Dir crossDir = PieceDB.GetStairCrossDir(type, rot);
+        int destFloor = _floor + PieceDB.StairFloorDelta(type);
+
+        // Reject any adjacency between StairsUp and StairsDown — V shapes, inverted-V,
+        // back-to-back stacking, AND same-floor flat-to-flat chains (Case D). Chains
+        // must be made of one stair type so the gameplay collision (DungeonBuilder's
+        // wall suppression) lines up. Same-direction chains stay valid.
+        if (ConnectsToOppositeStair(cx, cy, type, rot, _floor))
+        {
+            SetStatus("Stair chains must be all stairs up or all stairs down — mixing types creates a wall.");
+            return false;
+        }
+
+        // Flat-side mismatches are no longer hard rejections — a stair next to a piece
+        // with a non-matching opening just has a dead-end side. Connection is still
+        // required somewhere (flat / cross / stair-landing); see the check below.
+
+        // Connection requirement: stair must have at least one valid connection,
+        // either on its flat side or at its cross-floor landing cell.
+        bool flatConnected = false;
+        {
+            var (fdx, fdy) = DirToOffset(flatDir);
+            int nx = cx + fdx, ny = cy + fdy;
+            if (nx >= 0 && nx < GW && ny >= 0 && ny < GH &&
+                TryGetPlacedPieceOnFloor(nx, ny, _floor, out var nbr))
+            {
+                Dir opp = PieceDB.Opposite(flatDir);
+                if (PieceDB.HasSameFloorOpening(nbr.Type, nbr.Rotation, opp))
+                    flatConnected = true;
+            }
+        }
+
+        bool crossConnected = false;
+        {
+            var (cdx, cdy) = DirToOffset(crossDir);
+            int ex = cx + cdx, ey = cy + cdy;
+            if (ex >= 0 && ex < GW && ey >= 0 && ey < GH &&
+                TryGetPlacedPieceOnFloor(ex, ey, destFloor, out var landing))
+            {
+                Dir opp = PieceDB.Opposite(crossDir);
+                if (PieceDB.HasSameFloorOpening(landing.Type, landing.Rotation, opp))
+                    crossConnected = true;
+            }
+        }
+
+        // Stair-to-stair: a new stair placed AT the landing cell of an existing stair on
+        // an adjacent floor is a valid connection (the player can step from the existing
+        // stair's top onto the new stair's bottom at the cell boundary). This is what
+        // makes "chained" stairs going up or down multiple floors work — and it lets a
+        // StairsUp meet a StairsDown directly without an intermediate corridor.
+        bool stairLanding = HasStairLandingNeighbor(cx, cy, _floor, type, rot);
+
+        int floorCount = _maze.Pieces.Count(p => p.Floor == _floor);
+        if (floorCount > 0 && !flatConnected && !crossConnected && !stairLanding)
+        {
+            SetStatus("Stair must connect to a neighbor opening (flat side) or a piece on the destination floor.");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Treat a stair landing on this floor as a connection from the perspective of `type`/`rot` at (cx,cy).
+    bool HasStairLandingNeighbor(int cx, int cy, int floor, PieceType type, int rot)
+    {
+        Dir myOpen = PieceDB.GetOpenings(type, rot);
+
+        // Case A: (cx, cy) IS itself a stair landing — i.e., a stair on an adjacent
+        // floor pops up directly into my cell. I'm connected if my opening faces back
+        // toward the stair (opposite of the stair's cross direction).
+        // Without this, placing a piece right AT a stair's landing cell — which is
+        // especially common near the grid border where there's no room to use an
+        // adjacent intermediate cell — would fail "must connect to an existing piece".
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            int sf = s.Floor + PieceDB.StairFloorDelta(s.Type);
+            if (sf != floor) continue;
+            Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+            var (sdx, sdy) = DirToOffset(scross);
+            if (s.X + sdx == cx && s.Y + sdy == cy)
+            {
+                Dir backToStair = PieceDB.Opposite(scross);
+                if ((myOpen & backToStair) != 0) return true;
+            }
+        }
+
+        // Case B: an adjacent cell on this floor is a stair landing — my opening into
+        // that cell acts as the connection (the landing's "virtual" piece).
+        foreach (Dir dir in new[] { Dir.N, Dir.S, Dir.E, Dir.W })
+        {
+            if ((myOpen & dir) == 0) continue;
+            var (dx, dz) = DirToOffset(dir);
+            int nx = cx + dx, ny = cy + dz;
+            foreach (var s in _maze.Pieces)
+            {
+                if (!PieceDB.IsStair(s.Type)) continue;
+                int sf = s.Floor + PieceDB.StairFloorDelta(s.Type);
+                if (sf != floor) continue;
+                Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+                var (sdx, sdy) = DirToOffset(scross);
+                if (s.X + sdx == nx && s.Y + sdy == ny) return true;
+            }
+        }
+        return false;
+    }
+
+    // For non-stair pieces: pick the rotation that connects to the most neighbors WHILE
+    // never producing an opening mismatch. Ties prefer the user's current `fallback`.
+    // If no rotation is valid, returns `fallback` (the placement call will then fail loudly).
+    int InferRotation(PieceType type, int x, int y, int floor, int fallback)
+    {
+        int bestRot     = fallback;
+        int bestScore   = -1;
+        bool foundValid = false;
+
+        // Iterate starting from `fallback` so ties resolve to the user's preferred rotation.
+        for (int i = 0; i < 4; i++)
+        {
+            int r = (fallback + i) % 4;
+            if (!IsRotationCompatibleAt(type, r, x, y, floor)) continue;
+
+            int score = CountConnectionsAt(type, r, x, y, floor);
+            if (!foundValid || score > bestScore)
+            {
+                bestRot    = r;
+                bestScore  = score;
+                foundValid = true;
+            }
+        }
+        return bestRot;
+    }
+
+    // True if rotation `r` at (x,y,floor) has no opening-mismatch with any placed neighbor.
+    // Mirrors IsValidPlacement's neighbor check but with no side effects.
+    // Mismatches are now allowed (dead-end neighbor faces are fine), so every rotation
+    // is "compatible" — InferRotation just picks whichever scores best on connection count.
+    bool IsRotationCompatibleAt(PieceType type, int r, int x, int y, int floor) => true;
+
+    // Counts how many of this piece's openings actually connect to a placed neighbor.
+    int CountConnectionsAt(PieceType type, int r, int x, int y, int floor)
+    {
+        Dir openings = PieceDB.GetOpenings(type, r);
+        int count    = 0;
+        foreach (Dir dir in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+        {
+            if ((openings & dir) == 0) continue;
+            var (dx, dz) = DirToOffset(dir);
+            int nx = x + dx, ny = y + dz;
+            if (nx < 0 || nx >= GW || ny < 0 || ny >= GH) continue;
+            if (!TryGetPlacedPieceOnFloor(nx, ny, floor, out var nb)) continue;
+            Dir opp = PieceDB.Opposite(dir);
+            if (PieceDB.HasSameFloorOpening(nb.Type, nb.Rotation, opp)) count++;
+        }
+
+        // Also count connections through stair landings (matches the validation in
+        // HasStairLandingNeighbor). Without this the auto-rotation didn't know that a
+        // piece placed AT the top/bottom of a stair chain should orient itself to face
+        // back toward the stair — so corridors at chain endpoints stayed at fallback
+        // rotation and you'd have to spin them by hand.
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            int sf = s.Floor + PieceDB.StairFloorDelta(s.Type);
+            if (sf != floor) continue;
+            Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+            var (sdx, sdy) = DirToOffset(scross);
+            int landingX = s.X + sdx, landingY = s.Y + sdy;
+
+            // Case A: my cell IS the stair's landing — opening at back-to-stair direction connects.
+            if (landingX == x && landingY == y)
+            {
+                Dir backDir = PieceDB.Opposite(scross);
+                if ((openings & backDir) != 0) count++;
+            }
+            // Case B: a neighbor cell of mine is a stair landing — my opening points to it.
+            foreach (Dir dir in new[] { Dir.N, Dir.E, Dir.S, Dir.W })
+            {
+                if ((openings & dir) == 0) continue;
+                var (dx, dz) = DirToOffset(dir);
+                if (x + dx == landingX && y + dz == landingY) { count++; break; }
+            }
+        }
+        return count;
+    }
+
+    // For stair pieces: pick the rotation that maximises connections at the flat
+    // (same-floor) side and at the cross-floor landing cell.
+    int InferStairRotation(PieceType type, int x, int y, int floor, int fallback)
+    {
+        int destFloor = floor + PieceDB.StairFloorDelta(type);
+
+        int bestRot     = fallback;
+        int bestScore   = -1;
+        bool foundValid = false;
+
+        for (int i = 0; i < 4; i++)
+        {
+            // Iterate starting from `fallback` so ties prefer the user's current choice.
+            int r = (fallback + i) % 4;
+
+            // Reject rotations that would cause an opening-mismatch with a same-floor
+            // neighbor on the stair's side walls or flat side. Otherwise the auto-rotate
+            // could "pick" a rotation that immediately fails IsValidStairPlacement and the
+            // click silently does nothing — the bug that made the "two pieces on two
+            // floors with a stair between them" scenario feel impossible to set up.
+            if (!IsStairRotationCompatible(type, r, x, y, floor)) continue;
+
+            int score = 0;
+
+            Dir flatDir = PieceDB.GetStairFlatDir(type, r);
+            var (fdx, fdy) = DirToOffset(flatDir);
+            int nx = x + fdx, ny = y + fdy;
+            if (nx >= 0 && nx < GW && ny >= 0 && ny < GH &&
+                TryGetPlacedPieceOnFloor(nx, ny, floor, out var nbr))
+            {
+                Dir opp = PieceDB.Opposite(flatDir);
+                if (PieceDB.HasSameFloorOpening(nbr.Type, nbr.Rotation, opp))
+                    score += 2;
+            }
+
+            Dir crossDir = PieceDB.GetStairCrossDir(type, r);
+            var (cdx, cdy) = DirToOffset(crossDir);
+            int ex = x + cdx, ey = y + cdy;
+            if (ex >= 0 && ex < GW && ey >= 0 && ey < GH &&
+                TryGetPlacedPieceOnFloor(ex, ey, destFloor, out var landing))
+            {
+                Dir opp = PieceDB.Opposite(crossDir);
+                if (PieceDB.HasSameFloorOpening(landing.Type, landing.Rotation, opp))
+                    score += 1;
+            }
+
+            // Stair-on-stair link: if my flat side faces a stair's landing cell on this
+            // floor — meaning my flat opening connects directly to another stair's top —
+            // weight this rotation highly so chained stairs auto-orient correctly.
+            foreach (var s in _maze.Pieces)
+            {
+                if (!PieceDB.IsStair(s.Type)) continue;
+                int sf = s.Floor + PieceDB.StairFloorDelta(s.Type);
+                if (sf != floor) continue;
+                Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+                var (sdx, sdy) = DirToOffset(scross);
+                // My flat-side neighbor cell == that stair's landing cell?
+                if (s.X + sdx == nx && s.Y + sdy == ny) { score += 2; break; }
+                // Or my OWN cell IS that stair's landing and my flat faces back toward it?
+                if (s.X + sdx == x && s.Y + sdy == y &&
+                    PieceDB.Opposite(scross) == flatDir) { score += 2; break; }
+            }
+
+            if (!foundValid || score > bestScore)
+            {
+                bestRot    = r;
+                bestScore  = score;
+                foundValid = true;
+            }
+        }
+
+        return bestRot;
+    }
+
+    // Opening mismatches are now allowed (they become dead-end side walls), so the only
+    // rotations a stair must avoid are the ones that would create a direct Up↔Down chain.
+    bool IsStairRotationCompatible(PieceType type, int r, int x, int y, int floor)
+        => !ConnectsToOppositeStair(x, y, type, r, floor);
+
+    // True iff placing this stair at (x,y) rotation `r` on `floor` would form an
+    // INVALID chain configuration. Chains must be unidirectional: a continuous run of
+    // same-type stairs all pointing the same way. Anything that diverges, peaks,
+    // overlaps, or mixes types is rejected here.
+    //
+    // Five rejected configurations:
+    //   A. My cell IS an opposite stair's cross-floor landing AND my flat opens back
+    //      toward it — its low end meets my low end at the boundary (a "V" shape).
+    //   B. My cross-floor landing IS the cell of an opposite stair AND its flat opens
+    //      back toward me — peaks meet at the upper-floor boundary ("inverted V").
+    //   C. An opposite stair sits at MY XY on the adjacent floor whose Y range
+    //      overlaps mine — the two stair geometries would occupy the same 3D volume
+    //      (stacked back-to-back).
+    //   D. SAME-FLOOR flat-to-flat adjacency with an opposite-delta stair. The two
+    //      pieces would share a boundary at home-floor Y, forming a mixed-type
+    //      chain. Geometry is technically valid but DungeonBuilder's wall-suppression
+    //      rules are written for same-type chains only, so the gameplay shows an
+    //      invisible wall at the seam. Easier to enforce same-type chains in the
+    //      editor than to special-case mixed chains in the renderer + collision.
+    //   E. SAME-TYPE inverted V (∧). Two same-type stairs at adjacent same-floor
+    //      cells with their HIGH-END directions facing each other. Peaks meet at
+    //      the boundary and the chain "reverses direction" mid-flight, which isn't
+    //      a chain at all — it's a triangular peak. Reject so chains cascade
+    //      unidirectionally in the expected order (down for StairsDown, up for
+    //      StairsUp), keeping the all-purple / all-cyan chain coloring honest.
+    bool ConnectsToOppositeStair(int x, int y, PieceType type, int r, int floor)
+    {
+        if (!PieceDB.IsStair(type)) return false;
+        int myDelta = PieceDB.StairFloorDelta(type);
+        Dir myFlat  = PieceDB.GetStairFlatDir(type, r);
+        Dir myCross = PieceDB.GetStairCrossDir(type, r);
+
+        // Case A: my cell is an opposite stair's landing.
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            if (PieceDB.StairFloorDelta(s.Type) == myDelta) continue;   // same direction OK
+            int sDestFloor = s.Floor + PieceDB.StairFloorDelta(s.Type);
+            if (sDestFloor != floor) continue;
+            Dir scross = PieceDB.GetStairCrossDir(s.Type, s.Rotation);
+            var (sdx, sdy) = DirToOffset(scross);
+            if (s.X + sdx == x && s.Y + sdy == y &&
+                myFlat == PieceDB.Opposite(scross))
+                return true;
+        }
+
+        // Case B: my landing is an opposite stair's cell.
+        int myDestFloor = floor + myDelta;
+        var (mdx, mdy)  = DirToOffset(myCross);
+        int landX = x + mdx, landY = y + mdy;
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            if (PieceDB.StairFloorDelta(s.Type) == myDelta) continue;
+            if (s.Floor != myDestFloor) continue;
+            if (s.X != landX || s.Y != landY) continue;
+            Dir sflat = PieceDB.GetStairFlatDir(s.Type, s.Rotation);
+            if (sflat == PieceDB.Opposite(myCross)) return true;
+        }
+
+        // Case C: opposite-direction stair stacked at my exact XY on the floor where
+        // our spans overlap. A StairsUp on floor F (span F→F+1) and a StairsDown on
+        // floor F+1 (span F→F+1) occupy the same Y range at the same cell.
+        foreach (var s in _maze.Pieces)
+        {
+            if (!PieceDB.IsStair(s.Type)) continue;
+            if (PieceDB.StairFloorDelta(s.Type) == myDelta) continue;
+            if (s.X != x || s.Y != y) continue;
+            if (s.Floor == myDestFloor) return true;   // opposite stair sitting on my destination floor at same XY
+        }
+
+        // Case D: same-floor flat-to-flat adjacency with an opposite-delta stair. My
+        // flat side opens directly onto a cell that hosts an opposite stair whose
+        // flat points BACK at me — the two pieces would share a boundary at
+        // home-floor Y, forming a mixed-type chain. (See comment above the method.)
+        {
+            var (fdx, fdy) = DirToOffset(myFlat);
+            int fx = x + fdx, fy = y + fdy;
+            if (TryGetPlacedPieceOnFloor(fx, fy, floor, out var fNbr) &&
+                PieceDB.IsStair(fNbr.Type) &&
+                PieceDB.StairFloorDelta(fNbr.Type) != myDelta &&
+                PieceDB.GetStairFlatDir(fNbr.Type, fNbr.Rotation) == PieceDB.Opposite(myFlat))
+                return true;
+        }
+
+        // Case E: same-type inverted V (∧). Two same-type stairs on the same home floor
+        // at adjacent cells with their HIGH-END directions pointing at each other —
+        // their peaks meet at the shared boundary and the result is a "peak" instead
+        // of a continuous descent/ascent. For StairsDown the high end is the flat
+        // direction (so this is flat-to-flat with rot 0 vs rot 2); for StairsUp the
+        // high end is the cross direction (so this is cross-to-cross). The user
+        // builds chains by stepping unidirectionally — peaks are visually confusing
+        // and break the "all purple / all cyan chain" coloring rule.
+        {
+            Dir myHigh = myDelta > 0 ? myCross : myFlat;
+            var (hdx, hdy) = DirToOffset(myHigh);
+            int hx = x + hdx, hy = y + hdy;
+            if (TryGetPlacedPieceOnFloor(hx, hy, floor, out var hNbr) &&
+                hNbr.Type == type)   // same type ⇒ same delta + same high-direction formula
+            {
+                Dir nbrHigh = myDelta > 0
+                    ? PieceDB.GetStairCrossDir(hNbr.Type, hNbr.Rotation)
+                    : PieceDB.GetStairFlatDir(hNbr.Type, hNbr.Rotation);
+                if (nbrHigh == PieceDB.Opposite(myHigh))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    static int PopCount(int n)
+    {
+        int c = 0;
+        while (n != 0) { c += n & 1; n >>= 1; }
+        return c;
+    }
+
+    bool TryGetPlacedPiece(int cx, int cy, out MazePiece piece)
+        => TryGetPlacedPieceOnFloor(cx, cy, _floor, out piece);
+
+    // internal (not private): test/TestRoomPitLogic.cs calls this directly to verify
+    // pit-footprint occupancy headlessly. Pure lookup over _maze.Pieces — no Node
+    // access, so it's safe to call on an instance that never entered the scene tree.
+    internal bool TryGetPlacedPieceOnFloor(int cx, int cy, int floor, out MazePiece piece)
+    {
+        // Exact match first — the common case.
+        int idx = _maze.Pieces.FindIndex(p => p.X == cx && p.Y == cy && p.Floor == floor);
+        if (idx >= 0) { piece = _maze.Pieces[idx]; return true; }
+
+        // Multi-cell pieces (Pit) claim cells other than their anchor.
+        foreach (var p in _maze.Pieces)
+        {
+            if (!PieceDB.IsMultiCell(p.Type)) continue;
+            if (PitBuilder.Occupies(p, cx, cy, floor, FlMin, FlMax)) { piece = p; return true; }
+        }
+
+        piece = default!;
+        return false;
+    }
+
+    /// Like TryGetPlacedPiece(cx, cy) but also resolves stairs whose OTHER endpoint
+    /// touches the active floor. A StairsUp at _floor-1 lands on _floor; a StairsDown
+    /// at _floor+1 lands on _floor. From the user's POV they're "on this floor"
+    /// (you can see them, they're highlighted, you should be able to delete them).
+    ///
+    /// Priority order:
+    ///   1. Direct piece at (cx, cy, _floor)
+    ///   2. StairsUp/legacy Stairs at (cx, cy, _floor - 1) whose high end lands here
+    ///   3. StairsDown at (cx, cy, _floor + 1) whose low end lands here
+    ///
+    /// Note: same-floor placement validation (IsValidPlacement etc.) still uses
+    /// TryGetPlacedPieceOnFloor with an explicit floor argument — those checks need
+    /// "is there a piece literally on THIS floor at this cell", not the cross-floor
+    /// view. This helper is only for the click/delete UI path.
+    bool TryGetActiveFloorPiece(int cx, int cy, out MazePiece piece)
+    {
+        if (TryGetPlacedPieceOnFloor(cx, cy, _floor, out piece))
+            return true;
+
+        if (TryGetPlacedPieceOnFloor(cx, cy, _floor - 1, out var below) &&
+            PieceDB.IsStair(below.Type) && PieceDB.StairFloorDelta(below.Type) > 0)
+        {
+            piece = below;
+            return true;
+        }
+
+        if (TryGetPlacedPieceOnFloor(cx, cy, _floor + 1, out var above) &&
+            PieceDB.IsStair(above.Type) && PieceDB.StairFloorDelta(above.Type) < 0)
+        {
+            piece = above;
+            return true;
+        }
+
+        piece = default!;
+        return false;
+    }
+
+    static (int dx, int dz) DirToOffset(Dir dir) => dir switch
+    {
+        Dir.N => (0, -1),
+        Dir.S => (0,  1),
+        Dir.E => (1,  0),
+        _     => (-1, 0),
+    };
+}

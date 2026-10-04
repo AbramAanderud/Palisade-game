@@ -1,0 +1,47 @@
+using Godot;
+using System.Collections.Generic;
+
+/// res://scripts/PieceVariants.cs
+/// Deterministic per-piece visual variants. Applied AFTER DungeonBuilder
+/// builds each cell: swaps mesh materials and adds decorative child nodes.
+/// NEVER touches piece geometry or collision (fragile — see CLAUDE.md).
+/// Determinism: both multiplayer clients hold identical MazeData, so a pure
+/// hash of piece fields yields identical variants with no shared seed.
+public partial class PieceVariants : Node
+{
+    public const int VariantCount = 4;
+
+    // FNV-1a — stable across runs and machines (never use GetHashCode here).
+    public static int Fnv(params int[] values)
+    {
+        unchecked
+        {
+            uint h = 2166136261;
+            foreach (int v in values) { h ^= (uint)v; h *= 16777619; }
+            return (int)(h & 0x7FFFFFFF);
+        }
+    }
+
+    public static int VariantIndex(MazePiece p, int count, int salt = 0)
+        => Fnv(p.X, p.Y, p.Floor, (int)p.Type, p.Rotation, salt) % count;
+
+    /// Entry point — called once from DungeonBuilder.Build.
+    public static void Apply(Node3D builder, IEnumerable<MazePiece> pieces)
+    {
+        foreach (var p in pieces)
+        {
+            var body = builder.GetNodeOrNull<StaticBody3D>($"Cell_{p.X}_{p.Y}_{p.Floor}");
+            if (body == null) continue;
+            int v = VariantIndex(p, VariantCount);
+            ApplyVariant(builder, body, p, v);
+        }
+    }
+
+    /// Task 2 scope: establishes the deterministic hook only. Intentionally a
+    /// documented no-op — Tasks 3/4/6 replace this body with real variant
+    /// material sets, decor, and props keyed off `variant`. Do not add
+    /// speculative tint/material logic here ahead of those tasks.
+    static void ApplyVariant(Node3D builder, StaticBody3D body, MazePiece p, int variant)
+    {
+    }
+}

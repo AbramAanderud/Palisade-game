@@ -1,0 +1,94 @@
+using Godot;
+using System.Collections.Generic;
+using System.Linq;
+
+/// Task 7 (Polish): visual QA capture for manor furniture placement. Builds
+/// the same long Straight-piece corridor as TestFurnitureCollision.cs (a
+/// "Straight-heavy" capture, as the task brief asks for alongside
+/// ArenaConnTest) and discovers every placed table/bookshelf/painting via
+/// the "ManorFurnitureVisual" group (tagged in PieceVariants.cs) instead of
+/// hardcoding world coordinates — camera waypoints stay correct even if the
+/// Fnv-gated placement changes.
+public partial class TestManorCapture : Node3D
+{
+    const float CellSize = DungeonBuilder.CellSize;
+    const int   CellX    = 5;
+    const int   RunLen   = 20;
+
+    int _frame = 0;
+    List<(Vector3 pos, Vector3 look, string label)> _cameras = new();
+
+    public override void _Ready()
+    {
+        var env = new WorldEnvironment
+        {
+            Environment = new Godot.Environment
+            {
+                AmbientLightSource = Godot.Environment.AmbientSource.Color,
+                AmbientLightColor  = new Color(0.4f, 0.4f, 0.4f),
+                AmbientLightEnergy = 1.0f,
+            }
+        };
+        AddChild(env);
+
+        var data = new MazeData { Name = "ManorCapture" };
+        data.Pieces = new List<MazePiece> { new() { Type = PieceType.Start, X = CellX, Y = 0, Floor = 0, Rotation = 0 } };
+        for (int y = 1; y <= RunLen; y++)
+            data.Pieces.Add(new MazePiece { Type = PieceType.Straight, X = CellX, Y = y, Floor = 0, Rotation = 0 });
+        data.Pieces.Add(new MazePiece { Type = PieceType.Exit, X = CellX, Y = RunLen + 1, Floor = 0, Rotation = 0 });
+
+        var builder = new DungeonBuilder { Name = "Maze" };
+        AddChild(builder);
+        builder.Build(data);
+
+        float cx = CellX * CellSize + CellSize * 0.5f;
+
+        // Wide establishing shot down the whole corridor first.
+        _cameras.Add((new Vector3(cx, 1.7f, 8f), new Vector3(cx, 1.6f, 60f), "wide_hall"));
+
+        var visuals = GetTree().GetNodesInGroup("ManorFurnitureVisual").OfType<Node3D>().OrderBy(n => n.GlobalPosition.Z).ToList();
+        GD.Print($"[TestManorCapture] {visuals.Count} manor furniture visuals found");
+        foreach (var n in visuals)
+        {
+            var pos = n.GlobalPosition;
+            bool isPainting = n.IsInGroup("ManorPainting");
+            string label = isPainting ? "painting" : n.Name;
+            GD.Print($"[TestManorCapture] {n.Name} pos=({pos.X:F2},{pos.Y:F2},{pos.Z:F2}) painting={isPainting}");
+
+            float camY = isPainting ? Mathf.Max(pos.Y - 0.3f, 1.2f) : 1.7f;
+            var camPos = new Vector3(cx, camY, pos.Z - 3.5f);
+            var lookAt = new Vector3(pos.X, isPainting ? pos.Y : 1.4f, pos.Z);
+            _cameras.Add((camPos, lookAt, $"{label}_z{pos.Z:F0}"));
+        }
+
+        // Close centreline walk shot near the far end, for a second general read.
+        _cameras.Add((new Vector3(cx, 1.7f, RunLen * CellSize - 10f), new Vector3(cx, 1.6f, RunLen * CellSize + 5f), "far_hall"));
+
+        GD.Print($"[TestManorCapture] {_cameras.Count} camera waypoints queued");
+        SetupCamera(0);
+    }
+
+    void SetupCamera(int idx)
+    {
+        var old = GetNodeOrNull<Camera3D>("Cam");
+        old?.QueueFree();
+        var (pos, look, label) = _cameras[idx];
+        var cam = new Camera3D { Name = "Cam", Current = true };
+        cam.Position = pos;
+        AddChild(cam);
+        cam.LookAt(look);
+        cam.Current = true;
+        GD.Print($"[TestManorCapture] camera[{idx}]={label} pos=({pos.X:F2},{pos.Y:F2},{pos.Z:F2})");
+    }
+
+    public override void _Process(double delta)
+    {
+        _frame++;
+        if (_frame < 2) return;
+        int camIdx = (_frame - 2) / 2;
+        if (camIdx < _cameras.Count)
+            SetupCamera(camIdx);
+        else
+            GetTree().Quit();
+    }
+}

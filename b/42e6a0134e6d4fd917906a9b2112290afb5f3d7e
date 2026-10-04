@@ -1,0 +1,1581 @@
+using Godot;
+using System;
+using System.Collections.Generic;
+
+/// res://scripts/ArenaBuilder.cs
+/// Builds a tall circular arena room that bridges two dungeon exits.
+///
+/// Geometry:
+///   - Walls: N=32 polygon cylinder, wall height = 2 × CellHeight
+///   - No ceiling: open to a real night-sky HDRI on the environment
+///   - Two arch doorways matching corridor cross-section (width=OpeningW, vault arch)
+///   - Doorways face north (toward Maze A exit) and south (toward Maze B exit)
+///
+/// Gap elimination: arena is positioned so its face vertices lie exactly flush
+/// with the exit tile south/north faces (no float gap).
+public partial class ArenaBuilder : Node3D
+{
+    // Polish Task 5: raised from 2×CellHeight (28m) to 36m so the columns have
+    // room to rise from the tier ledge to the dome spring instead of reading
+    // stubby. Shelf/tier altitude (topY/tierY) stays retied to TierUnitH-14
+    // so the shelves themselves don't move — the extra height all goes into
+    // the panel band + column run above them. Nothing outside ArenaBuilder
+    // references ArenaWallH (confirmed via grep) — no alias needed.
+    //
+    // ── VERTICAL TIER STACKING ────────────────────────────────────────────────
+    // One tier unit = ShelfBandH of bookshelf ring, then a bare panel band with
+    // the balustrade + column run above it. Tiers repeats that unit upward, so
+    // the wall grows to TierUnitH × Tiers and the shelf/column pattern reads the
+    // same at every level.
+    //
+    // Tiers = 1 reproduces the pre-stacking arena EXACTLY (36m wall, shelves to
+    // 22m, columns 22→36m). That identity is deliberate: it is the A/B baseline
+    // for the perf capture, and it is also the correctness check on this
+    // refactor. Do not let Tiers=1 drift.
+    //
+    // column_a's PropLibrary scale factor (14.0) is the column-band height
+    // TierUnitH - ShelfBandH, which is per-tier and therefore unchanged by
+    // stacking — no PropLibrary edit is needed when Tiers changes.
+    public const int   Tiers      = 3;
+
+    // ── Standable column tops ─────────────────────────────────────────────────
+    // MEASURED, not assumed: column_a's GLB origin is at the model's CENTRE, so
+    // after PropLibrary's 14x height-anchor its AABB runs Y -7.000 .. +7.003.
+    // A column batched at tierY therefore spans tierY-7 .. tierY+7 and its
+    // capital tops out at tierY + ColumnHalfH = 29m — NOT at tierY + 14 = 36m,
+    // which is what PropLibrary's "columns span tier -> dome-spring (14m)"
+    // comment reads like if you assume a base-anchored origin. Re-measure with
+    // a GetLocalAabb probe if column_a.glb is ever regenerated.
+    const float ColumnHalfH   = 7.0f;
+    // The capital's full AABB is ~5.26 x 5.43m. The platform is deliberately
+    // narrower so the player never stands on empty air past the silhouette.
+    const float ColumnTopW    = 3.6f;
+    const float ColumnTopThk  = 0.5f;
+    public const float TierUnitH  = 36f;
+    public const float ShelfBandH = TierUnitH - 14f;      // 22m of shelves per tier
+    public const float ArenaWallH = TierUnitH * Tiers;
+    public const float Radius   = 30f;
+
+    /// Radius of bare floor kept clear of grass at the arena centre. Scenes
+    /// that place an altar set this to AltarBuilder.BaseRadius before calling
+    /// Build, so blades do not grow up through its steps. Default 0 (training
+    /// arena has no altar and wants unbroken turf).
+    public float GrassInnerRadius { get; set; } = 0f;
+    const float OpeningW        = DungeonBuilder.OpeningW;         // 6.0 m
+    const float ArchRise        = DungeonBuilder.ArchRise;         // 4.0 m
+    const float SpringY         = DungeonBuilder.CellHeight;       // arch spring = normal CellHeight
+    const int   Sides           = 32;
+    const int   ArchSegs        = 10;   // arch subdivisions
+
+    // Angle offset so face 0 is centred exactly on north (±π/Sides from north)
+    static float FaceHalf => Mathf.Pi / Sides;
+
+    // The north face of the polygon reaches exactly this far from centre (apothem)
+    public static float Apothem => Radius * Mathf.Cos(FaceHalf);
+
+    // ── Shaders (duplicated from DungeonBuilder for self-contained build) ─────
+    const string StoneShaderSrc = @"
+shader_type spatial;
+render_mode diffuse_burley, specular_schlick_ggx, cull_disabled;
+uniform vec3 base_color : source_color = vec3(0.42, 0.37, 0.30);
+uniform vec3 mortar_color : source_color = vec3(0.22, 0.20, 0.18);
+uniform float brick_scale = 0.28;
+uniform float mortar_w = 0.07;
+varying vec3 wpos; varying vec3 wnorm;
+void vertex() {
+    wpos  = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+    wnorm = normalize((MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz);
+}
+float brick_mask(vec2 uv) {
+    float row = floor(uv.y);
+    vec2 b = fract(vec2(uv.x + mod(row,2.0)*0.5, uv.y));
+    return step(mortar_w,b.x)*step(b.x,1.0-mortar_w)*step(mortar_w,b.y)*step(b.y,1.0-mortar_w);
+}
+float hash21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+void fragment(){
+    vec3 n=abs(wnorm); vec2 uv; vec2 bid;
+    if(n.y>n.x&&n.y>n.z){uv=wpos.xz*brick_scale;bid=floor(vec2(uv.x+mod(floor(uv.y),2.0)*0.5,uv.y));}
+    else if(n.x>n.z){vec2 r=wpos.zy*brick_scale*vec2(0.6,1.0);uv=r;bid=floor(vec2(r.x+mod(floor(r.y),2.0)*0.5,r.y));}
+    else{vec2 r=wpos.xy*brick_scale*vec2(0.6,1.0);uv=r;bid=floor(vec2(r.x+mod(floor(r.y),2.0)*0.5,r.y));}
+    float ib=brick_mask(uv); float hv=(hash21(bid)-0.5)*0.18;
+    vec3 bc=clamp(base_color+vec3(hv,hv*0.85,hv*0.65),vec3(0.0),vec3(1.0));
+    ALBEDO=mix(mortar_color,bc,ib); ROUGHNESS=0.93; METALLIC=0.0;
+}";
+    const string FloorShaderSrc = @"
+shader_type spatial;
+render_mode diffuse_burley, specular_schlick_ggx, cull_disabled;
+uniform vec3 stone_color : source_color = vec3(0.32, 0.29, 0.25);
+uniform vec3 grout_color : source_color = vec3(0.18, 0.17, 0.15);
+uniform float tile_scale = 0.20;
+varying vec3 wpos;
+void vertex(){wpos=(MODEL_MATRIX*vec4(VERTEX,1.0)).xyz;}
+float hash21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+void fragment(){
+    vec2 uv=wpos.xz*tile_scale; vec2 cell=floor(uv); vec2 f=fract(uv);
+    float gap=0.09;
+    float it=step(gap,f.x)*step(f.x,1.0-gap)*step(gap,f.y)*step(f.y,1.0-gap);
+    float hv=(hash21(cell)-0.5)*0.12;
+    vec3 sc=clamp(stone_color+vec3(hv),vec3(0.0),vec3(1.0));
+    ALBEDO=mix(grout_color,sc,it); ROUGHNESS=0.97; METALLIC=0.0;
+}";
+
+    // ── Stained-glass dome shader (leaded panes, sky glows through) ────────────
+    const string StainedGlassShaderSrc = @"
+shader_type spatial;
+render_mode blend_mix, depth_draw_opaque, cull_disabled, diffuse_burley, specular_schlick_ggx;
+uniform float alpha_base = 0.42;
+// Dome-squash pivot, in the DomeGlass mesh's own local space (== ArenaBuilder
+// local space, since the MeshInstance3D carries no extra transform) — must
+// equal ArenaWallH (the wall-top / dome-spring Y) or the leaded-pane grid's
+// polar centre drifts off the actual dome apex. Was hardcoded to a stale
+// 22.0 (a leftover from an earlier WallH value); now set from C# in
+// AddStainedGlassDome() so it always tracks ArenaWallH.
+uniform float spring_y = 36.0;
+varying vec3 lpos;
+void vertex(){ lpos = VERTEX; }
+float hash13(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+void fragment(){
+    // leaded cells: spherical-ish grid from direction angles
+    vec3 dir = normalize(lpos - vec3(0.0, spring_y, 0.0));
+    float az = atan(dir.z, dir.x) * 6.0;
+    float el = acos(clamp(dir.y, -1.0, 1.0)) * 7.0;
+    vec2 cell = floor(vec2(az, el));
+    vec2 f = fract(vec2(az, el));
+    float lead = step(f.x, 0.06) + step(0.94, f.x) + step(f.y, 0.06) + step(0.94, f.y);
+    // warm pane tints: amber / rose / pale gold per cell
+    float r = hash13(vec3(cell, 3.0));
+    vec3 pane = r < 0.4 ? vec3(0.95, 0.62, 0.25) : (r < 0.7 ? vec3(0.85, 0.35, 0.30) : vec3(0.98, 0.85, 0.55));
+    ALBEDO = pane * 0.25;
+    EMISSION = pane * 0.06;                 // faint inner glow
+    ALPHA = clamp(lead, 0.0, 1.0) > 0.5 ? 0.95 : alpha_base;   // lead lines near-opaque
+    ROUGHNESS = 0.25; METALLIC = clamp(lead, 0.0, 1.0) * 0.8;
+}";
+
+    ShaderMaterial? _stoneMat, _floorMat;
+    ShaderMaterial StoneMat() { if (_stoneMat!=null&&GodotObject.IsInstanceValid(_stoneMat)) return _stoneMat; var sh=new Shader{Code=StoneShaderSrc}; return _stoneMat=new ShaderMaterial{Shader=sh}; }
+    ShaderMaterial FloorMat() { if (_floorMat!=null&&GodotObject.IsInstanceValid(_floorMat)) return _floorMat; var sh=new Shader{Code=FloorShaderSrc}; return _floorMat=new ShaderMaterial{Shader=sh}; }
+
+    // ── Real night sky: HDRI panorama on the scene environment (renders at
+    //    infinity behind everything — "the proper distance away"). Uses the
+    //    CC0 PolyHaven "satara_night" Milky Way photo. If the HDR file is
+    //    missing on this machine, the environment is left untouched.
+    void SetupNightSky()
+    {
+        if (!IsInsideTree()) { CallDeferred(nameof(SetupNightSky)); return; }
+        const string skyPath = "res://assets/img/sky/satara_night_4k.hdr";
+        var abs = ProjectSettings.GlobalizePath(skyPath);
+        var img = new Image();
+        if (img.Load(abs) != Error.Ok)
+        {
+            img = LoadImageResourceFallback(skyPath);
+            if (img == null) return;      // HDR data is linear — no sRGB convert
+        }
+        var sky = new Sky
+        {
+            SkyMaterial  = new PanoramaSkyMaterial { Panorama = ImageTexture.CreateFromImage(img) },
+            RadianceSize = Sky.RadianceSizeEnum.Size256,
+        };
+        var env = GetViewport()?.World3D?.Environment;
+        if (env == null)
+        {
+            env = new Godot.Environment();
+            AddChild(new WorldEnvironment { Environment = env });
+        }
+        env.BackgroundMode = Godot.Environment.BGMode.Sky;
+        env.Sky = sky;
+        env.BackgroundEnergyMultiplier = 2.2f;   // real night HDRIs are dim; lift for readable stars
+    }
+
+    // ── Grass floor: PolyHaven texture when present, procedural grass fallback ─
+    const string GrassShaderSrc = @"
+shader_type spatial;
+render_mode diffuse_burley, specular_schlick_ggx, cull_disabled;
+varying vec3 wpos;
+void vertex(){wpos=(MODEL_MATRIX*vec4(VERTEX,1.0)).xyz;}
+float hash21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float vn2(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
+ return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x),mix(hash21(i+vec2(0,1)),hash21(i+vec2(1,1)),f.x),f.y);}
+void fragment(){
+    vec2 uv=wpos.xz;
+    float patch =vn2(uv*0.35);                        // broad tonal patches
+    float blades=vn2(uv*7.0)*0.6+vn2(uv*23.0)*0.4;    // fine blade detail
+    vec3 deep=vec3(0.03,0.06,0.025), lush=vec3(0.06,0.13,0.04), dry=vec3(0.09,0.11,0.035);
+    vec3 g=mix(deep,lush,patch);
+    g=mix(g,dry,smoothstep(0.55,0.9,vn2(uv*0.13))*0.5);
+    g*=0.75+0.5*blades;
+    ALBEDO=g; ROUGHNESS=0.95; METALLIC=0.0;
+}";
+
+    Material? _grassMat;
+    Material ArenaFloorMat()
+    {
+        if (_grassMat != null && GodotObject.IsInstanceValid(_grassMat)) return _grassMat;
+        var diff = LoadTexture("res://assets/img/arena_redesign/leafy_grass/diffuse.jpg");
+        if (diff != null)
+        {
+            GD.Print("[ArenaBuilder] grass texture loaded");
+            return _grassMat = new StandardMaterial3D
+            {
+                AlbedoTexture = diff,
+                // The GrassField blades cover this now, so the floor's only job
+                // is to make whatever peeks between them read as shaded turf
+                // rather than bare ground: tint toward the blade root colour
+                // and darken. Tiling also tightened (0.12 -> 0.30, i.e. an 8.3m
+                // repeat -> 3.3m) so the photo shows blade-scale detail instead
+                // of a stretched blur.
+                AlbedoColor   = new Color(0.40f, 0.52f, 0.32f),
+                Roughness     = 0.95f,
+                Uv1Triplanar  = true,
+                Uv1Scale      = new Vector3(0.30f, 0.30f, 0.30f),
+            };
+        }
+        GD.Print("[ArenaBuilder] grass texture missing — using procedural grass");
+        return _grassMat = new ShaderMaterial { Shader = new Shader { Code = GrassShaderSrc } };
+    }
+
+    // Export builds ship only the imported .ctex + .remap (no source bytes), so a
+    // GlobalizePath + Image.Load miss here doesn't mean the asset is really
+    // missing — retry through the resource loader before the caller falls back.
+    static Image? LoadImageResourceFallback(string resPath)
+    {
+        if (!ResourceLoader.Exists(resPath)) return null;
+        var img = GD.Load<Texture2D>(resPath)?.GetImage();
+        if (img != null) img.Decompress();   // GetImage() may be compressed
+        return img;
+    }
+
+    static ImageTexture? LoadTexture(string resPath)
+    {
+        var abs = ProjectSettings.GlobalizePath(resPath);
+        var img = new Image();
+        if (img.Load(abs) != Error.Ok)
+        {
+            img = LoadImageResourceFallback(resPath);
+            if (img == null) return null;
+        }
+        img.SrgbToLinear();   // runtime-loaded albedo is sampled as linear; pre-convert
+        img.GenerateMipmaps();
+        return ImageTexture.CreateFromImage(img);
+    }
+
+    // ── Wall paneling behind the bookshelves (BlenderKit "Wooden Panels") ──────
+    Material? _panelMat;
+    Material PanelWallMat()
+    {
+        if (_panelMat != null && GodotObject.IsInstanceValid(_panelMat)) return _panelMat;
+        var tex = LoadTexture("res://assets/img/mats/woodpanel/wooden_panels_diff.png.jpg");
+        if (tex == null) return StoneMat();   // asset missing — keep stone
+        return _panelMat = new StandardMaterial3D
+        {
+            AlbedoTexture = tex,
+            // dark mahogany reads as void after sRGB->linear in dim light; lift it
+            AlbedoColor   = new Color(1.9f, 1.8f, 1.7f),
+            Roughness     = 0.85f,
+            Uv1Triplanar  = true,
+            Uv1Scale      = new Vector3(0.4f, 0.4f, 0.4f),
+            // arena wall ring is wound facing outward (masked by every other
+            // material here being cull_disabled) — render both sides
+            CullMode      = BaseMaterial3D.CullModeEnum.Disabled,
+        };
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  PUBLIC API
+    // Build the arena room centred at 'centre' (local coords, parent sets world pos).
+    // openNorth=true: leave north arch open (toward Maze A)
+    // openSouth=true: leave south arch open (toward Maze B)
+    // ══════════════════════════════════════════════════════════════════════════
+    public void Build(Vector3 centre, bool openNorth = true, bool openSouth = true)
+    {
+        Position = centre;
+
+        var wallST  = MakeST();
+        var floorST = MakeST();
+        var domeST  = MakeST();
+
+        // Polygon vertices with half-face offset so face 0 is centred on north
+        var outer = new Vector3[Sides];
+        for (int i = 0; i < Sides; i++)
+        {
+            float a = 2f * Mathf.Pi * i / Sides - FaceHalf;
+            outer[i] = new Vector3(Mathf.Sin(a) * Radius, 0f, -Mathf.Cos(a) * Radius);
+        }
+
+        // Half-angle of the opening in radians: enough to span OpeningW at the wall
+        float openHalfAngle = Mathf.Asin(OpeningW * 0.5f / Radius);
+
+        // ── Cylindrical walls ─────────────────────────────────────────────────
+        for (int i = 0; i < Sides; i++)
+        {
+            float midAngle = 2f * Mathf.Pi * i / Sides - FaceHalf + Mathf.Pi / Sides;
+            // North opening: midAngle near 0; south opening: midAngle near π
+            bool isNorth = Mathf.Abs(midAngle) < openHalfAngle ||
+                           Mathf.Abs(midAngle - 2f * Mathf.Pi) < openHalfAngle;
+            bool isSouth = Mathf.Abs(midAngle - Mathf.Pi) < openHalfAngle;
+
+            if ((isNorth && openNorth) || (isSouth && openSouth))
+            {
+                // Leave wall segment open — arch geometry added separately
+                continue;
+            }
+
+            Vector3 a = outer[i];
+            Vector3 b = outer[(i + 1) % Sides];
+            // Inward-facing wall quad
+            Quad(wallST,
+                new(b.X, ArenaWallH, b.Z),
+                new(a.X, ArenaWallH, a.Z),
+                new(a.X, 0f, a.Z),
+                new(b.X, 0f, b.Z));
+        }
+
+        // ── Arch doorways ──────────────────────────────────────────────────────
+        // Each doorway matches the corridor cross-section: OpeningW wide, CellHeight
+        // flat section, then a parabolic vault arch up to CellHeight + ArchRise.
+        // The arch is placed at the wall circle radius (Apothem distance from centre).
+        if (openNorth) AddArchDoorway(wallST, domeST, northFacing: true);
+        if (openSouth) AddArchDoorway(wallST, domeST, northFacing: false);
+
+        // ── Floor (polygon fan) ────────────────────────────────────────────────
+        // Winding: center → b → a gives counterclockwise from above → normal faces UP (+Y).
+        for (int i = 0; i < Sides; i++)
+        {
+            Vector3 a = outer[i];
+            Vector3 b = outer[(i + 1) % Sides];
+            floorST.SetUV(UV(Vector3.Zero)); floorST.AddVertex(Vector3.Zero);
+            floorST.SetUV(UV(a));            floorST.AddVertex(a);
+            floorST.SetUV(UV(b));            floorST.AddVertex(b);
+        }
+
+        // ── NO ceiling: the arena is open to the sky. The walls simply end at
+        //    ArenaWallH and a real night-sky HDRI (scene environment) shows beyond.
+        //    domeST still carries the arch-doorway soffit panels built above.
+
+        // ── Commit ─────────────────────────────────────────────────────────────
+        var body = new StaticBody3D { Name = "ArenaBody" };
+        AddChild(body);
+        Emit(body, Commit(wallST),  "ArenaWalls", PanelWallMat());
+        Emit(body, Commit(floorST), "ArenaFloor", ArenaFloorMat());
+        // Arches share the wall material: the velvet curtains used to cover this
+        // geometry, and their removal exposed the old stone as a visible mismatch.
+        Emit(body, Commit(domeST),  "ArenaArches", PanelWallMat());
+
+        // ── Wall collision skirt (fixes slide-into-wall tunneling — see
+        //    AddWallSkirt's doc comment for the diagnosis) ───────────────────────
+        AddWallSkirt(outer, openHalfAngle, openNorth, openSouth);
+
+        // ── Real night sky at infinity (HDRI panorama on the environment) ─────
+        SetupNightSky();
+
+        // ── Stained-glass dome (visual only — night sky glows through) ────────
+        AddStainedGlassDome();
+
+        // ── Stacked tiers: shelf ring + collision + balustrade/column band,
+        //    repeated Tiers times up the wall. Each tier commits its OWN merged
+        //    meshes and its own MultiMesh batches (see the batching section's
+        //    doc comment for why per-tier and not one global batch).
+        //    GLB decor is gracefully absent pre-asset-generation; the
+        //    procedural ledge always renders. ──────────────────────────────────
+        for (int t = 0; t < Tiers; t++)
+        {
+            float baseY = t * TierUnitH;
+            AddBookshelfRing(outer, openHalfAngle, openNorth, openSouth, baseY, t);
+            AddShelfCollision(outer, openHalfAngle, openNorth, openSouth, baseY, t);
+            AddSecondTier(baseY, t, openHalfAngle, openNorth, openSouth);
+            FlushBatch($"t{t}", baseY);
+        }
+
+        // ── Interactive grass over the arena floor (visual only) ──────────────
+        // Radius-1.6 (28.4m) reaches the wall skirt's inner face (~29.1m at
+        // the face centres) without letting blades poke through it, closing
+        // the bare ring of floor that Radius-2.5 left at the wall base.
+        AddChild(new GrassField { Name = "Grass", Radius = Radius - 1.6f,
+                                  InnerRadius = GrassInnerRadius });
+
+        // ── Velvet physics curtains over the doorways ──────────────────────────
+        // Removed 2026-09-24 per owner ("they look janky") — flip to restore.
+        // They existed to hide the black arches above the doorways; if the bare
+        // arches read too dark, fix the entrance lighting rather than re-hanging these.
+        bool doorCurtains = false;
+        if (doorCurtains)
+        {
+            if (openNorth) AddCurtain(northFacing: true);
+            if (openSouth) AddCurtain(northFacing: false);
+        }
+
+        // ── Torch rings, one per tier ──────────────────────────────────────────
+        // Deliberately NOT tripled 1:1. gl_compatibility does per-object forward
+        // lighting (max_lights_per_object=32 in project.godot), so light count
+        // feeds straight into fragment cost on every shelf surface rather than
+        // being clustered away as it would be under Forward+. Tier 0 is the
+        // gameplay floor and keeps the full Sides/2 ring; the upper tiers are
+        // scenery seen from below and get a half-density ring, which reads the
+        // same at that distance. 16 → 16+8+8 rather than 16 → 48.
+        for (int t = 0; t < Tiers; t++)
+        {
+            float baseY = t * TierUnitH;
+            int   tc    = t == 0 ? Sides / 2 : Sides / 4;
+            for (int i = 0; i < tc; i++)
+            {
+                float a  = 2f * Mathf.Pi * i / tc;
+                float tx = Mathf.Sin(a) * (Radius - 2f);
+                float tz = -Mathf.Cos(a) * (Radius - 2f);
+                AddChild(new OmniLight3D
+                {
+                    Name            = $"ArenaLight{t}_{i}",
+                    Position        = new(tx, baseY + TierUnitH * 0.45f, tz),
+                    LightColor      = new(1.0f, 0.68f, 0.22f),
+                    LightEnergy     = 2.1f,          // warm accents, not the main light
+                    OmniRange       = 40f,
+                    OmniAttenuation = 0.55f,
+                    ShadowEnabled   = false,
+                });
+            }
+
+            // ── Panel-band uplights: dim cool wash so the paneling strip above
+            //    each tier's shelves (and, on tier 0, the curtain valances) read
+            //    instead of going black — also gives the flat liminal cyan wash
+            //    up high. 3 per upper tier vs 6 on tier 0, same reasoning as the
+            //    torch ring above.
+            int bc = t == 0 ? 6 : 3;
+            for (int i = 0; i < bc; i++)
+            {
+                float a = 2f * Mathf.Pi * i / bc + 0.5f;
+                AddChild(new OmniLight3D
+                {
+                    Name            = $"BandLight{t}_{i}",
+                    Position        = new(Mathf.Sin(a) * (Radius - 4f), baseY + TierUnitH - 3.5f, -Mathf.Cos(a) * (Radius - 4f)),
+                    LightColor      = new(0.55f, 0.75f, 0.85f),
+                    LightEnergy     = 5.0f,
+                    OmniRange       = 20f,
+                    OmniAttenuation = 0.8f,
+                    ShadowEnabled   = false,
+                });
+            }
+        }
+
+        // ── Dome apex light (centre top of hemisphere) ─────────────────────────
+        AddChild(new OmniLight3D
+        {
+            Name            = "DomeApexLight",
+            Position        = new(0f, ArenaWallH + Radius * 0.95f, 0f),
+            LightColor      = new(0.62f, 0.70f, 1.0f),   // moonlight from the night sky
+            LightEnergy     = 7.0f,
+            OmniRange       = Radius * 2.2f,
+            OmniAttenuation = 0.4f,
+            ShadowEnabled   = false,
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  STAINED-GLASS DOME — squashed hemisphere over the wall ring, leaded
+    //  panes with a real night sky glowing through. Visual only: MeshInstance3D
+    //  children, no collision, no Emit(). The arena has no ceiling collision
+    //  by design — the player never reaches this height.
+    // ══════════════════════════════════════════════════════════════════════════
+    void AddStainedGlassDome()
+    {
+        const int DomeRings = 10;
+        var glassST = MakeST();
+        for (int ring = 0; ring < DomeRings; ring++)
+        {
+            float t0 = (float)ring / DomeRings, t1 = (float)(ring + 1) / DomeRings;
+            float th0 = t0 * Mathf.Pi * 0.5f, th1 = t1 * Mathf.Pi * 0.5f;
+            float r0 = Radius * Mathf.Cos(th0), r1 = Radius * Mathf.Cos(th1);
+            float y0 = ArenaWallH + Radius * 0.35f * Mathf.Sin(th0);   // squashed dome (0.35 height ratio)
+            float y1 = ArenaWallH + Radius * 0.35f * Mathf.Sin(th1);
+            for (int i = 0; i < Sides; i++)
+            {
+                float a0 = 2f * Mathf.Pi * i / Sides - FaceHalf;
+                float a1 = 2f * Mathf.Pi * (i + 1) / Sides - FaceHalf;
+                Quad(glassST,
+                    new(Mathf.Sin(a0)*r0, y0, -Mathf.Cos(a0)*r0),
+                    new(Mathf.Sin(a1)*r0, y0, -Mathf.Cos(a1)*r0),
+                    new(Mathf.Sin(a1)*r1, y1, -Mathf.Cos(a1)*r1),
+                    new(Mathf.Sin(a0)*r1, y1, -Mathf.Cos(a0)*r1));
+            }
+        }
+        var glass = Commit(glassST);
+        if (glass != null)
+        {
+            var glassMat = new ShaderMaterial { Shader = new Shader { Code = StainedGlassShaderSrc } };
+            glassMat.SetShaderParameter("spring_y", ArenaWallH);   // fixes the old hardcoded-22.0 pivot bug
+            AddChild(new MeshInstance3D
+            {
+                Name = "DomeGlass", Mesh = glass,
+                MaterialOverride = glassMat,
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            });
+        }
+
+        // ironwork: radial ribs (thin boxes following the dome curve) + rings
+        var ribST = MakeST();
+        for (int i = 0; i < Sides; i += 2)
+        {
+            float a = 2f * Mathf.Pi * i / Sides - FaceHalf;
+            for (int s = 0; s < 8; s++)
+            {
+                float u0 = s / 8f, u1 = (s + 1) / 8f;
+                float th0 = u0 * Mathf.Pi * 0.5f, th1 = u1 * Mathf.Pi * 0.5f;
+                Vector3 p0 = new(Mathf.Sin(a) * Radius * Mathf.Cos(th0), ArenaWallH + Radius * 0.35f * Mathf.Sin(th0) + 0.06f, -Mathf.Cos(a) * Radius * Mathf.Cos(th0));
+                Vector3 p1 = new(Mathf.Sin(a) * Radius * Mathf.Cos(th1), ArenaWallH + Radius * 0.35f * Mathf.Sin(th1) + 0.06f, -Mathf.Cos(a) * Radius * Mathf.Cos(th1));
+                Vector3 side = new Vector3(Mathf.Cos(a), 0, Mathf.Sin(a)) * 0.14f;
+                Quad(ribST, p0 - side, p1 - side, p1 + side, p0 + side);
+            }
+        }
+        var ribs = Commit(ribST);
+        if (ribs != null)
+        {
+            var iron = new StandardMaterial3D { AlbedoColor = new Color(0.06f, 0.05f, 0.05f),
+                Roughness = 0.5f, Metallic = 0.8f, CullMode = BaseMaterial3D.CullModeEnum.Disabled };
+            AddChild(new MeshInstance3D { Name = "DomeRibs", Mesh = ribs, MaterialOverride = iron });
+        }
+    }
+
+    // ── Arch doorway geometry ─────────────────────────────────────────────────
+    // Places a corridor-shaped arch in the arena wall:
+    //   - Side walls left and right of the opening (from Apothem inward)
+    //   - Flat header up to SpringY, then parabolic arch up to SpringY+ArchRise
+    //   - Lintel connecting to rest of wall above the arch spring
+    void AddArchDoorway(SurfaceTool wallST, SurfaceTool domeST, bool northFacing)
+    {
+        float hw    = OpeningW * 0.5f;
+        float zFace = northFacing ? -Apothem : Apothem;  // wall plane Z
+        float nSign = northFacing ? -1f : 1f;           // outward normal direction
+
+        // ── Side jambs: wall flanking the arch ────────────────────────────────
+        // West jamb: from wall edge to -hw at the face Z
+        float wallEdge = Mathf.Sqrt(Mathf.Max(0f, Radius * Radius - zFace * zFace));
+        // Jamb faces inward: north jamb → +Z (nSign=-1 → normalX=+1); south jamb → -Z (nSign=+1 → normalX=-1)
+        // West side of corridor: x from -wallEdge to -hw
+        AddVertPanel(wallST, -wallEdge, -hw, zFace, 0f, ArenaWallH, normalX: nSign > 0 ? -1f : 1f);
+        // East side: x from +hw to +wallEdge
+        AddVertPanel(wallST, hw, wallEdge, zFace, 0f, ArenaWallH, normalX: nSign > 0 ? -1f : 1f);
+
+        // ── Arch soffit: barrel vault above corridor opening ──────────────────
+        for (int i = 0; i < ArchSegs; i++)
+        {
+            float t0 = (float)i / ArchSegs, t1 = (float)(i + 1) / ArchSegs;
+            float xi0 = -hw + OpeningW * t0, xi1 = -hw + OpeningW * t1;
+            float archY0 = SpringY + ArchRise * 4f * t0 * (1f - t0);
+            float archY1 = SpringY + ArchRise * 4f * t1 * (1f - t1);
+
+            // Flat section below arch spring (if needed) — just the spring-to-wall line
+            // Arch panel (facing inward / downward)
+            if (northFacing)
+                Quad(domeST,
+                    new(xi0, archY0, zFace),
+                    new(xi1, archY1, zFace),
+                    new(xi1, ArenaWallH,  zFace),
+                    new(xi0, ArenaWallH,  zFace));
+            else
+                Quad(domeST,
+                    new(xi1, archY1, zFace),
+                    new(xi0, archY0, zFace),
+                    new(xi0, ArenaWallH,  zFace),
+                    new(xi1, ArenaWallH,  zFace));
+        }
+
+        // ── Lintel: flat wall above arch spring up to ArenaWallH ───────────────────
+        // (filled by the arch panels above — nothing extra needed)
+    }
+
+    // Vertical flat panel at constant Z, spanning x from xA to xB, y from y0 to y1
+    static void AddVertPanel(SurfaceTool st, float xA, float xB, float z,
+        float y0, float y1, float normalX)
+    {
+        if (normalX > 0)
+            Quad(st, new(xA, y0, z), new(xB, y0, z), new(xB, y1, z), new(xA, y1, z));
+        else
+            Quad(st, new(xB, y0, z), new(xA, y0, z), new(xA, y1, z), new(xB, y1, z));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  WALL COLLISION SKIRT — fixes the "slide out of the arena through the
+    //  wall" playtest bug.
+    //
+    //  Diagnosis (test/TestArenaEscape.cs): the visible wall/floor/arch meshes
+    //  above (ArenaWalls / ArenaFloor / ArenaArches, via Emit()) are flat,
+    //  double-sided (BackfaceCollision) but genuinely ZERO-THICKNESS trimesh
+    //  quads. A raycast confirms the collider IS present exactly where
+    //  expected. But a CharacterBody3D matching the player's slide capsule
+    //  (Radius=0.35, Height=1.6 — PlayerController never resizes this shape
+    //  during a slide, contrary to the original bug-report guess) driven
+    //  straight at a plain wall face at slide speed (PlayerController.
+    //  SlideMaxEntry = 32 m/s) tunnels straight through — MoveAndSlide's sweep
+    //  misses a zero-thickness plane hit dead-on at that speed. The same
+    //  capsule driven diagonally into a corner/jamb (where two triangles meet
+    //  at an angle, giving the sweep a "thicker" effective target) is reliably
+    //  blocked. This is a classic zero-thickness-geometry tunneling case, not
+    //  a positional gap — so the fix is volume, not repositioning: a ring of
+    //  solid BoxShape3D colliders (real thickness) lining the interior wall
+    //  faces. A sweep cannot tunnel through an actual box the way it can
+    //  tunnel through a flat plane.
+    //
+    //  Collision only — zero MeshInstance3D — and does not touch the existing
+    //  wall/floor/arch trimesh or their visuals in any way.
+    // ══════════════════════════════════════════════════════════════════════════
+    const float SkirtHeight    = 2.0f;    // covers the player's full slide-capsule height (1.6m) + margin
+    const float SkirtBottomY   = -0.25f;  // overlaps the floor by 0.25m — no seam
+    const float SkirtThickness = 0.8f;    // radial depth of each box (> capsule diameter of 0.7m)
+    // At shelf bays only (see AddWallSkirt's per-face loop): the skirt's
+    // inner face is pulled out to meet the bookshelf's front plane instead
+    // of standing 0.25m short of it (that gap read as an invisible standoff
+    // at foot level in front of every shelf). Must mirror AddShelfCollision's
+    // `depth` const (0.55m) — that's the true radius the shelf's post/board
+    // front sits at. The skirt's OUTER face stays flush at the wall
+    // (Apothem) regardless of thickness (see AddSkirtBox), so shrinking the
+    // thickness to 0.55m only moves the inner face outward — it never
+    // reduces coverage below the wall plane. 0.55m still comfortably clears
+    // the anti-tunnel margin the 0.8m default was sized against (a 32 m/s
+    // slide capsule travels ≈0.53m/tick @60fps; 0.35m capsule radius on top
+    // of that keeps 0.55m safely above the sweep-miss threshold — re-verified
+    // empirically by test/TestArenaEscape.tscn, not just by this arithmetic).
+    const float SkirtShelfInnerDepth = 0.55f;
+
+    void AddWallSkirt(Vector3[] outer, float openHalfAngle, bool openNorth, bool openSouth)
+    {
+        var skirt = new StaticBody3D { Name = "ArenaWallSkirt" };
+        AddChild(skirt);
+
+        // Precompute which faces are doorway faces so the main loop can also
+        // ask "is my NEIGHBOUR a doorway" (needed below — the doorway-jamb
+        // corner is a known-fragile wedge; see the thickness comment).
+        bool IsDoorwayFace(int idx)
+        {
+            idx = ((idx % Sides) + Sides) % Sides;
+            float ang = 2f * Mathf.Pi * idx / Sides;
+            bool n = Mathf.Abs(ang) < openHalfAngle || Mathf.Abs(ang - 2f * Mathf.Pi) < openHalfAngle;
+            bool s = Mathf.Abs(ang - Mathf.Pi) < openHalfAngle;
+            return (n && openNorth) || (s && openSouth);
+        }
+
+        // One box per closed polygon face, flush with its interior surface.
+        for (int i = 0; i < Sides; i++)
+        {
+            if (IsDoorwayFace(i)) continue;   // doorway — jamb boxes below
+
+            float midAngle = 2f * Mathf.Pi * i / Sides - FaceHalf + Mathf.Pi / Sides;
+
+            // Does THIS face actually have a bookshelf behind it? AddShelfCollision
+            // / AddBookshelfRing skip a WIDER band near each doorway than the skirt
+            // does (openHalfAngle*1.7 vs openHalfAngle above) — mirror that exact
+            // test here so the thinner, shelf-aligned box is only used where a
+            // shelf really is.
+            float midAngleSkirt = 2f * Mathf.Pi * i / Sides - FaceHalf + Mathf.Pi / Sides;
+            bool shelfNorth = Mathf.Abs(midAngleSkirt) < openHalfAngle * 1.7f ||
+                               Mathf.Abs(midAngleSkirt - 2f * Mathf.Pi) < openHalfAngle * 1.7f;
+            bool shelfSouth = Mathf.Abs(midAngleSkirt - Mathf.Pi) < openHalfAngle * 1.7f;
+            bool hasShelf = !((shelfNorth && openNorth) || (shelfSouth && openSouth));
+
+            // Never thin a face that touches a doorway-jamb vertex, even if it
+            // technically has a shelf. TestArenaEscape's E_tangential_jamb_skim
+            // scenario grazes exactly that corner and, empirically, already
+            // clears the full 0.8m box by only 0.12m — thinning either
+            // neighbour of a doorway face reopened the escape (verified:
+            // maxRadial jumped from 30.24 to 255 with a naive global thin).
+            // Keeping the two doorway-adjacent faces at full thickness costs
+            // nothing visually (that lip is right next to the jamb, not out
+            // in the open bays) and preserves the hard-won anti-tunnel margin.
+            bool nearDoorwayJamb = IsDoorwayFace(i - 1) || IsDoorwayFace(i + 1) ||
+                                    IsDoorwayFace(i - 2) || IsDoorwayFace(i + 2);
+            float thickness = (hasShelf && !nearDoorwayJamb) ? SkirtShelfInnerDepth : SkirtThickness;
+
+            Vector3 a = outer[i];
+            Vector3 b = outer[(i + 1) % Sides];
+            Vector3 mid     = (a + b) * 0.5f;
+            Vector3 tangent = (b - a).Normalized();
+            Vector3 inward  = new Vector3(-mid.X, 0f, -mid.Z).Normalized();
+            // +0.1m overlap with neighbouring boxes so no micro-gap opens at
+            // the polygon's own vertices between adjacent skirt segments.
+            AddSkirtBox(skirt, mid, tangent, inward, (b - a).Length() + 0.1f, $"SkirtWall{i}", thickness);
+        }
+
+        // Corner posts at every polygon vertex (including the two vertices that
+        // flank each open doorway). Adjacent skirt boxes are rotated relative to
+        // each other by the polygon's per-face angle (and, at a doorway, by the
+        // extra mismatch between the jamb cap's axis-aligned orientation and the
+        // regular wall face's orientation) — two flat boxes meeting only at a
+        // shared edge at an angle can leave a thin wedge-shaped gap exactly at
+        // that vertex. A rotation-agnostic cylinder centred on each vertex
+        // guarantees solid overlap there regardless of the angle mismatch.
+        // (Confirmed necessary: without these posts, a capsule aimed exactly at
+        // the north/south doorway's flanking vertex tunnelled straight through
+        // the wedge between the wall-face skirt box and the jamb cap box.)
+        for (int i = 0; i < Sides; i++)
+        {
+            Vector3 v = outer[i];
+            Vector3 inward = new Vector3(-v.X, 0f, -v.Z).Normalized();
+            AddSkirtPost(skirt, v + inward * 0.3f, $"SkirtPost{i}");
+        }
+
+        // Jamb caps flanking each open doorway — the polygon's own vertex sits
+        // at a slightly smaller half-width (wallEdge) than the doorway's design
+        // half-width (hw); this closes that sliver with real thickness so a
+        // capsule can't clip diagonally past the doorway's own edge either.
+        if (openNorth) AddDoorwaySkirt(skirt, northFacing: true);
+        if (openSouth) AddDoorwaySkirt(skirt, northFacing: false);
+    }
+
+    void AddDoorwaySkirt(StaticBody3D skirt, bool northFacing)
+    {
+        float hw       = OpeningW * 0.5f;
+        float zFace    = northFacing ? -Apothem : Apothem;
+        float wallEdge = Mathf.Sqrt(Mathf.Max(0f, Radius * Radius - zFace * zFace));
+        Vector3 tangent = Vector3.Right;
+        Vector3 inward  = new Vector3(0f, 0f, northFacing ? 1f : -1f);
+
+        float len = Mathf.Abs(wallEdge - hw) + 0.15f;   // +overlap into the regular wall skirt
+        Vector3 westMid = new Vector3(-(hw + wallEdge) * 0.5f, 0f, zFace);
+        Vector3 eastMid = new Vector3( (hw + wallEdge) * 0.5f, 0f, zFace);
+        AddSkirtBox(skirt, westMid, tangent, inward, len, northFacing ? "SkirtJambNW" : "SkirtJambSW");
+        AddSkirtBox(skirt, eastMid, tangent, inward, len, northFacing ? "SkirtJambNE" : "SkirtJambSE");
+    }
+
+    // A single solid box collider: local X = tangent (length `len`), local Y =
+    // up (SkirtHeight), local Z = inward (`thickness`). Positioned so its
+    // OUTER face (away from `inward`) sits flush at `mid` — i.e. flush with
+    // the actual wall plane — and extends inward from there, regardless of
+    // `thickness`. No gap, no overlap with the visible wall.
+    static void AddSkirtBox(StaticBody3D skirt, Vector3 mid, Vector3 tangent, Vector3 inward, float len, string name, float thickness = SkirtThickness)
+    {
+        if (len < 0.01f) return;
+        var origin = mid + inward * (thickness * 0.5f) + new Vector3(0f, SkirtBottomY + SkirtHeight * 0.5f, 0f);
+        skirt.AddChild(new CollisionShape3D
+        {
+            Name      = name,
+            Shape     = new BoxShape3D { Size = new Vector3(len, SkirtHeight, thickness) },
+            Transform = new Transform3D(new Basis(tangent, Vector3.Up, inward), origin),
+        });
+    }
+
+    // Rotation-agnostic corner filler — see the call site's comment for why
+    // this is needed (wedge gaps between differently-oriented skirt boxes).
+    static void AddSkirtPost(StaticBody3D skirt, Vector3 pos, string name)
+    {
+        skirt.AddChild(new CollisionShape3D
+        {
+            Name      = name,
+            Shape     = new CylinderShape3D { Radius = 0.5f, Height = SkirtHeight },
+            Position  = pos + new Vector3(0f, SkirtBottomY + SkirtHeight * 0.5f, 0f),
+        });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  BOOKSHELF RING — gnarly wood frames + jewel-toned books lining the wall.
+    //  Visual only — collision is added separately by AddShelfCollision below
+    //  (flat wall-run slabs, not a per-book trimesh). Bays skip the two arch
+    //  doorways.
+    // ══════════════════════════════════════════════════════════════════════════
+    const string BookShaderSrc = @"
+shader_type spatial;
+render_mode diffuse_burley, specular_schlick_ggx;
+void fragment(){
+    ALBEDO = COLOR.rgb;
+    ROUGHNESS = 0.6;
+    // glow books encode emissive in vertex alpha
+    EMISSION = COLOR.rgb * COLOR.a * 6.0;
+}";
+    const string ShelfWoodShaderSrc = @"
+shader_type spatial;
+render_mode diffuse_burley, specular_schlick_ggx;
+varying vec3 wpos;
+void vertex(){ wpos=(MODEL_MATRIX*vec4(VERTEX,1.0)).xyz; }
+float hash13(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.zyx+31.32); return fract((p.x+p.y)*p.z); }
+float vnoise(vec3 p){
+    vec3 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+    float a=hash13(i),b=hash13(i+vec3(1,0,0)),c=hash13(i+vec3(0,1,0)),d=hash13(i+vec3(1,1,0));
+    float e=hash13(i+vec3(0,0,1)),g=hash13(i+vec3(1,0,1)),h=hash13(i+vec3(0,1,1)),k=hash13(i+vec3(1,1,1));
+    return mix(mix(mix(a,b,f.x),mix(c,d,f.x),f.y),mix(mix(e,g,f.x),mix(h,k,f.x),f.y),f.z);
+}
+void fragment(){
+    // weird wood: warped vertical grain + knots
+    float grain = vnoise(vec3(wpos.x*6.0, wpos.y*0.9 + vnoise(wpos*0.8)*3.0, wpos.z*6.0));
+    vec3 dark  = vec3(0.13,0.08,0.05);
+    vec3 light = vec3(0.30,0.19,0.11);
+    ALBEDO = mix(dark, light, grain);
+    ROUGHNESS = 0.85;
+}";
+
+    // ── Doorway exception is a GROUND-FLOOR-ONLY exception ────────────────────
+    // The arch reaches SpringY + ArchRise = 18m, which lives entirely inside
+    // tier 0's shelf band (0..22). Tiers above it have no arch and no opening —
+    // nothing to leave clear.
+    //
+    // Applying the skip at every tier (which vertical stacking did by default)
+    // carved a bare stripe the full 108m height of the wall above each
+    // entryway: unlit, unshelved, and reading in-game as a giant dark strip.
+    // Gate every doorway skip on tier 0 so the upper tiers close the ring.
+    static bool DoorwayBay(int i, float openHalfAngle, bool openNorth, bool openSouth, int tier)
+    {
+        if (tier != 0) return false;
+        float mid = 2f * Mathf.Pi * i / Sides - FaceHalf + Mathf.Pi / Sides;
+        bool n = Mathf.Abs(mid) < openHalfAngle * 1.7f ||
+                 Mathf.Abs(mid - 2f * Mathf.Pi) < openHalfAngle * 1.7f;
+        bool s = Mathf.Abs(mid - Mathf.Pi) < openHalfAngle * 1.7f;
+        return (n && openNorth) || (s && openSouth);
+    }
+
+    void AddBookshelfRing(Vector3[] outer, float openHalfAngle, bool openNorth, bool openSouth,
+                          float baseY, int tier)
+    {
+        var woodST = MakeST();
+        var bookST = MakeST();
+        // Same seed every tier: the stack is meant to read as the SAME shelf
+        // ring repeated, so the per-post lean and box-book fallback layout
+        // should be identical at every level rather than re-randomised.
+        var rng    = new Random(1337);
+
+        const float depth     = 0.55f;  // how far shelves stand out from the wall
+        const float postW     = 0.42f;
+        const float boardTh   = 0.10f;
+        const float levelStep = 1.45f;
+        // Task 5 retie: shelf altitude stays fixed (22m per tier) as TierUnitH
+        // grew — the extra height all goes into the panel band + columns above
+        // topY. Tier-local: y runs 0..topY and baseY lifts the whole band.
+        float topY            = ShelfBandH;   // taller bare paneling band above the shelves
+
+        // Jewel palette (matches approved Blender concept)
+        var palette = new (float r, float g, float b)[]
+        {
+            (0.45f,0.08f,0.50f), (0.10f,0.30f,0.55f), (0.50f,0.12f,0.15f), (0.08f,0.40f,0.30f),
+            (0.55f,0.30f,0.08f), (0.25f,0.10f,0.45f), (0.05f,0.45f,0.50f), (0.40f,0.35f,0.10f),
+        };
+
+        for (int i = 0; i < Sides; i++)
+        {
+            float midAngle = 2f * Mathf.Pi * i / Sides - FaceHalf + Mathf.Pi / Sides;
+            if (DoorwayBay(i, openHalfAngle, openNorth, openSouth, tier)) continue;
+
+            Vector3 a = outer[i];
+            Vector3 b = outer[(i + 1) % Sides];
+            Vector3 chord   = b - a;
+            float faceLen   = chord.Length();
+            Vector3 tangent = chord / faceLen;
+            Vector3 inward  = -new Vector3(a.X + b.X, 0, a.Z + b.Z).Normalized(); // toward centre
+
+            // ── gnarly posts at both bay corners ──────────────────────────────
+            foreach (var corner in new[] { a, b })
+            {
+                Vector3 basePos = corner + inward * (depth * 0.5f);
+                // slight per-post lean for the weird-wood feel
+                float lean = (float)(rng.NextDouble() - 0.5) * 0.35f;
+                OrientedBox(woodST, basePos + new Vector3(lean, topY * 0.5f + 0.4f, 0),
+                            tangent, inward, postW * 0.5f, depth * 0.5f, topY * 0.5f + 0.4f, null);
+            }
+
+            // ── boards + books per level ──────────────────────────────────────
+            float boardLen = faceLen - postW;
+            for (float y = 0.35f; y <= topY; y += levelStep)
+            {
+                Vector3 boardMid = (a + b) * 0.5f + inward * (depth * 0.5f) + new Vector3(0, y, 0);
+                OrientedBox(woodST, boardMid, tangent, inward,
+                            boardLen * 0.5f, depth * 0.5f, boardTh * 0.5f, null);
+
+                if (y + levelStep > topY) continue;   // no books on the top board
+
+                // Book rows: one detailed GLB per board (3 variants), replacing
+                // the ~26 individual box-books. Fallback: original box loop
+                // below when the GLB is missing (pre-Task-5 asset generation).
+                // Batched into a per-tier MultiMesh rather than added as its own
+                // node — this loop is the arena's dominant instance source
+                // (14 rows × 30 bays × Tiers), see the batching doc comment.
+                string rowName = new[] { "bookrow_a", "bookrow_b", "bookrow_c" }
+                    [PieceVariants.Fnv(i, (int)(y * 100), 5) % 3];
+                if (PropMesh(rowName) != null)
+                {
+                    // ── Fit the row to the shelf, per axis ────────────────────
+                    // This was a UNIFORM scale of boardLen/longestAxis. The
+                    // bookrow GLBs are blocky (raw ~1.00 long x 0.345 deep x
+                    // 0.303 tall), so scaling them to span the 5.46m board also
+                    // blew their depth to 1.88m and height to 1.65m: each "row
+                    // of books" became a slab jutting 1.4m out of the shelf and
+                    // through the collision surface, which is what the player
+                    // walked into. Measured by TestArenaProtrusion.
+                    //
+                    // The model simply is not shaped like a shelf row, so fit
+                    // each axis to its own budget instead. Local axes: Z = row
+                    // length, X = depth into the shelf, Y = spine height.
+                    var stretch = PropStretch(rowName, ab => new Vector3(
+                        ab.Size.X > 0.001f ? RowDepth  / ab.Size.X : 1f,
+                        ab.Size.Y > 0.001f ? RowHeight / ab.Size.Y : 1f,
+                        ab.Size.Z > 0.001f ? boardLen  / ab.Size.Z : 1f));
+                    // ScaledLocal, not Scaled: a Node3D composes its basis as
+                // Rotation × Scale (scale in the model's own frame). Basis.Scaled
+                // pre-multiplies (parent frame) and would shear a rotated,
+                // non-uniformly stretched prop.
+                var basis = new Basis(Vector3.Up, -midAngle + Mathf.Pi * 0.5f).ScaledLocal(stretch);
+                    Batch(rowName, new Transform3D(basis,
+                        (a + b) * 0.5f + inward * (depth * 0.45f)
+                        + new Vector3(0, y + boardTh * 0.5f, 0)));
+                    continue;   // skip the box-book loop for this level
+                }
+
+                float t = -boardLen * 0.5f + 0.15f;
+                while (t < boardLen * 0.5f - 0.15f)
+                {
+                    float w = 0.09f + (float)rng.NextDouble() * 0.06f;
+                    if (rng.NextDouble() < 0.12) { t += 0.12f + (float)rng.NextDouble() * 0.2f; continue; }
+                    float h = 0.72f + (float)rng.NextDouble() * 0.4f;
+                    var p   = palette[rng.Next(palette.Length)];
+                    float j = 0.75f + (float)rng.NextDouble() * 0.5f;
+                    bool glow = rng.NextDouble() < 0.045;
+                    var col = glow
+                        ? new Color(0.2f, 1.0f, 0.9f, 1f)                       // teal glow, alpha=emissive
+                        : new Color(Mathf.Clamp(p.r*j,0,1), Mathf.Clamp(p.g*j,0,1), Mathf.Clamp(p.b*j,0,1), 0f);
+                    Vector3 c = (a + b) * 0.5f + tangent * t + inward * (depth * 0.45f)
+                                + new Vector3(0, y + boardTh * 0.5f + h * 0.5f, 0);
+                    OrientedBox(bookST, c, tangent, inward, w * 0.5f, 0.16f, h * 0.5f, col);
+                    t += w + 0.012f;
+                }
+            }
+        }
+
+        // One merged mesh pair PER TIER, lifted into place by node position —
+        // not one mesh spanning the whole shaft. The geometry above is built in
+        // tier-local Y (0..topY) so the committed mesh keeps a tight AABB,
+        // which is what lets tiers outside the frustum cull and keeps the
+        // gl_compatibility per-object light list scoped to this tier.
+        var lift = new Vector3(0, baseY, 0);
+        var woodMesh = Commit(woodST);
+        if (woodMesh != null)
+            AddChild(new MeshInstance3D { Name = $"ShelfWood_t{tier}", Mesh = woodMesh, Position = lift,
+                MaterialOverride = new ShaderMaterial { Shader = new Shader { Code = ShelfWoodShaderSrc } } });
+        var bookMesh = Commit(bookST);
+        if (bookMesh != null)
+            AddChild(new MeshInstance3D { Name = $"ShelfBooks_t{tier}", Mesh = bookMesh, Position = lift,
+                MaterialOverride = new ShaderMaterial { Shader = new Shader { Code = BookShaderSrc } } });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  SHELF COLLISION — Task 4 (Polish). AddBookshelfRing above is visual-only;
+    //  without this the player phases straight through the bookshelf ring
+    //  instead of being able to wall-run on it.
+    //
+    //  Front-plane math: the shelf's corner posts and boards (see
+    //  AddBookshelfRing) are the ring's OUTERMOST physical geometry — both are
+    //  built with inward half-extent `depth*0.5` centred at `inward*(depth*0.5)`
+    //  from the bay chord, so they span radius [Apothem-depth, Apothem] and
+    //  their front edge sits at radius (Apothem - depth). The books are more
+    //  recessed: centred at inward*(depth*0.45) with their own half-depth 0.16,
+    //  so their front only reaches inward*(depth*0.45+0.16) ≈ 0.41m in — short
+    //  of the post/board edge at a full `depth` (0.55m) in. Colliding at the
+    //  post/board front plane (the true frontmost surface, not the recessed
+    //  book plane) guarantees nothing visual — post, board, or book — ever
+    //  pokes past the collider.
+    //
+    //  For Sides=32, Radius=30: Apothem = Radius*cos(pi/Sides) ≈ 29.856m, so
+    //  the shelf front plane sits at radius ≈ 29.856 - 0.55 = 29.306m
+    //  (effective arena radius shrinks ~0.55m at the shelf bays — expected and
+    //  accepted per the polish brief).
+    //
+    //  ── ONE CONTINUOUS RING, NOT PER-BAY BOXES ────────────────────────────────
+    //  This was originally one flat BoxShape3D per non-doorway bay, each built
+    //  `faceLen + 0.1` long so neighbours overlapped. That left a ~5mm lip at
+    //  each of the 30 seams, and a capsule sliding along a wall run catches on
+    //  convex box corners — which is what made wall-running the arena feel like
+    //  bumping into the shelves.
+    //
+    //  Now it is a single ConcavePolygonShape3D ring with SHARED vertices
+    //  between bays, so there are no seams and no overlap to catch on — the
+    //  same construction the arena walls themselves already use and which
+    //  wall-running is known to slide along cleanly. `TryStartWallRun`'s
+    //  fallback uses TestMove precisely because it detects concave trimesh
+    //  (IntersectRay does not), so a trimesh here is fully supported.
+    //
+    //  Offset math: offsetting every edge of a REGULAR polygon inward by
+    //  `depth` yields a smaller similar polygon — same vertex angles, apothem
+    //  reduced by exactly `depth`. So the ring's vertices sit at the original
+    //  angles at circumradius (Apothem - depth) / cos(pi/Sides). Computing it
+    //  this way (rather than per-bay perpendicular offsets, which is what
+    //  produced the overlapping boxes) is what makes adjacent bays share a
+    //  vertex exactly.
+    //
+    //  Zero thickness is fine here: `BackfaceCollision = true` matches the
+    //  arena wall trimesh, and anything that does punch through still meets
+    //  the wall trimesh 0.55m behind it, so there is no route out of the arena.
+    //
+    //  Chamfer: the shelf band ends at topY but the tier continues to
+    //  TierUnitH. Without the chamfer the surface steps back 0.55m to the wall
+    //  in one plane — a catchable ledge at every tier boundary (introduced by
+    //  tier stacking; it did not exist when the arena was a single tier). The
+    //  ring ramps back to the wall over ChamferH instead.
+    // ══════════════════════════════════════════════════════════════════════════
+    const float ShelfChamferH = 2.0f;   // vertical run of the shelf-top ramp back to the wall
+    // How far the collision face continues ABOVE the shelf band, covering the
+    // corner posts (which run to topY+0.8) plus the tier ledge and balustrade.
+    const float ShelfOverrun  = 1.7f;
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  WALL FURNITURE CLEARANCE CONTRACT
+    //
+    //  Everything mounted on the arena wall — shelf boards, book rows, the tier
+    //  ledge, balustrades, columns — must live OUTSIDE radius
+    //  (Apothem - ShelfDepth). The shelf collision ring sits exactly on that
+    //  radius, so anything violating the contract is visual geometry the player
+    //  can walk into: they reach the collider, the decor is past it, and they
+    //  are standing inside a bookshelf.
+    //
+    //  Enforced by test/TestArenaProtrusion.cs, which compares every visual
+    //  vertex against the collision surface and fails on any protrusion. Run it
+    //  after touching any prop scale or wall-decor radius.
+    //
+    //  These budgets are what the props get fitted INTO. They are deliberately
+    //  per-axis: the Tripo3D props are blocky, and a uniform scale that makes
+    //  one axis right makes the others badly wrong (a bookrow scaled to span
+    //  its board ended up 1.88m deep; a column scaled to 14m tall ended up
+    //  5.3m wide).
+    // ══════════════════════════════════════════════════════════════════════════
+    const float ShelfDepth  = 0.55f;   // the furniture band; mirrors AddBookshelfRing's `depth`
+    const float RowDepth    = 0.40f;   // book row depth into the shelf (< ShelfDepth)
+    const float RowHeight   = 1.05f;   // book spine height (< levelStep 1.45 so rows clear the next board)
+    const float BalustradeR = 29.56f;  // balustrade ring radius (was 29.0 — 0.3m inside the collider)
+
+    //  NOT covered by the contract: column_a. It is 0.376 wide x 1.0 tall raw,
+    //  and PropLibrary scales it uniformly by 14 to reach the dome spring, so it
+    //  ends up ~5.3m wide and protrudes ~4.45m past the collider — by far the
+    //  worst offender TestArenaProtrusion reports. Deliberately left alone:
+    //  its capitals are standable platforms (ColumnTop* below) sized off that
+    //  width, so narrowing it silently breaks the platforming route up the
+    //  shaft. Fixing it properly means either giving the column body collision
+    //  (making it a real obstacle) or re-proportioning it AND ColumnTopW
+    //  together — a call for whoever owns that feature.
+
+    void AddShelfCollision(Vector3[] outer, float openHalfAngle, bool openNorth, bool openSouth,
+                           float baseY, int tier)
+    {
+        const float depth = 0.55f;   // must mirror AddBookshelfRing's `depth`
+        float topY = ShelfBandH;     // must mirror AddBookshelfRing's `topY`
+
+        var shelfBody = new StaticBody3D { Name = $"ShelfCollision_t{tier}", Position = new Vector3(0, baseY, 0) };
+        AddChild(shelfBody);
+
+        // ── Collision ring is a FINE CIRCLE, not the 32-gon ───────────────────
+        // Measured with TestShelfSlide: matching the visual 32-gon gave 140mm of
+        // radial in/out wobble per bay — the capsule shoved 14cm in and out every
+        // 5.9m, i.e. a bump every 0.4s at wall-run speed. That, not seam lips, is
+        // what made wall-running feel like bumping along the shelves. (An A/B
+        // against the old per-bay boxes was byte-identical, which is what ruled
+        // the seams out: a 0.35m capsule simply rides over a 5mm lip.)
+        //
+        // Subdividing the collision ring decouples it from the visual facet
+        // count and drives that wobble toward zero. Collision-only, so the
+        // shelves still LOOK faceted — only the surface the player slides on is
+        // smooth.
+        //
+        // Radius is the shelf-front INRADIUS. The visual shelf polygon spans
+        // radius 29.306 (bay midpoints) to 29.448 (bay corners); a circle at the
+        // inradius therefore sits at-or-inside the visual surface everywhere, so
+        // the player can never be held inside a shelf post. The cost is up to
+        // 142mm of invisible gap at the bay corners, which is the right trade.
+        const int ColSubdiv = 8;                    // collision segments per visual bay
+        int   colSides = Sides * ColSubdiv;
+        // PostClearance: the shelf's corner posts sit at bay VERTICES, not on
+        // the chord, so their inner corners reach ~43mm closer to the centre
+        // than the chord-derived front plane. Pull the collider in past them.
+        // RowUnderhang: bookrow GLB origins are centred, so the lowest row of
+        // each tier hangs ~0.13m below the tier base. Starting the ring below
+        // zero covers that rather than leaving it in the inter-tier band.
+        const float PostClearance = 0.06f;
+        const float RowUnderhang  = 0.60f;
+        float rFront   = Apothem - depth - PostClearance;
+        float faceTop  = topY + ShelfOverrun;
+
+        Vector3 Ring(int seg, float r, float y)
+        {
+            float a = 2f * Mathf.Pi * seg / colSides - FaceHalf;
+            return new Vector3(Mathf.Sin(a) * r, y, -Mathf.Cos(a) * r);
+        }
+
+        var st = MakeST();
+        for (int seg = 0; seg < colSides; seg++)
+        {
+            // Doorway test must be evaluated on the segment's OWNING BAY, not on
+            // the segment's own mid-angle.
+            //
+            // AddBookshelfRing's test is `|bayMidAngle| < openHalfAngle * 1.7`,
+            // where bay mid-angles are 0.196 rad apart — so the 1.7 factor is a
+            // per-bay tolerance that ends up skipping exactly one bay (0.196 rad
+            // of arc). Applying the same threshold to 0.025-rad segments instead
+            // opened 0.34 rad — 1.7 bays wide — so the collider was missing on
+            // either side of each doorway while shelves were still visible
+            // there. That was the entire remaining protrusion set: bookrows
+            // sitting correctly at r=29.408 but with nothing in front of them.
+            //
+            // ColSubdiv is an integer, so seg/ColSubdiv is the owning bay and
+            // this reproduces the visual skip exactly.
+            int bay = seg / ColSubdiv;
+            if (DoorwayBay(bay, openHalfAngle, openNorth, openSouth, tier)) continue;   // doorway — matches AddBookshelfRing's skip test
+
+            // Shelf face, y = 0..faceTop. Adjacent segments reuse Ring(seg) /
+            // Ring(seg+1) exactly, so the surface is seamless.
+            //
+            // faceTop is topY + ShelfOverrun, NOT topY: the shelf band's own
+            // geometry continues above topY. The corner posts run to topY+0.8
+            // (half-height topY*0.5+0.4), and the tier ledge and balustrade sit
+            // just above that. Ending the collision face at topY left all of it
+            // outside the collider — TestArenaProtrusion caught this as ~600mm
+            // of balustrade and ~460mm of shelf post reachable at every tier
+            // boundary, each reporting collide=29.892 (i.e. the bare wall).
+            Quad(st,
+                Ring(seg,     rFront, faceTop), Ring(seg + 1, rFront, faceTop),
+                Ring(seg + 1, rFront, -RowUnderhang), Ring(seg, rFront, -RowUnderhang));
+
+            // Chamfer back to the wall over ShelfChamferH, so the top of the
+            // shelf band is a ramp rather than a ledge to catch on.
+            Quad(st,
+                Ring(seg,     Radius, faceTop + ShelfChamferH), Ring(seg + 1, Radius, faceTop + ShelfChamferH),
+                Ring(seg + 1, rFront, faceTop),                 Ring(seg,     rFront, faceTop));
+        }
+
+        var mesh = Commit(st);
+        if (mesh == null) return;                       // fully-open ring (both doorways) — nothing to collide
+        var shape = mesh.CreateTrimeshShape();
+        shape.BackfaceCollision = true;                 // matches the arena wall trimesh
+        shelfBody.AddChild(new CollisionShape3D { Name = "ShelfRing", Shape = shape });
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  SECOND TIER — balustrade + columns (GLB decor; absent pre-Task-5 asset
+    //  generation, PropLibrary.Instance returns null and the ring is simply
+    //  skipped with zero errors) plus a procedural tier ledge. The ledge is NOT
+    //  gated on PropLibrary.PropsAvailable — it is pure procedural geometry
+    //  and must always render.
+    // ══════════════════════════════════════════════════════════════════════════
+    void AddSecondTier(float baseY, int tier, float openHalfAngle, bool openNorth, bool openSouth)
+    {
+        float tierY = ShelfBandH;                 // shelf-top / balcony floor line — keep in
+                                                  // sync with AddBookshelfRing's topY.
+                                                  // Tier-local; baseY lifts the band.
+        // Balcony ring: shallow ledge (visual only, no collision).
+        // Was InnerRadius = Radius-1.6 (28.4), which put the tube 0.9m INSIDE the
+        // shelf collision surface — the player walked straight into it. Pulled
+        // back inside the furniture band per the clearance contract; the tube is
+        // correspondingly thinner, which also matches the "shallow ledge" name it
+        // always had.
+        float ledgeInner = Apothem - ShelfDepth + 0.05f;   // just outside the collider
+        var ledge = new MeshInstance3D
+        {
+            Name = $"TierLedge_t{tier}",
+            Mesh = new TorusMesh { InnerRadius = ledgeInner, OuterRadius = Radius - 0.2f,
+                                   Rings = 64, RingSegments = 8 },
+            Position = new Vector3(0, baseY + tierY, 0),
+            MaterialOverride = PanelWallMat(),
+        };
+        AddChild(ledge);
+
+        // TierLedge's tube radius is (OuterRadius-InnerRadius)/2, centred at tierY,
+        // so it spans roughly tierY±that. A balustrade placed at tierY+0.2 sits
+        // submerged inside the tube and is invisible — bump it above the tube's top
+        // surface so the railing reads as standing ON the ledge.
+        float ledgeTube = ((Radius - 0.2f) - ledgeInner) * 0.5f;
+        float balY = tierY + ledgeTube + 0.05f;
+
+        // Only the FIRST ring of columns is standable. The upper tiers' columns
+        // are scenery seen from below, and making every ring standable would
+        // turn the stacked shaft into an unintended ladder to the dome.
+        StaticBody3D? colTops = null;
+        if (tier == 0)
+        {
+            colTops = new StaticBody3D
+            {
+                Name     = "ColumnTopCollision_t0",
+                Position = new Vector3(0, baseY, 0),
+            };
+            AddChild(colTops);
+        }
+
+        for (int i = 0; i < Sides; i++)
+        {
+            // Skip doorway bays, matching AddBookshelfRing / AddShelfCollision.
+            // Balustrades were previously placed at all 32 bays including the two
+            // the collision ring deliberately opens, so the railing spanned the
+            // doorway with nothing in front of it — reachable, and wrong anyway.
+            if (DoorwayBay(i, openHalfAngle, openNorth, openSouth, tier)) continue;
+
+            float a = 2f * Mathf.Pi * i / Sides;
+            // BalustradeR, not Radius-1.0: the old radius put the railing 0.3m
+            // inside the shelf collision surface, so the player walked into it.
+            var pos = new Vector3(Mathf.Sin(a) * BalustradeR, balY,
+                                  -Mathf.Cos(a) * BalustradeR);
+            // balustrade segment between columns. The GLB is a squarish
+            // railing tile (height-anchored by PropLibrary's _scale), so
+            // stretch its local-Z (span) axis only to fill the ring bay.
+            // AABB is measured BEFORE rotation is applied (unlike the
+            // post-rotation measurement below for bookrows) — measuring
+            // after an arbitrary (non-90°) Y-rotation would re-project the
+            // box into the rotated frame and read a skewed, angle-dependent
+            // size instead of the model's true local-Z extent.
+            if (PropMesh("balustrade_a") != null)
+            {
+                float bayLen = 2f * Mathf.Pi * (Radius - 1.0f) / Sides;
+                var stretch = PropStretch("balustrade_a", ab =>
+                    ab.Size.Z > 0.001f ? new Vector3(1f, 1f, bayLen / ab.Size.Z) : Vector3.One);
+                // ScaledLocal so the local-Z-only span stretch stays on the
+                // model's own Z after the ring rotation (see the bookrow note).
+                var basis = new Basis(Vector3.Up, -a + Mathf.Pi * 0.5f).ScaledLocal(stretch);
+                Batch("balustrade_a", new Transform3D(basis, pos));
+            }
+            // column every other bay, rising to the wall top
+            if (i % 2 == 0 && PropMesh("column_a") != null)
+            {
+                var colPos = new Vector3(Mathf.Sin(a) * (Radius - 0.8f), tierY,
+                                         -Mathf.Cos(a) * (Radius - 0.8f));
+                Batch("column_a", new Transform3D(Basis.Identity, colPos));
+
+                // Standable capital. Gated on the same PropMesh check as the
+                // visual so a missing column_a.glb never leaves an invisible
+                // platform floating in the shaft.
+                colTops?.AddChild(new CollisionShape3D
+                {
+                    Name  = $"ColumnTop{i}",
+                    Shape = new BoxShape3D
+                    {
+                        Size = new Vector3(ColumnTopW, ColumnTopThk, ColumnTopW),
+                    },
+                    // Slab tucked just under the capital's top face, so the
+                    // surface the player lands on is exactly the capital top.
+                    Position = colPos + new Vector3(0, ColumnHalfH - ColumnTopThk * 0.5f, 0),
+                });
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  VELVET CURTAINS — shader-cloth pinned at the rod, draped over each arch
+    //  doorway. Deep-red velvet from BlenderKit's procedural "Velvet Fabric
+    //  Material" (color 0.39,0.043,0.043 + sheen) as a fresnel-sheen shader.
+    //  Physics: vertex-shader cloth (drape folds + wind ripple) that bulges and
+    //  parts around nearby GrassInteractors (player/enemies walking through).
+    //  NOTE: real SoftBody3D is NOT used — Jolt (this project's physics engine)
+    //  shreds soft-body cloth in Godot 4.6; do not switch back without testing.
+    // ══════════════════════════════════════════════════════════════════════════
+    const string VelvetShaderSrc = @"
+shader_type spatial;
+render_mode cull_disabled, diffuse_burley, specular_schlick_ggx;
+uniform vec3 velvet_color : source_color = vec3(0.39, 0.043, 0.043);
+uniform vec3 push_pos    = vec3(0.0, 0.0, 1000.0);  // curtain-local
+uniform float push_r     = 2.2;
+uniform float push_dir   = 1.0;                     // +z or -z bulge
+varying vec2 vuv;
+float hash21(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
+float vn2(vec2 p){
+    vec2 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+    return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x),mix(hash21(i+vec2(0,1)),hash21(i+vec2(1,1)),f.x),f.y);
+}
+void vertex(){
+    vuv = UV;
+    float free = UV.y;                 // 0 at the pinned rod, 1 at the hem
+    // hanging drape: horizontal scallop folds, deeper toward the hem
+    VERTEX.z += sin(UV.x * 18.85) * 0.16 * free;
+    // wind: two ripple layers travelling across the cloth
+    float w = sin(UV.x * 7.0 + TIME * 1.6) * 0.10
+            + vn2(vec2(UV.x * 2.5 + TIME * 0.25, UV.y * 1.5)) * 0.22;
+    VERTEX.z += w * free * free;
+    // interactor push: bulge through + part sideways around the walker
+    float d = distance(VERTEX.xy, push_pos.xy);
+    float infl = smoothstep(push_r, 0.0, d) * free;
+    VERTEX.z += push_dir * infl * 2.4;
+    VERTEX.x += clamp(VERTEX.x - push_pos.x, -1.0, 1.0) * infl * 1.1;
+}
+void fragment(){
+    // vertical fold shading + fabric grain
+    float folds = vn2(vuv * vec2(16.0, 2.0));
+    float grain = vn2(vuv * 90.0);
+    vec3 col = velvet_color * (0.65 + 0.45 * folds) * (0.92 + 0.16 * grain);
+    // velvet sheen: brighten toward grazing angles
+    float fres = pow(1.0 - clamp(dot(normalize(NORMAL), normalize(VIEW)), 0.0, 1.0), 2.4);
+    col = mix(col, velvet_color * 2.4 + vec3(0.10, 0.04, 0.04), fres * 0.75);
+    ALBEDO = col; ROUGHNESS = 0.78; METALLIC = 0.0;
+}";
+
+    readonly System.Collections.Generic.List<(ShaderMaterial mat, Node3D node)> _curtains = new();
+
+    void AddCurtain(bool northFacing)
+    {
+        const int   SegsX = 24, SegsY = 20;
+        const float Width = 8.6f;                 // overhangs the 6m opening
+        // Valance style: rod at the top of the paneling band (dome spring), hem
+        // draping just past the arch peak — the doorway itself stays open.
+        float top = ArenaWallH;
+        float Bottom = SpringY + ArchRise - 1.5f;   // 16.5m — overhangs the arch top
+
+        var st = new SurfaceTool();
+        st.Begin(Mesh.PrimitiveType.Triangles);
+        // Two full vertex layers at the SAME positions: one facing +Z (the arena
+        // interior) and a mirrored one facing -Z (outside, toward the connecting
+        // maze). Measured via TestTask.cs capture (screenshots/issue_verify4):
+        // the shader's `render_mode cull_disabled` left this sheet fully
+        // INVISIBLE (not merely badly lit) when viewed from outside — you could
+        // see clean through the archway to the far wall. That is Issue 4 ("the
+        // banner reads red one way, black the other" — "black" was actually
+        // "not there at all", exposing whatever sat behind it). Rather than
+        // depend on cull_disabled/backface-normal-flip behaviour that this GL
+        // Compatibility build doesn't apply here, each side gets its own real,
+        // correctly-wound triangles with a correctly-oriented normal, so lighting
+        // and visibility both work from either side unconditionally.
+        int vertsPerLayer = (SegsX + 1) * (SegsY + 1);
+        for (int side = 0; side < 2; side++)
+        {
+            Vector3 normal = side == 0 ? new Vector3(0, 0, 1) : new Vector3(0, 0, -1);
+            for (int row = 0; row <= SegsY; row++)
+            {
+                float t = (float)row / SegsY;
+                float y = Mathf.Lerp(top, Bottom, t);
+                for (int col = 0; col <= SegsX; col++)
+                {
+                    float s = (float)col / SegsX;
+                    st.SetUV(new Vector2(s, t));
+                    st.SetNormal(normal);
+                    st.AddVertex(new Vector3((s - 0.5f) * Width, y, 0));
+                }
+            }
+        }
+        for (int row = 0; row < SegsY; row++)
+        for (int col = 0; col < SegsX; col++)
+        {
+            int i0 = row * (SegsX + 1) + col;
+            int i1 = i0 + 1;
+            int i2 = i0 + (SegsX + 1);
+            int i3 = i2 + 1;
+            // Front layer (normal +Z): original winding, visible from inside.
+            st.AddIndex(i0); st.AddIndex(i2); st.AddIndex(i1);
+            st.AddIndex(i1); st.AddIndex(i2); st.AddIndex(i3);
+            // Back layer (normal -Z): reversed winding, visible from outside.
+            int j0 = i0 + vertsPerLayer, j1 = i1 + vertsPerLayer;
+            int j2 = i2 + vertsPerLayer, j3 = i3 + vertsPerLayer;
+            st.AddIndex(j0); st.AddIndex(j1); st.AddIndex(j2);
+            st.AddIndex(j1); st.AddIndex(j3); st.AddIndex(j2);
+        }
+        var mesh = st.Commit();
+        var mat = new ShaderMaterial { Shader = new Shader { Code = VelvetShaderSrc } };
+        mesh.SurfaceSetMaterial(0, mat);
+
+        float zFace = northFacing ? -(Apothem - 0.55f) : (Apothem - 0.55f);
+        var mi = new MeshInstance3D
+        {
+            Name  = northFacing ? "CurtainNorth" : "CurtainSouth",
+            Mesh  = mesh,
+            Position = new Vector3(0, 0, zFace),
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+        };
+        AddChild(mi);
+        _curtains.Add((mat, mi));
+    }
+
+    // Feed the nearest walker (player/enemy GrassInteractor) into each curtain's
+    // push uniforms so the cloth bulges and parts as they walk through.
+    public override void _PhysicsProcess(double delta)
+    {
+        if (_curtains.Count == 0) return;
+        var interactors = GetTree().GetNodesInGroup(GrassInteractor.Group);
+        foreach (var (mat, node) in _curtains)
+        {
+            Vector3 best = new(0, 0, 1000f);   // far away = no push
+            float bestD = 6f;                  // only react within 6m
+            foreach (var n in interactors)
+            {
+                if (n is not Node3D g || !g.IsInsideTree()) continue;
+                var local = node.ToLocal(g.GlobalPosition);
+                float d = new Vector2(local.X, local.Z).Length();
+                if (d < bestD) { bestD = d; best = local; }
+            }
+            mat.SetShaderParameter("push_pos", best);
+            mat.SetShaderParameter("push_dir", best.Z > 0f ? -1f : 1f);
+        }
+    }
+
+    // Box oriented on (tangent, inward, up) axes; half-extents ht/hn/hy. Optional vertex color.
+    static void OrientedBox(SurfaceTool st, Vector3 c, Vector3 tan, Vector3 inw,
+        float ht, float hn, float hy, Color? col)
+    {
+        Vector3 T = tan * ht, N = inw * hn, U = Vector3.Up * hy;
+        // 8 corners
+        Vector3 p000=c-T-N-U, p100=c+T-N-U, p010=c-T+N-U, p110=c+T+N-U;
+        Vector3 p001=c-T-N+U, p101=c+T-N+U, p011=c-T+N+U, p111=c+T+N+U;
+        if (col.HasValue) st.SetColor(col.Value);
+        // 6 faces (outward winding)
+        CQuad(st, p010, p110, p111, p011, col);  // inward face (toward centre)
+        CQuad(st, p100, p000, p001, p101, col);  // wall-side face
+        CQuad(st, p000, p010, p011, p001, col);  // -tangent end
+        CQuad(st, p110, p100, p101, p111, col);  // +tangent end
+        CQuad(st, p001, p011, p111, p101, col);  // top
+        CQuad(st, p010, p000, p100, p110, col);  // bottom
+    }
+
+    static void CQuad(SurfaceTool st, Vector3 a, Vector3 b, Vector3 c, Vector3 d, Color? col)
+    {
+        if (col.HasValue) st.SetColor(col.Value);
+        st.SetUV(UV(a)); st.AddVertex(a); st.SetUV(UV(b)); st.AddVertex(b);
+        st.SetUV(UV(c)); st.AddVertex(c); st.SetUV(UV(a)); st.AddVertex(a);
+        st.SetUV(UV(c)); st.AddVertex(c); st.SetUV(UV(d)); st.AddVertex(d);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  MULTIMESH PROP BATCHING
+    //
+    //  Tier stacking multiplies GLB prop placements (at Tiers=3: 420 → 1260
+    //  bookrows, 16 → 48 columns, 32 → 96 balustrades). As individual nodes
+    //  that is ~1400 MeshInstance3D children — ~1400 draw calls and ~1400
+    //  culled objects per frame, which on this project's gl_compatibility
+    //  renderer is the single dominant cost of the whole stack. The measured
+    //  pre-stacking baseline was CPU-render-bound (8.87ms CPU vs 2.94ms GPU),
+    //  so instance COUNT, not triangle count, is the thing to kill.
+    //
+    //  Every placement is one of a handful of repeated meshes, so they batch
+    //  into one MultiMeshInstance3D per (prop, tier): ~1400 draw calls → ~9.
+    //
+    //  Batched PER TIER rather than one global batch per prop, deliberately:
+    //    - a per-tier batch keeps a tight AABB, so tiers outside the frustum
+    //      still cull (one global batch would be a 108m-tall always-visible
+    //      object)
+    //    - gl_compatibility builds a per-OBJECT light list capped at
+    //      max_lights_per_object=32 (project.godot). A per-tier batch only
+    //      picks up its own tier's torches instead of every light in the shaft.
+    //
+    //  Side benefit: PropMesh() instantiates each GLB exactly once for the
+    //  whole arena instead of once per placement, which removes ~1400
+    //  PackedScene.Instantiate() calls and ~1400 GetLocalAabb() tree-walks
+    //  from arena build time.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // prop name → (mesh, transform of that mesh relative to the prop root).
+    // The transform includes PropLibrary's own uniform scale correction, so a
+    // caller's placement transform carries only position/rotation plus any
+    // extra per-prop stretch. Null value = GLB missing or has no mesh (cached
+    // so the miss is probed once, matching PropLibrary's graceful-absent rule).
+    static readonly Dictionary<string, (Mesh mesh, Transform3D local)?> _propMesh = new();
+
+    static (Mesh mesh, Transform3D local)? PropMesh(string name)
+    {
+        if (_propMesh.TryGetValue(name, out var hit)) return hit;
+
+        (Mesh, Transform3D)? found = null;
+        var probe = PropLibrary.Instance(name);
+        if (probe != null)
+        {
+            void Visit(Node n, Transform3D x)
+            {
+                if (found != null) return;
+                if (n is Node3D n3d) x *= n3d.Transform;
+                if (n is MeshInstance3D mi && mi.Mesh != null) { found = (mi.Mesh, x); return; }
+                foreach (Node c in n.GetChildren()) Visit(c, x);
+            }
+            Visit(probe, Transform3D.Identity);
+            probe.Free();   // orphan node (never entered the tree); the Mesh
+                            // resource it yielded is RefCounted and survives.
+        }
+        _propMesh[name] = found;
+        return found;
+    }
+
+    // The AABB-derived extra scale a prop needs, measured once per prop name.
+    // Bookrows stretch to fill boardLen and balustrades stretch along local Z
+    // to fill a ring bay; both spans are identical for every bay of a regular
+    // polygon, so the factor is constant and does not need re-measuring per
+    // placement (the pre-batching code re-measured on every single one).
+    static readonly Dictionary<string, Vector3> _propStretch = new();
+
+    static Vector3 PropStretch(string name, Func<Aabb, Vector3> measure)
+    {
+        if (_propStretch.TryGetValue(name, out var hit)) return hit;
+        var probe = PropLibrary.Instance(name);
+        var s = Vector3.One;
+        if (probe != null) { s = measure(GetLocalAabb(probe)); probe.Free(); }
+        _propStretch[name] = s;
+        return s;
+    }
+
+    // Accumulates placements for the tier currently being built.
+    readonly Dictionary<string, List<Transform3D>> _batch = new();
+
+    void Batch(string prop, Transform3D placement)
+    {
+        if (!_batch.TryGetValue(prop, out var list)) _batch[prop] = list = new List<Transform3D>();
+        list.Add(placement);
+    }
+
+    // Emits one MultiMeshInstance3D per batched prop and clears the batch.
+    // `suffix` scopes the node name to the tier (e.g. "t0") so the arena tree
+    // stays readable and per-tier batches are individually inspectable.
+    // Placements are batched in TIER-LOCAL space; baseY lifts the whole batch
+    // via node position, which is what keeps each batch's AABB tight (see the
+    // section doc comment on why that matters for culling and light lists).
+    void FlushBatch(string suffix, float baseY)
+    {
+        foreach (var kv in _batch)
+        {
+            var pm = PropMesh(kv.Key);
+            if (pm == null || kv.Value.Count == 0) continue;
+
+            var mm = new MultiMesh
+            {
+                TransformFormat = MultiMesh.TransformFormatEnum.Transform3D,
+                Mesh            = pm.Value.mesh,
+            };
+            mm.InstanceCount = kv.Value.Count;   // allocates — must follow TransformFormat
+            for (int i = 0; i < kv.Value.Count; i++)
+                mm.SetInstanceTransform(i, kv.Value[i] * pm.Value.local);
+
+            AddChild(new MultiMeshInstance3D
+            {
+                Name       = $"{kv.Key}_{suffix}",
+                Multimesh  = mm,
+                Position   = new Vector3(0, baseY, 0),
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            });
+        }
+        _batch.Clear();
+    }
+
+    // ── Mesh helpers ──────────────────────────────────────────────────────────
+    void Emit(StaticBody3D body, ArrayMesh? mesh, string name, Material mat)
+    {
+        if (mesh == null) return;
+        var mi = new MeshInstance3D { Name = name, Mesh = mesh };
+        mi.SetSurfaceOverrideMaterial(0, mat);
+        body.AddChild(mi);
+        var shape = mesh.CreateTrimeshShape();
+        shape.BackfaceCollision = true;   // collide from both sides; fixes player walking through walls from inside
+        body.AddChild(new CollisionShape3D { Name = name + "Col", Shape = shape });
+    }
+
+    // Combined AABB of a GLB instance's visual geometry, in the root node's own
+    // local space (i.e. before any additional scale/position the caller sets
+    // afterward). Walks all VisualInstance3D descendants and merges their
+    // AABBs through accumulated local transforms. Returns a zero-size AABB
+    // (safe — caller must guard divide-by-zero) if the root has no meshes.
+    static Aabb GetLocalAabb(Node3D root)
+    {
+        Aabb result = default;
+        bool first = true;
+        void Visit(Node n, Transform3D xform)
+        {
+            if (n is Node3D n3d) xform *= n3d.Transform;
+            if (n is VisualInstance3D vi)
+            {
+                var local = xform * vi.GetAabb();
+                result = first ? local : result.Merge(local);
+                first = false;
+            }
+            foreach (Node c in n.GetChildren()) Visit(c, xform);
+        }
+        Visit(root, Transform3D.Identity);
+        return result;
+    }
+
+    static SurfaceTool MakeST()
+    { var st = new SurfaceTool(); st.Begin(Mesh.PrimitiveType.Triangles); return st; }
+
+    static ArrayMesh? Commit(SurfaceTool st)
+    { st.GenerateNormals(); var m = st.Commit(); return m.GetSurfaceCount() > 0 ? m : null; }
+
+    static void Quad(SurfaceTool st, Vector3 a, Vector3 b, Vector3 c, Vector3 d)
+    {
+        st.SetUV(UV(a)); st.AddVertex(a); st.SetUV(UV(b)); st.AddVertex(b);
+        st.SetUV(UV(c)); st.AddVertex(c); st.SetUV(UV(a)); st.AddVertex(a);
+        st.SetUV(UV(c)); st.AddVertex(c); st.SetUV(UV(d)); st.AddVertex(d);
+    }
+
+    static Vector2 UV(Vector3 v) => new(v.X * 0.2f, v.Z * 0.2f);
+}
